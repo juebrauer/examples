@@ -1,3 +1,10 @@
+"""
+Weather module
+
+Currently only provides one function in order to
+retrieve the temperature.
+"""
+
 import sys
 import requests
 
