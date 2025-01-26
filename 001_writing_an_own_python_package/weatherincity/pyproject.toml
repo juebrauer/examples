@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weatherincity"
+version = "1.0.0"
+authors = [
+  { name = "Jürgen Brauer"},
+]
+description = "Retrieves the current temperature in a city"
+readme = "README.md"
+license = { text = "Unlicense" }
+requires-python = ">=3.10"
+keywords = ["weather", "temperature", "example-package"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: The Unlicense (Unlicense)",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Source Code" = "https://github.com/juebrauer/examples/tree/main/001_writing_an_own_python_package/weatherincity"
