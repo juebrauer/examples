@@ -4,10 +4,18 @@ Title Video Generator
 Creates a video with typewriter effect, blinking cursor, and very subtle typewriter sound effects.
 
 Usage:
-    python generate_title_video.py "Your text here" output.mp4
+    python generate_title_video.py "Your text here"
     
     - Text: The text to display
-    - Output: Output file (e.g. output.mp4)
+    - Output filename is automatically generated from the text
+      (lowercase, spaces replaced with underscores, .mp4 extension)
+    
+Examples:
+    python generate_title_video.py "Once upon a time"
+    → Creates: once_upon_a_time.mp4
+    
+    python generate_title_video.py "Es war einmal ..."
+    → Creates: es_war_einmal_....mp4
     
 Features:
     - Typewriter effect with character-by-character reveal
@@ -16,6 +24,7 @@ Features:
     - Automatic text wrapping with proper margins
     - Very subtle typewriter sound for each character
     - Full HD (1920x1080) output
+    - Auto-generated output filename
 """
 
 import sys
@@ -30,6 +39,32 @@ import shutil
 import numpy as np
 import wave
 import random
+import re
+
+
+def text_to_filename(text):
+    """Convert text to a safe filename"""
+    # Convert to lowercase
+    filename = text.lower()
+    
+    # Replace spaces with underscores
+    filename = filename.replace(' ', '_')
+    
+    # Remove or replace special characters that are problematic in filenames
+    # Keep only alphanumeric, underscores, hyphens, and dots
+    filename = re.sub(r'[^\w\-.]', '', filename)
+    
+    # Remove leading/trailing underscores or dots
+    filename = filename.strip('_.')
+    
+    # Limit length to reasonable filename size (100 chars before .mp4)
+    if len(filename) > 100:
+        filename = filename[:100].rstrip('_.')
+    
+    # Add .mp4 extension
+    filename = filename + '.mp4'
+    
+    return filename
 
 
 class TitleWidget(QWidget):
@@ -330,24 +365,28 @@ class TitleWidget(QWidget):
 def main():
     """Main function"""
     # Check arguments
-    if len(sys.argv) != 3:
-        print("Usage: python generate_title_video.py \"Text\" <output.mp4>")
+    if len(sys.argv) != 2:
+        print("Usage: python generate_title_video.py \"Text\"")
         print("\nExample:")
-        print('  python generate_title_video.py "Once upon a time ..." output.mp4')
+        print('  python generate_title_video.py "Once upon a time ..."')
         print("\nParameters:")
         print("  Text: The text to display (in quotes)")
-        print("  output.mp4: Name of the output file")
-        print("\nNote: Character delays are randomized between 40-200ms for natural typing effect")
+        print("\nNote:")
+        print("  - Output filename is auto-generated from text")
+        print("  - Character delays are randomized between 40-200ms for natural typing effect")
         sys.exit(1)
     
     text = sys.argv[1]
-    output_path = sys.argv[2]
     
-    # Check if output directory exists
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if output_dir and not os.path.exists(output_dir):
-        print(f"✗ Error: Directory does not exist: {output_dir}")
-        sys.exit(1)
+    # Auto-generate output filename from text
+    output_path = text_to_filename(text)
+    
+    # Check if file already exists
+    if os.path.exists(output_path):
+        response = input(f"File '{output_path}' already exists. Overwrite? (y/n): ")
+        if response.lower() != 'y':
+            print("Aborted.")
+            sys.exit(0)
     
     # Calculate approximate duration (using average delay of 120ms)
     avg_delay_ms = 120
