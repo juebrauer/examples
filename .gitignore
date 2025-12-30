@@ -4,6 +4,9 @@
 # ... but keep folders. Instead, Git will not see the files
 !*/
 
+# Ignore all dev_ folders (even though folders are allowed)
+dev_*/
+
 # Allowed file types:
 !*.py
 !*.png
