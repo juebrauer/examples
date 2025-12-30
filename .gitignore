@@ -6,6 +6,7 @@
 
 # Ignore all dev_ folders (even though folders are allowed)
 dev_*/
+005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
 
 # Allowed file types:
 !*.py
