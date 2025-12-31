@@ -12,4 +12,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 006      | Notebook, building a Keras MLP for concrete strength prediction. MLP is superior to linear model. |
 | 007      | Notebook, demonstrating a k-fold CV for a MLP |
 | 008      | Notebook, finetuning a VLM (Qwen 3, 8b) for classifying and describing monster images |
+| 009      | Notebook, finetuning a LLM (Llama 3.2, 3b) to know new facts (here: about a specific person) |
 | 00x      |  |
