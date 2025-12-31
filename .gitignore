@@ -15,11 +15,14 @@ dev_*/
 008_vlm_finetuning_with_unsloth_monsters/outputs
 008_vlm_finetuning_with_unsloth_monsters/lora_adapter_*
 
-
+009_llm_finetuning/unsloth_compiled_cache
+009_llm_finetuning/outputs*
+009_llm_finetuning/lora_adapter_*
 
 
 # Allowed file types:
 !*.py
+!*.jsonl
 !*.png
 !*.txt
 !*.log
