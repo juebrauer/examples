@@ -6,7 +6,17 @@
 
 # Ignore all dev_ folders (even though folders are allowed)
 dev_*/
+
+# Ignore specific folders
 005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
+
+008_vlm_finetuning_with_unsloth_monsters/monster_data
+008_vlm_finetuning_with_unsloth_monsters/unsloth_compiled_cache
+008_vlm_finetuning_with_unsloth_monsters/outputs
+008_vlm_finetuning_with_unsloth_monsters/lora_adapter_*
+
+
+
 
 # Allowed file types:
 !*.py
