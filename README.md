@@ -14,4 +14,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 008      | Notebook, finetuning a VLM (Qwen 3, 8b) for classifying and describing monster images |
 | 009      | Notebook, finetuning a LLM (Llama 3.2, 3b) to know new facts (here: about a specific person) |
 | 010      | Notebook, introducing BigData topics as Pandas chunking, Parquet files, etc. |
+| 011      | Notebook, showing uni- and multi-variate techniques for outlier detection and removal |
 | 00x      |  |
