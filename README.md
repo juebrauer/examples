@@ -15,4 +15,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 009      | Notebook, finetuning a LLM (Llama 3.2, 3b) to know new facts (here: about a specific person) |
 | 010      | Notebook, introducing BigData topics as Pandas chunking, Parquet files, etc. |
 | 011      | Notebook, showing uni- and multi-variate techniques for outlier detection and removal |
+| 012      | Python script, interactive DBSCAN demo. You can define data points and cluster them |
 | 00x      |  |
