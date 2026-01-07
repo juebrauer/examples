@@ -20,6 +20,9 @@
 // - “There might be none”
 // - “You must check”
 // Pointer = uncertainty
+// E.g., pointers can be used for a linked list
+// Either they point to the next element (e.g., a struct)
+// or they are nullptr (= end of the list)
 
 
 
