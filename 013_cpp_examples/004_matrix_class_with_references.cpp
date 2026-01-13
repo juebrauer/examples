@@ -7,77 +7,64 @@
 class Matrix
 {
 public:
-    Matrix(int rows, int cols)
+    Matrix(int rows, int cols, int startValue=0)
         : rows(rows), cols(cols)
     {
         data = new int[rows * cols];
-
         for (int y = 0; y < rows; y++)
         {
             for (int x = 0; x < cols; x++)
             {
                 int idx = y * cols + x;
-                if (y == 0)
-                    data[idx] = 1;
-                else
-                    data[idx] = 0;
+                data[idx] = startValue;
             }
         }
     }
-
-    // Destructor: frees owned memory
+    
     ~Matrix()
     {
+        std::cout << "Cleaning up data ..." << std::endl;
         delete[] data;
     }
-
-    // Matrix addition: other must exist → reference
-    Matrix* add(const Matrix& other) const
+    
+    // Referenz-Version: other kann nicht nullptr sein
+    Matrix add(const Matrix& other) const
     {
-        Matrix* result = new Matrix(rows, cols);
-
-        for (int y = 0; y < rows; y++)
+        Matrix result(rows, cols, 0);
+        for (int i = 0; i < rows * cols; i++)
         {
-            for (int x = 0; x < cols; x++)
-            {
-                int idx = y * cols + x;
-                result->data[idx] = data[idx] + other.data[idx];
-            }
+            result.data[i] = data[i] + other.data[i];
         }
-
         return result;
     }
-
+    
     void show() const
     {
         for (int y = 0; y < rows; y++)
         {
             for (int x = 0; x < cols; x++)
             {
-                int idx = y * cols + x;
-                std::cout << data[idx] << " ";
+                std::cout << data[y * cols + x] << " ";
             }
-            std::cout << std::endl;
+            std::cout << "\n";
         }
     }
-
+    
 private:
     int rows;
     int cols;
     int* data;
 };
 
-
 int main()
 {
-    Matrix m1(3, 5);
-    Matrix m2(3, 5);
-
+    Matrix m1(3, 5,  1);
+    Matrix m2(3, 5,  19);    
     m1.show();
     m2.show();
-
-    Matrix* m3 = m1.add(m2);
-    m3->show();
-
-    delete m3;
+    
+    Matrix m3 = m1.add(m2);
+    m3.show();
+    
+    // No delete necessary - automatic call of destructor!
 }
