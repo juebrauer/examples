@@ -17,4 +17,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 011      | Notebook, showing uni- and multi-variate techniques for outlier detection and removal |
 | 012      | Python script, interactive DBSCAN demo. You can define data points and cluster them |
 | 013      | C and C++ examples, demonstrating various concepts in C and C++ |
+| 014      | Python script, compares different optimizers like GD, Momentum, Nesterov, Adagrad, RMSProp, Adam, AdamW, Lion |
 | 00x      |  |
