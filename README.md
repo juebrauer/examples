@@ -18,4 +18,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 012      | Python script, interactive DBSCAN demo. You can define data points and cluster them |
 | 013      | C and C++ examples, demonstrating various concepts in C and C++ |
 | 014      | Python script, compares different optimizers like GD, Momentum, Nesterov, Adagrad, RMSProp, Adam, AdamW, Lion |
+| 015      | Notebook, demonstrates how to do AutoML on tabular data with AutoGluon TabularPredictor and TimeSeriesPredictor |
 | 00x      |  |
