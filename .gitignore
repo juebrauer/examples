@@ -1,26 +1,9 @@
 # Ignore everything ...
 *
-
 # ... but keep folders. Instead, Git will not see the files
 !*/
 
-# Ignore all dev_ folders (even though folders are allowed)
-dev_*/
-
-# Ignore specific folders
-005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
-
-008_vlm_finetuning_with_unsloth_monsters/monster_data
-008_vlm_finetuning_with_unsloth_monsters/unsloth_compiled_cache
-008_vlm_finetuning_with_unsloth_monsters/outputs
-008_vlm_finetuning_with_unsloth_monsters/lora_adapter_*
-
-009_llm_finetuning/unsloth_compiled_cache
-009_llm_finetuning/outputs*
-009_llm_finetuning/lora_adapter_*
-
-
-# Allowed file types:
+# Allowed file types (! means "do not ignore")
 !*.py
 !*.jsonl
 !*.png
@@ -34,3 +17,19 @@ dev_*/
 !*.sh
 !*.md
 
+# Ignore specific folders
+005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
+
+008_vlm_finetuning_with_unsloth_monsters/monster_data
+008_vlm_finetuning_with_unsloth_monsters/unsloth_compiled_cache
+008_vlm_finetuning_with_unsloth_monsters/outputs
+008_vlm_finetuning_with_unsloth_monsters/lora_adapter_*
+
+009_llm_finetuning/unsloth_compiled_cache
+009_llm_finetuning/outputs*
+009_llm_finetuning/lora_adapter_*
+
+015_automl_with_autogluon/autogluon_ts_predictor_using_covariates/*
+
+# Ignore checkpoint files
+*-checkpoint.ipynb
