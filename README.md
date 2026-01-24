@@ -22,4 +22,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 016      | Notebook, short intro to Dask - a Python library for working with big data files |
 | 017      | Notebook, shows how to create a SQLite3 database, retrieve data, change data |
 | 018      | Notebook, very short notebook that shows how to load in gpt-oss with 20b params and classify a user question (in German) |
+| 019      | Notebook, mini RAG example with Chroma vector store and OpenAI API (in German) |
 | 0xx      |  |
