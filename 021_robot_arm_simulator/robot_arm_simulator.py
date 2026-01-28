@@ -20,8 +20,8 @@ Action encoding:
 - Stored in samples.csv as a JSON list string, e.g. "[0,0,1,0,0,0,...]"
 
 CLI:
-  python robot_arm_simulator.py --dof 3 --samples 5000 --output ./data_dof3_5k
-  python robot_arm_simulator.py --dof 5 --samples 200000 --output ./data_5dof --headless
+  python robot_arm_simulator.py --dof 2 --samples 5000 --output ./data_dof2_5000
+  python robot_arm_simulator.py --dof 2 --samples 100000 --output ./data_dof2_100000 --headless
 
 Requirements:
   PySide6, numpy, opencv-python
