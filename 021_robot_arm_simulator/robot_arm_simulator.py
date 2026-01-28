@@ -25,6 +25,10 @@ CLI:
 
 Requirements:
   PySide6, numpy, opencv-python
+
+
+Note: if running this script on a server, call it like this
+QT_QPA_PLATFORM=offscreen python robot_arm_simulator.py --dof 2 --samples 5000 --output ./data_dof2_5000 --headless
 """
 
 import sys

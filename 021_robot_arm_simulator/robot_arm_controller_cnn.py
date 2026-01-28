@@ -17,12 +17,29 @@ Modes:
 
 - test: loads a saved model and evaluates on the remaining (1 - train_frac) portion.
 
-Examples:
-  # Train
-  python robot_arm_controller_cnn.py --data_dir ./my_data --mode train --model_path ./cnn.pt --train_frac 0.8 --epochs 20
+NEW:
+- All generated files are saved inside --exp_dir:
+    - model checkpoints (.pt)
+    - log file (.log)
+    - history json (.json)
+    - learning curve plots (.png)
 
-  # Test (evaluate on remaining 20%)
-  python robot_arm_controller_cnn.py --data_dir ./my_data --mode test --model_path ./cnn_epoch020.pt --train_frac 0.8
+Examples:
+  # Train (everything into ./experiments/exp001/)
+  python robot_arm_controller_cnn.py \
+      --data_dir ./data_dof2_100000 \
+      --mode train \
+      --exp_dir ./experiment1_cnn \
+      --model_path cnn.pt \
+      --train_frac 0.8 --epochs 50
+
+  # Test (loads a checkpoint from the same exp_dir)
+  python robot_arm_controller_cnn.py \
+      --data_dir ./data_dof2_100000 \
+      --mode test \
+      --exp_dir ./experiment1_cnn \
+      --model_path cnn_epoch050.pt \
+      --train_frac 0.8
 
 Requirements:
   pip install torch torchvision pillow matplotlib
@@ -35,7 +52,7 @@ import logging
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict
 
 import torch
 import torch.nn as nn
@@ -67,13 +84,11 @@ def setup_logger(log_path: Path) -> logging.Logger:
 
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    # File
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Console
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -88,9 +103,6 @@ def setup_logger(log_path: Path) -> logging.Logger:
 # -----------------------------
 class RobotArmImageActionDataset(Dataset):
     def __init__(self, data_dir: Path, pairs: List[Tuple[str, int]], transform=None):
-        """
-        pairs: list of (relative_image_path, class_index)
-        """
         self.data_dir = data_dir
         self.pairs = pairs
         self.transform = transform
@@ -114,11 +126,6 @@ class RobotArmImageActionDataset(Dataset):
 
 
 def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
-    """
-    Returns:
-      pairs: [(image_filename, class_index), ...]
-      action_dim: length of one-hot vector
-    """
     csv_path = data_dir / "samples.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing samples.csv in {data_dir}")
@@ -168,9 +175,7 @@ def split_pairs(
     n_train = int(n * train_frac)
     n_train = max(1, min(n - 1, n_train))  # ensure at least 1 in each split
 
-    train_pairs = pairs[:n_train]
-    test_pairs = pairs[n_train:]
-    return train_pairs, test_pairs
+    return pairs[:n_train], pairs[n_train:]
 
 
 # -----------------------------
@@ -179,7 +184,6 @@ def split_pairs(
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes: int):
         super().__init__()
-
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
@@ -193,7 +197,6 @@ class SimpleCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128, 128),
@@ -203,9 +206,7 @@ class SimpleCNN(nn.Module):
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(self.features(x))
 
 
 # -----------------------------
@@ -232,13 +233,10 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tupl
         correct += int((preds == y).sum().item())
         total += int(x.size(0))
 
-    avg_loss = total_loss / max(1, total)
-    acc = correct / max(1, total)
-    return avg_loss, acc
+    return total_loss / max(1, total), correct / max(1, total)
 
 
 def _epoch_checkpoint_path(base_model_path: Path, epoch: int) -> Path:
-    # base: /path/model.pt -> /path/model_epoch001.pt
     stem = base_model_path.stem
     suffix = base_model_path.suffix if base_model_path.suffix else ".pt"
     return base_model_path.with_name(f"{stem}_epoch{epoch:03d}{suffix}")
@@ -280,16 +278,7 @@ def load_model(model_path: Path, device: torch.device) -> Tuple[nn.Module, int, 
     return model, action_dim, image_size, epoch, history
 
 
-def plot_learning_curves(
-    out_path: Path,
-    history: Dict[str, List[float]],
-    title: str,
-) -> None:
-    """
-    Saves a plot with 2 panels:
-      - loss curves
-      - accuracy curves
-    """
+def plot_learning_curves(out_path: Path, history: Dict[str, List[float]], title: str) -> None:
     train_loss = history.get("train_loss", [])
     test_loss = history.get("test_loss", [])
     train_acc = history.get("train_acc", [])
@@ -299,7 +288,6 @@ def plot_learning_curves(
 
     plt.figure(figsize=(10, 4))
 
-    # Loss
     plt.subplot(1, 2, 1)
     if train_loss:
         plt.plot(epochs[: len(train_loss)], train_loss, label="train_loss")
@@ -310,7 +298,6 @@ def plot_learning_curves(
     plt.title("Loss")
     plt.legend()
 
-    # Accuracy
     plt.subplot(1, 2, 2)
     if train_acc:
         plt.plot(epochs[: len(train_acc)], train_acc, label="train_acc")
@@ -328,7 +315,7 @@ def plot_learning_curves(
     plt.close()
 
 
-def train(
+def train_loop(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
@@ -357,11 +344,8 @@ def train(
         if total_batches <= 0:
             raise RuntimeError("Training DataLoader has no batches. Check batch_size and dataset size.")
 
-        # Report every next 5% of mini-batches
         step_pct = 0.05
-        next_report_batch = max(1, int(math.ceil(total_batches * step_pct)))
         reported = set()
-
         epoch_start = datetime.now()
 
         for b_idx, (x, y) in enumerate(train_loader, start=1):
@@ -379,11 +363,10 @@ def train(
             correct += int((preds == y).sum().item())
             total += int(x.size(0))
 
-            # progress: every next 5% of mini-batches
             progress = b_idx / total_batches
-            progress_bucket = int(progress / step_pct)  # 0..20
-            if progress_bucket not in reported and progress >= step_pct:
-                reported.add(progress_bucket)
+            bucket = int(progress / step_pct)  # 0..20
+            if bucket not in reported and progress >= step_pct:
+                reported.add(bucket)
                 pct = min(100, int(round(progress * 100)))
                 logger.info(
                     f"Epoch {epoch:03d}/{epochs} | progress ~{pct:3d}% "
@@ -394,7 +377,6 @@ def train(
 
         train_loss = running_loss / max(1, total)
         train_acc = correct / max(1, total)
-
         test_loss, test_acc = evaluate(model, test_loader, device)
 
         history["train_loss"].append(float(train_loss))
@@ -410,7 +392,6 @@ def train(
             f"epoch_time={elapsed}"
         )
 
-        # 2) Save model after each epoch
         ckpt_path = _epoch_checkpoint_path(base_model_path, epoch)
         save_checkpoint(
             model_path=ckpt_path,
@@ -422,7 +403,6 @@ def train(
         )
         logger.info(f"Saved checkpoint: {ckpt_path.resolve()}")
 
-        # 4) Plot learning curves after each epoch (save latest + epoch-specific)
         plot_title = f"Learning Curves ({base_model_path.stem})"
         plot_learning_curves(plot_path, history, plot_title)
         plot_epoch_path = plot_path.with_name(f"{plot_path.stem}_epoch{epoch:03d}{plot_path.suffix}")
@@ -430,8 +410,6 @@ def train(
         logger.info(f"Saved plot: {plot_path.resolve()}")
         logger.info(f"Saved plot: {plot_epoch_path.resolve()}")
 
-        # Also persist history as JSON
-        history_path.parent.mkdir(parents=True, exist_ok=True)
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
         logger.info(f"Saved history: {history_path.resolve()}")
@@ -444,7 +422,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train/test a CNN on robot-arm image->action data.")
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
-    p.add_argument("--model_path", type=str, required=True, help="Path to save/load the PyTorch model (.pt).")
+
+    # IMPORTANT: model_path is now treated as a *filename* stored inside --exp_dir.
+    p.add_argument("--model_path", type=str, required=True, help="Model filename or path; will be saved/loaded inside --exp_dir.")
+    p.add_argument("--exp_dir", type=str, required=True, help="Experiment output directory (all outputs go here).")
 
     p.add_argument("--train_frac", type=float, default=0.8, help="Fraction of samples used for training (default: 0.8).")
     p.add_argument("--epochs", type=int, default=10, help="Training epochs (train mode only).")
@@ -459,7 +440,7 @@ def parse_args() -> argparse.Namespace:
         "--log_path",
         type=str,
         default="",
-        help="Optional path to a log file. If not set, defaults to <model_stem>.log next to model_path.",
+        help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).",
     )
     return p.parse_args()
 
@@ -472,11 +453,17 @@ def main() -> int:
         print(f"Error: data_dir does not exist: {data_dir}")
         return 1
 
-    base_model_path = Path(args.model_path)
+    exp_dir = Path(args.exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Force all outputs into exp_dir by using only filenames.
+    base_model_name = Path(args.model_path).name
+    base_model_path = (exp_dir / base_model_name)
     if not base_model_path.suffix:
         base_model_path = base_model_path.with_suffix(".pt")
 
-    log_path = Path(args.log_path) if args.log_path.strip() else base_model_path.with_suffix(".log")
+    log_name = Path(args.log_path).name if args.log_path.strip() else f"{base_model_path.stem}.log"
+    log_path = exp_dir / log_name
     logger = setup_logger(log_path)
 
     pairs, action_dim = load_samples_csv(data_dir)
@@ -484,6 +471,7 @@ def main() -> int:
 
     logger.info("=== Dataset ===")
     logger.info(f"Data dir: {data_dir.resolve()}")
+    logger.info(f"Experiment dir: {exp_dir.resolve()}")
     logger.info(f"Total samples: {len(pairs)}")
     logger.info(f"Train samples (first {args.train_frac*100:.1f}%): {len(train_pairs)}")
     logger.info(f"Test samples (remaining): {len(test_pairs)}")
@@ -518,18 +506,18 @@ def main() -> int:
         drop_last=False,
     )
 
-    plot_path = base_model_path.with_name(f"{base_model_path.stem}_learning_curve.png")
-    history_path = base_model_path.with_name(f"{base_model_path.stem}_history.json")
+    plot_path = exp_dir / f"{base_model_path.stem}_learning_curve.png"
+    history_path = exp_dir / f"{base_model_path.stem}_history.json"
 
     if args.mode == "train":
         model = SimpleCNN(num_classes=action_dim).to(device)
         logger.info("=== Training ===")
-        logger.info(f"Base model path: {base_model_path.resolve()}")
-        logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt")
+        logger.info(f"Base model file: {base_model_path.resolve()}")
+        logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt (in exp_dir)")
         logger.info(f"Plot (latest): {plot_path.resolve()}")
         logger.info(f"History JSON: {history_path.resolve()}")
 
-        train(
+        train_loop(
             model=model,
             train_loader=train_loader,
             test_loader=test_loader,
@@ -548,7 +536,13 @@ def main() -> int:
 
     # test mode
     logger.info("=== Testing ===")
-    model, saved_action_dim, saved_image_size, saved_epoch, saved_history = load_model(base_model_path, device=device)
+
+    # In test mode, model_path is also resolved inside exp_dir:
+    model_to_load = exp_dir / Path(args.model_path).name
+    if not model_to_load.suffix:
+        model_to_load = model_to_load.with_suffix(".pt")
+
+    model, saved_action_dim, saved_image_size, saved_epoch, _saved_history = load_model(model_to_load, device=device)
 
     if saved_action_dim != action_dim:
         logger.warning(
