@@ -31,5 +31,7 @@
 
 015_automl_with_autogluon/autogluon_ts_predictor_using_covariates/*
 
+021_robot_arm_simulator/data*
+
 # Ignore checkpoint files
 *-checkpoint.ipynb
