@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train/Test a PyTorch CNN on the recorded robot-arm dataset.
+Train/Test a PyTorch CNN or a custom ResNet on the recorded robot-arm dataset.
 
 Dataset format (inside --data_dir):
 - samples.csv with columns: image_filename, action
@@ -24,34 +24,39 @@ Output management:
     - history json (.json)
     - learning curve plots (.png)
 
-NEW (augmentation):
-- Training data augmentation is applied ONLY in train mode (not in test mode).
+Model selection:
+- Use --model {cnn,resnet} to choose architecture for train/test.
+
+Augmentation:
+- Training augmentation is applied ONLY in train mode.
 - Enable/disable via --augment / --no_augment and control via --aug_* options.
 
 Examples:
-  # Train with augmentation (default)
+  # Train ResNet
   python robot_arm_controller_cnn.py \
       --data_dir ./data_dof2_100000 \
       --mode train \
-      --exp_dir ./experiment1_cnn_aug \
-      --model_path cnn.pt \
-      --train_frac 0.8 --epochs 50
+      --model resnet \
+      --exp_dir ./experiments/exp_resnet \
+      --model_path model.pt \
+      --epochs 50
 
-  # Train without augmentation
+  # Train CNN
   python robot_arm_controller_cnn.py \
       --data_dir ./data_dof2_100000 \
       --mode train \
-      --exp_dir ./experiment1_cnn_noaug \
-      --model_path cnn.pt \
-      --no_augment
+      --model cnn \
+      --exp_dir ./experiments/exp_cnn \
+      --model_path model.pt \
+      --epochs 50
 
-  # Test
+  # Test (must specify the model type you want to instantiate)
   python robot_arm_controller_cnn.py \
       --data_dir ./data_dof2_100000 \
       --mode test \
-      --exp_dir ./experiment1_cnn_aug \
-      --model_path cnn_epoch050.pt \
-      --train_frac 0.8
+      --model resnet \
+      --exp_dir ./experiments/exp_resnet \
+      --model_path model_epoch050.pt
 
 Requirements:
   pip install torch torchvision pillow matplotlib
@@ -64,7 +69,7 @@ import logging
 import math
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -89,7 +94,7 @@ except ImportError as e:
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("cnn_train_test")
+    logger = logging.getLogger("arm_action_train_test")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -143,7 +148,7 @@ def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
         raise FileNotFoundError(f"Missing samples.csv in {data_dir}")
 
     pairs: List[Tuple[str, int]] = []
-    action_dim = None
+    action_dim: Optional[int] = None
 
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -190,9 +195,10 @@ def split_pairs(
 
 
 # -----------------------------
-# Model
+# Models
 # -----------------------------
 class SimpleCNN(nn.Module):
+    """Your original baseline CNN."""
     def __init__(self, num_classes: int):
         super().__init__()
         self.features = nn.Sequential(
@@ -220,6 +226,97 @@ class SimpleCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+class BasicBlock(nn.Module):
+    """Small ResNet basic block."""
+    expansion = 1
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+
+        self.downsample = None
+        if stride != 1 or in_ch != out_ch:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+
+    def forward(self, x):
+        identity = x
+
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+
+        out = out + identity
+        out = self.relu(out)
+        return out
+
+
+class SmallResNet(nn.Module):
+    """
+    Custom lightweight ResNet for geometric, synthetic images.
+
+    Design choices:
+    - No early maxpool to preserve spatial precision longer.
+    - Small channel sizes for speed.
+    - Global average pooling to reduce overfitting and allow input-size flexibility.
+    """
+    def __init__(self, num_classes: int, layers=(2, 2, 2, 2), channels=(32, 64, 128, 256)):
+        super().__init__()
+        c1, c2, c3, c4 = channels
+
+        # "Stem" (no maxpool)
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, c1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.in_ch = c1
+        self.layer1 = self._make_layer(c1, blocks=layers[0], stride=1)
+        self.layer2 = self._make_layer(c2, blocks=layers[1], stride=2)
+        self.layer3 = self._make_layer(c3, blocks=layers[2], stride=2)
+        self.layer4 = self._make_layer(c4, blocks=layers[3], stride=2)
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(c4, num_classes)
+
+    def _make_layer(self, out_ch: int, blocks: int, stride: int):
+        layers = [BasicBlock(self.in_ch, out_ch, stride=stride)]
+        self.in_ch = out_ch
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(self.in_ch, out_ch, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+
+def build_model(model_name: str, num_classes: int) -> nn.Module:
+    model_name = model_name.lower().strip()
+    if model_name == "cnn":
+        return SimpleCNN(num_classes=num_classes)
+    if model_name == "resnet":
+        return SmallResNet(num_classes=num_classes)
+    raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn' or 'resnet'.")
+
+
 # -----------------------------
 # Transforms
 # -----------------------------
@@ -237,8 +334,6 @@ def build_transforms(
     Returns (train_transform, test_transform).
     Augmentations are applied ONLY to train_transform if augment=True.
     """
-
-    # Deterministic test transform
     test_tfm = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -248,10 +343,6 @@ def build_transforms(
     if not augment:
         return test_tfm, test_tfm
 
-    # Mild but useful augmentations for synthetic images
-    # - RandomResizedCrop provides scale/shift variation
-    # - RandomAffine adds rotation/translation/scale variation
-    # - ColorJitter adds camera-like intensity changes
     train_ops = [
         transforms.RandomResizedCrop(
             size=(image_size, image_size),
@@ -281,7 +372,7 @@ def build_transforms(
                 p=aug_erasing_p,
                 scale=(0.01, 0.06),
                 ratio=(0.3, 3.3),
-                value=0.0,  # erase to black (after normalization this is fine)
+                value=0.0,
                 inplace=False,
             )
         )
@@ -331,12 +422,13 @@ def save_checkpoint(
     epoch: int,
     history: Dict[str, List[float]],
     augment_cfg: Dict[str, float],
+    model_name: str,
 ) -> None:
     payload = {
         "state_dict": model.state_dict(),
         "action_dim": int(action_dim),
         "image_size": int(image_size),
-        "model_type": "SimpleCNN",
+        "model_name": str(model_name),
         "epoch": int(epoch),
         "history": history,
         "augment_cfg": augment_cfg,
@@ -345,21 +437,10 @@ def save_checkpoint(
     torch.save(payload, model_path)
 
 
-def load_model(model_path: Path, device: torch.device):
+def load_checkpoint_payload(model_path: Path, device: torch.device) -> Dict:
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    payload = torch.load(model_path, map_location=device)
-    action_dim = int(payload["action_dim"])
-    image_size = int(payload.get("image_size", 224))
-    epoch = int(payload.get("epoch", 0))
-    history = payload.get("history", {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []})
-    augment_cfg = payload.get("augment_cfg", {})
-
-    model = SimpleCNN(num_classes=action_dim).to(device)
-    model.load_state_dict(payload["state_dict"])
-    model.eval()
-    return model, action_dim, image_size, epoch, history, augment_cfg
+    return torch.load(model_path, map_location=device)
 
 
 def plot_learning_curves(out_path: Path, history: Dict[str, List[float]], title: str) -> None:
@@ -406,6 +487,7 @@ def train_loop(
     device: torch.device,
     epochs: int,
     lr: float,
+    weight_decay: float,
     logger: logging.Logger,
     base_model_path: Path,
     action_dim: int,
@@ -413,8 +495,10 @@ def train_loop(
     plot_path: Path,
     history_path: Path,
     augment_cfg: Dict[str, float],
+    model_name: str,
 ) -> None:
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # AdamW works well for both CNN and ResNet and helps generalization.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
 
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
@@ -429,6 +513,7 @@ def train_loop(
         if total_batches <= 0:
             raise RuntimeError("Training DataLoader has no batches. Check batch_size and dataset size.")
 
+        # Progress reporting every next 5% of mini-batches
         step_pct = 0.05
         reported = set()
         epoch_start = datetime.now()
@@ -454,7 +539,7 @@ def train_loop(
                 reported.add(bucket)
                 pct = min(100, int(round(progress * 100)))
                 logger.info(
-                    f"Epoch {epoch:03d}/{epochs} | progress ~{pct:3d}% "
+                    f"[{model_name}] Epoch {epoch:03d}/{epochs} | progress ~{pct:3d}% "
                     f"({b_idx}/{total_batches} batches) | "
                     f"running_loss={running_loss / max(1, total):.4f} | "
                     f"running_acc={correct / max(1, total) * 100:.2f}%"
@@ -471,7 +556,7 @@ def train_loop(
 
         elapsed = datetime.now() - epoch_start
         logger.info(
-            f"Epoch {epoch:03d}/{epochs} DONE | "
+            f"[{model_name}] Epoch {epoch:03d}/{epochs} DONE | "
             f"train_loss={train_loss:.4f} | train_acc={train_acc*100:.2f}% | "
             f"test_loss={test_loss:.4f} | test_acc={test_acc*100:.2f}% | "
             f"epoch_time={elapsed}"
@@ -486,10 +571,11 @@ def train_loop(
             epoch=epoch,
             history=history,
             augment_cfg=augment_cfg,
+            model_name=model_name,
         )
         logger.info(f"Saved checkpoint: {ckpt_path.resolve()}")
 
-        plot_title = f"Learning Curves ({base_model_path.stem})"
+        plot_title = f"Learning Curves ({model_name})"
         plot_learning_curves(plot_path, history, plot_title)
         plot_epoch_path = plot_path.with_name(f"{plot_path.stem}_epoch{epoch:03d}{plot_path.suffix}")
         plot_learning_curves(plot_epoch_path, history, plot_title)
@@ -505,9 +591,10 @@ def train_loop(
 # CLI / Main
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train/test a CNN on robot-arm image->action data.")
+    p = argparse.ArgumentParser(description="Train/test CNN or ResNet on robot-arm image->action data.")
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
+    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet"], help="Which model architecture to use.")
 
     p.add_argument("--model_path", type=str, required=True,
                    help="Model filename or path; will be saved/loaded inside --exp_dir.")
@@ -517,6 +604,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=10, help="Training epochs (train mode only).")
     p.add_argument("--batch_size", type=int, default=64, help="Batch size.")
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate (train mode only).")
+    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW (default: 1e-4).")
 
     p.add_argument("--image_size", type=int, default=224, help="Resize images to this square size (default: 224).")
     p.add_argument("--num_workers", type=int, default=2, help="DataLoader workers.")
@@ -554,7 +642,7 @@ def main() -> int:
 
     # Force all outputs into exp_dir by using only filenames.
     base_model_name = Path(args.model_path).name
-    base_model_path = (exp_dir / base_model_name)
+    base_model_path = exp_dir / base_model_name
     if not base_model_path.suffix:
         base_model_path = base_model_path.with_suffix(".pt")
 
@@ -577,19 +665,23 @@ def main() -> int:
         "aug_erasing_p": float(args.aug_erasing_p),
     }
 
-    logger.info("=== Dataset ===")
+    logger.info("=== Run ===")
+    logger.info(f"Mode: {args.mode}")
+    logger.info(f"Model: {args.model}")
     logger.info(f"Data dir: {data_dir.resolve()}")
     logger.info(f"Experiment dir: {exp_dir.resolve()}")
+    logger.info(f"Base model file: {base_model_path.resolve()}")
     logger.info(f"Total samples: {len(pairs)}")
     logger.info(f"Train samples (first {args.train_frac*100:.1f}%): {len(train_pairs)}")
     logger.info(f"Test samples (remaining): {len(test_pairs)}")
     logger.info(f"Action dim (num classes): {action_dim}")
     logger.info(f"Device: {device}")
+    logger.info(f"Hyperparams: epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, wd={args.weight_decay}")
     logger.info(f"Augment cfg: {augment_cfg}")
 
     train_tfm, test_tfm = build_transforms(
         image_size=args.image_size,
-        augment=args.augment if args.mode == "train" else False,  # never augment in test mode
+        augment=args.augment if args.mode == "train" else False,
         aug_rotate_deg=args.aug_rotate_deg,
         aug_translate=args.aug_translate,
         aug_scale=args.aug_scale,
@@ -622,9 +714,8 @@ def main() -> int:
     history_path = exp_dir / f"{base_model_path.stem}_history.json"
 
     if args.mode == "train":
-        model = SimpleCNN(num_classes=action_dim).to(device)
+        model = build_model(args.model, num_classes=action_dim).to(device)
         logger.info("=== Training ===")
-        logger.info(f"Base model file: {base_model_path.resolve()}")
         logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt (in exp_dir)")
         logger.info(f"Plot (latest): {plot_path.resolve()}")
         logger.info(f"History JSON: {history_path.resolve()}")
@@ -636,6 +727,7 @@ def main() -> int:
             device=device,
             epochs=args.epochs,
             lr=args.lr,
+            weight_decay=args.weight_decay,
             logger=logger,
             base_model_path=base_model_path,
             action_dim=action_dim,
@@ -643,39 +735,57 @@ def main() -> int:
             plot_path=plot_path,
             history_path=history_path,
             augment_cfg=augment_cfg,
+            model_name=args.model,
         )
         logger.info("Training finished.")
         return 0
 
     # test mode
     logger.info("=== Testing ===")
-
     model_to_load = exp_dir / Path(args.model_path).name
     if not model_to_load.suffix:
         model_to_load = model_to_load.with_suffix(".pt")
 
-    model, saved_action_dim, saved_image_size, saved_epoch, _saved_history, saved_aug_cfg = load_model(model_to_load, device=device)
+    payload = load_checkpoint_payload(model_to_load, device=device)
+    saved_model_name = str(payload.get("model_name", "unknown"))
+    saved_action_dim = int(payload["action_dim"])
+    saved_image_size = int(payload.get("image_size", args.image_size))
+    saved_epoch = int(payload.get("epoch", 0))
+    saved_aug_cfg = payload.get("augment_cfg", {})
 
     if saved_action_dim != action_dim:
         logger.warning(
             "Action dim mismatch between dataset and saved model.\n"
             f"  dataset action_dim: {action_dim}\n"
-            f"  model action_dim:   {saved_action_dim}\n"
+            f"  checkpoint action_dim: {saved_action_dim}\n"
             "Results may be invalid."
+        )
+
+    if saved_model_name != args.model:
+        logger.warning(
+            "Model type mismatch between CLI and checkpoint.\n"
+            f"  --model: {args.model}\n"
+            f"  checkpoint model_name: {saved_model_name}\n"
+            "Will instantiate the CLI model type; if this is wrong, loading may fail."
         )
 
     if saved_image_size != args.image_size:
         logger.warning(
-            "Image size differs from saved model metadata.\n"
-            f"  saved image_size: {saved_image_size}\n"
+            "Image size differs from checkpoint metadata.\n"
+            f"  checkpoint image_size: {saved_image_size}\n"
             f"  current --image_size: {args.image_size}\n"
         )
 
+    model = build_model(args.model, num_classes=saved_action_dim).to(device)
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+
+    logger.info(f"Loaded checkpoint: {model_to_load.resolve()}")
+    logger.info(f"Checkpoint epoch: {saved_epoch}")
     if saved_aug_cfg:
-        logger.info(f"Model was trained with augment cfg: {saved_aug_cfg}")
+        logger.info(f"Checkpoint augment cfg: {saved_aug_cfg}")
 
     test_loss, test_acc = evaluate(model, test_loader, device)
-    logger.info(f"Loaded checkpoint epoch: {saved_epoch}")
     logger.info(f"Test loss: {test_loss:.4f}")
     logger.info(f"Test accuracy: {test_acc*100:.2f}%")
     return 0
