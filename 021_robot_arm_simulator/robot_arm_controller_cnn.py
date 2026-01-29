@@ -17,27 +17,39 @@ Modes:
 
 - test: loads a saved model and evaluates on the remaining (1 - train_frac) portion.
 
-NEW:
+Output management:
 - All generated files are saved inside --exp_dir:
     - model checkpoints (.pt)
     - log file (.log)
     - history json (.json)
     - learning curve plots (.png)
 
+NEW (augmentation):
+- Training data augmentation is applied ONLY in train mode (not in test mode).
+- Enable/disable via --augment / --no_augment and control via --aug_* options.
+
 Examples:
-  # Train (everything into ./experiments/exp001/)
+  # Train with augmentation (default)
   python robot_arm_controller_cnn.py \
       --data_dir ./data_dof2_100000 \
       --mode train \
-      --exp_dir ./experiment1_cnn \
+      --exp_dir ./experiment1_cnn_aug \
       --model_path cnn.pt \
       --train_frac 0.8 --epochs 50
 
-  # Test (loads a checkpoint from the same exp_dir)
+  # Train without augmentation
+  python robot_arm_controller_cnn.py \
+      --data_dir ./data_dof2_100000 \
+      --mode train \
+      --exp_dir ./experiment1_cnn_noaug \
+      --model_path cnn.pt \
+      --no_augment
+
+  # Test
   python robot_arm_controller_cnn.py \
       --data_dir ./data_dof2_100000 \
       --mode test \
-      --exp_dir ./experiment1_cnn \
+      --exp_dir ./experiment1_cnn_aug \
       --model_path cnn_epoch050.pt \
       --train_frac 0.8
 
@@ -173,8 +185,7 @@ def split_pairs(
 
     n = len(pairs)
     n_train = int(n * train_frac)
-    n_train = max(1, min(n - 1, n_train))  # ensure at least 1 in each split
-
+    n_train = max(1, min(n - 1, n_train))
     return pairs[:n_train], pairs[n_train:]
 
 
@@ -207,6 +218,76 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         return self.classifier(self.features(x))
+
+
+# -----------------------------
+# Transforms
+# -----------------------------
+def build_transforms(
+    image_size: int,
+    augment: bool,
+    aug_rotate_deg: float,
+    aug_translate: float,
+    aug_scale: float,
+    aug_brightness: float,
+    aug_contrast: float,
+    aug_erasing_p: float,
+) -> Tuple[transforms.Compose, transforms.Compose]:
+    """
+    Returns (train_transform, test_transform).
+    Augmentations are applied ONLY to train_transform if augment=True.
+    """
+
+    # Deterministic test transform
+    test_tfm = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ])
+
+    if not augment:
+        return test_tfm, test_tfm
+
+    # Mild but useful augmentations for synthetic images
+    # - RandomResizedCrop provides scale/shift variation
+    # - RandomAffine adds rotation/translation/scale variation
+    # - ColorJitter adds camera-like intensity changes
+    train_ops = [
+        transforms.RandomResizedCrop(
+            size=(image_size, image_size),
+            scale=(max(0.7, 1.0 - aug_scale), 1.0),
+            ratio=(0.95, 1.05),
+        ),
+        transforms.RandomAffine(
+            degrees=aug_rotate_deg,
+            translate=(aug_translate, aug_translate),
+            scale=(max(0.7, 1.0 - aug_scale), 1.0 + aug_scale),
+            shear=None,
+            fill=255,  # white background
+        ),
+        transforms.ColorJitter(
+            brightness=aug_brightness,
+            contrast=aug_contrast,
+            saturation=0.0,
+            hue=0.0,
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ]
+
+    if aug_erasing_p > 0.0:
+        train_ops.append(
+            transforms.RandomErasing(
+                p=aug_erasing_p,
+                scale=(0.01, 0.06),
+                ratio=(0.3, 3.3),
+                value=0.0,  # erase to black (after normalization this is fine)
+                inplace=False,
+            )
+        )
+
+    train_tfm = transforms.Compose(train_ops)
+    return train_tfm, test_tfm
 
 
 # -----------------------------
@@ -249,6 +330,7 @@ def save_checkpoint(
     image_size: int,
     epoch: int,
     history: Dict[str, List[float]],
+    augment_cfg: Dict[str, float],
 ) -> None:
     payload = {
         "state_dict": model.state_dict(),
@@ -257,12 +339,13 @@ def save_checkpoint(
         "model_type": "SimpleCNN",
         "epoch": int(epoch),
         "history": history,
+        "augment_cfg": augment_cfg,
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, model_path)
 
 
-def load_model(model_path: Path, device: torch.device) -> Tuple[nn.Module, int, int, int, Dict[str, List[float]]]:
+def load_model(model_path: Path, device: torch.device):
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
@@ -271,11 +354,12 @@ def load_model(model_path: Path, device: torch.device) -> Tuple[nn.Module, int, 
     image_size = int(payload.get("image_size", 224))
     epoch = int(payload.get("epoch", 0))
     history = payload.get("history", {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []})
+    augment_cfg = payload.get("augment_cfg", {})
 
     model = SimpleCNN(num_classes=action_dim).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
-    return model, action_dim, image_size, epoch, history
+    return model, action_dim, image_size, epoch, history, augment_cfg
 
 
 def plot_learning_curves(out_path: Path, history: Dict[str, List[float]], title: str) -> None:
@@ -328,6 +412,7 @@ def train_loop(
     image_size: int,
     plot_path: Path,
     history_path: Path,
+    augment_cfg: Dict[str, float],
 ) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
@@ -364,7 +449,7 @@ def train_loop(
             total += int(x.size(0))
 
             progress = b_idx / total_batches
-            bucket = int(progress / step_pct)  # 0..20
+            bucket = int(progress / step_pct)
             if bucket not in reported and progress >= step_pct:
                 reported.add(bucket)
                 pct = min(100, int(round(progress * 100)))
@@ -400,6 +485,7 @@ def train_loop(
             image_size=image_size,
             epoch=epoch,
             history=history,
+            augment_cfg=augment_cfg,
         )
         logger.info(f"Saved checkpoint: {ckpt_path.resolve()}")
 
@@ -423,8 +509,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
 
-    # IMPORTANT: model_path is now treated as a *filename* stored inside --exp_dir.
-    p.add_argument("--model_path", type=str, required=True, help="Model filename or path; will be saved/loaded inside --exp_dir.")
+    p.add_argument("--model_path", type=str, required=True,
+                   help="Model filename or path; will be saved/loaded inside --exp_dir.")
     p.add_argument("--exp_dir", type=str, required=True, help="Experiment output directory (all outputs go here).")
 
     p.add_argument("--train_frac", type=float, default=0.8, help="Fraction of samples used for training (default: 0.8).")
@@ -436,12 +522,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=2, help="DataLoader workers.")
     p.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
 
-    p.add_argument(
-        "--log_path",
-        type=str,
-        default="",
-        help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).",
-    )
+    p.add_argument("--log_path", type=str, default="",
+                   help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).")
+
+    # Augmentation controls
+    aug = p.add_argument_group("augmentation")
+    aug.add_argument("--augment", dest="augment", action="store_true", help="Enable training data augmentation (default).")
+    aug.add_argument("--no_augment", dest="augment", action="store_false", help="Disable training data augmentation.")
+    p.set_defaults(augment=True)
+
+    aug.add_argument("--aug_rotate_deg", type=float, default=10.0, help="Random rotation degrees for RandomAffine.")
+    aug.add_argument("--aug_translate", type=float, default=0.05, help="Random translation fraction for RandomAffine.")
+    aug.add_argument("--aug_scale", type=float, default=0.10, help="Random scale fraction for crop/affine.")
+    aug.add_argument("--aug_brightness", type=float, default=0.15, help="ColorJitter brightness.")
+    aug.add_argument("--aug_contrast", type=float, default=0.15, help="ColorJitter contrast.")
+    aug.add_argument("--aug_erasing_p", type=float, default=0.0, help="RandomErasing probability (0 disables).")
+
     return p.parse_args()
 
 
@@ -469,6 +565,18 @@ def main() -> int:
     pairs, action_dim = load_samples_csv(data_dir)
     train_pairs, test_pairs = split_pairs(pairs, args.train_frac)
 
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+
+    augment_cfg = {
+        "augment": bool(args.augment),
+        "aug_rotate_deg": float(args.aug_rotate_deg),
+        "aug_translate": float(args.aug_translate),
+        "aug_scale": float(args.aug_scale),
+        "aug_brightness": float(args.aug_brightness),
+        "aug_contrast": float(args.aug_contrast),
+        "aug_erasing_p": float(args.aug_erasing_p),
+    }
+
     logger.info("=== Dataset ===")
     logger.info(f"Data dir: {data_dir.resolve()}")
     logger.info(f"Experiment dir: {exp_dir.resolve()}")
@@ -476,18 +584,22 @@ def main() -> int:
     logger.info(f"Train samples (first {args.train_frac*100:.1f}%): {len(train_pairs)}")
     logger.info(f"Test samples (remaining): {len(test_pairs)}")
     logger.info(f"Action dim (num classes): {action_dim}")
-
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     logger.info(f"Device: {device}")
+    logger.info(f"Augment cfg: {augment_cfg}")
 
-    tfm = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ])
+    train_tfm, test_tfm = build_transforms(
+        image_size=args.image_size,
+        augment=args.augment if args.mode == "train" else False,  # never augment in test mode
+        aug_rotate_deg=args.aug_rotate_deg,
+        aug_translate=args.aug_translate,
+        aug_scale=args.aug_scale,
+        aug_brightness=args.aug_brightness,
+        aug_contrast=args.aug_contrast,
+        aug_erasing_p=args.aug_erasing_p,
+    )
 
-    train_ds = RobotArmImageActionDataset(data_dir, train_pairs, transform=tfm)
-    test_ds = RobotArmImageActionDataset(data_dir, test_pairs, transform=tfm)
+    train_ds = RobotArmImageActionDataset(data_dir, train_pairs, transform=train_tfm)
+    test_ds = RobotArmImageActionDataset(data_dir, test_pairs, transform=test_tfm)
 
     train_loader = DataLoader(
         train_ds,
@@ -530,6 +642,7 @@ def main() -> int:
             image_size=args.image_size,
             plot_path=plot_path,
             history_path=history_path,
+            augment_cfg=augment_cfg,
         )
         logger.info("Training finished.")
         return 0
@@ -537,12 +650,11 @@ def main() -> int:
     # test mode
     logger.info("=== Testing ===")
 
-    # In test mode, model_path is also resolved inside exp_dir:
     model_to_load = exp_dir / Path(args.model_path).name
     if not model_to_load.suffix:
         model_to_load = model_to_load.with_suffix(".pt")
 
-    model, saved_action_dim, saved_image_size, saved_epoch, _saved_history = load_model(model_to_load, device=device)
+    model, saved_action_dim, saved_image_size, saved_epoch, _saved_history, saved_aug_cfg = load_model(model_to_load, device=device)
 
     if saved_action_dim != action_dim:
         logger.warning(
@@ -557,8 +669,10 @@ def main() -> int:
             "Image size differs from saved model metadata.\n"
             f"  saved image_size: {saved_image_size}\n"
             f"  current --image_size: {args.image_size}\n"
-            "This is usually OK for this CNN, but keep it consistent for fair comparisons."
         )
+
+    if saved_aug_cfg:
+        logger.info(f"Model was trained with augment cfg: {saved_aug_cfg}")
 
     test_loss, test_acc = evaluate(model, test_loader, device)
     logger.info(f"Loaded checkpoint epoch: {saved_epoch}")
