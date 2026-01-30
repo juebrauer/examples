@@ -33,6 +33,7 @@
 
 021_robot_arm_simulator/data*
 021_robot_arm_simulator/experiment*
+021_robot_arm_simulator/backup
 
 # Ignore checkpoint files
 *-checkpoint.ipynb
