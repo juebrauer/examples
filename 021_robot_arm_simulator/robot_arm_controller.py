@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train/Test a PyTorch CNN or a custom ResNet on the recorded robot-arm dataset.
+Train/Test a PyTorch CNN, custom ResNet, or torchvision ViT on the recorded robot-arm dataset.
 
 Dataset format (inside --data_dir):
 - samples.csv with columns: image_filename, action
@@ -25,15 +25,20 @@ Output management:
     - learning curve plots (.png)
 
 Model selection:
-- Use --model {cnn,resnet} to choose architecture for train/test.
+- Use --model {cnn,resnet,vit} to choose architecture.
 
 Augmentation:
 - Training augmentation is applied ONLY in train mode.
 - Enable/disable via --augment / --no_augment and control via --aug_* options.
 
+ViT notes:
+- Uses torchvision.models.vit_b_16 by default (weights=None).
+- Replace the classification head to match num_actions.
+- ViTs often work well with AdamW and larger weight decay (e.g. 0.05); you can set --weight_decay.
+
 Examples:
   # Train ResNet
-  python robot_arm_controller_cnn.py \
+  python robot_arm_controller_models.py \
       --data_dir ./data_dof2_100000 \
       --mode train \
       --model resnet \
@@ -42,7 +47,7 @@ Examples:
       --epochs 50
 
   # Train CNN
-  python robot_arm_controller_cnn.py \
+  python robot_arm_controller_models.py \
       --data_dir ./data_dof2_100000 \
       --mode train \
       --model cnn \
@@ -50,12 +55,22 @@ Examples:
       --model_path model.pt \
       --epochs 50
 
-  # Test (must specify the model type you want to instantiate)
-  python robot_arm_controller_cnn.py \
+  # Train ViT
+  python robot_arm_controller_models.py \
+      --data_dir ./data_dof2_100000 \
+      --mode train \
+      --model vit \
+      --exp_dir ./experiments/exp_vit \
+      --model_path model.pt \
+      --epochs 50 \
+      --lr 3e-4 --weight_decay 0.05
+
+  # Test
+  python robot_arm_controller_models.py \
       --data_dir ./data_dof2_100000 \
       --mode test \
-      --model resnet \
-      --exp_dir ./experiments/exp_resnet \
+      --model vit \
+      --exp_dir ./experiments/exp_vit \
       --model_path model_epoch050.pt
 
 Requirements:
@@ -79,6 +94,7 @@ from PIL import Image
 
 try:
     from torchvision import transforms
+    import torchvision
 except ImportError as e:
     raise ImportError("torchvision is required (pip install torchvision).") from e
 
@@ -165,7 +181,7 @@ def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
 
             onehot = json.loads(action_str)
             if not isinstance(onehot, list) or not onehot:
-                raise ValueError(f"Invalid one-hot action: {action_str[:80]}...")
+                raise ValueError(f"Invalid one-hot action: {action_str[:120]}...")
 
             if action_dim is None:
                 action_dim = len(onehot)
@@ -198,7 +214,7 @@ def split_pairs(
 # Models
 # -----------------------------
 class SimpleCNN(nn.Module):
-    """Your original baseline CNN."""
+    """Baseline CNN."""
     def __init__(self, num_classes: int):
         super().__init__()
         self.features = nn.Sequential(
@@ -232,7 +248,6 @@ class BasicBlock(nn.Module):
 
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
         super().__init__()
-
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_ch)
         self.relu = nn.ReLU(inplace=True)
@@ -248,13 +263,10 @@ class BasicBlock(nn.Module):
 
     def forward(self, x):
         identity = x
-
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-
         if self.downsample is not None:
             identity = self.downsample(identity)
-
         out = out + identity
         out = self.relu(out)
         return out
@@ -263,17 +275,13 @@ class BasicBlock(nn.Module):
 class SmallResNet(nn.Module):
     """
     Custom lightweight ResNet for geometric, synthetic images.
-
-    Design choices:
     - No early maxpool to preserve spatial precision longer.
-    - Small channel sizes for speed.
-    - Global average pooling to reduce overfitting and allow input-size flexibility.
+    - Global average pooling.
     """
     def __init__(self, num_classes: int, layers=(2, 2, 2, 2), channels=(32, 64, 128, 256)):
         super().__init__()
         c1, c2, c3, c4 = channels
 
-        # "Stem" (no maxpool)
         self.stem = nn.Sequential(
             nn.Conv2d(3, c1, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(c1),
@@ -304,8 +312,24 @@ class SmallResNet(nn.Module):
         x = self.layer4(x)
         x = self.pool(x)
         x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
+        return self.fc(x)
+
+
+def build_vit_b_16(num_classes: int) -> nn.Module:
+    """
+    Build torchvision ViT-B/16 (weights=None) and replace classifier head.
+    torchvision >= 0.13 has vit_b_16; you have 0.24.1 so this is available.
+    """
+    from torchvision.models import vit_b_16
+    model = vit_b_16(weights=None)
+    # Replace classification head
+    if hasattr(model, "heads") and hasattr(model.heads, "head"):
+        in_features = model.heads.head.in_features
+        model.heads.head = nn.Linear(in_features, num_classes)
+    else:
+        # Fallback (unlikely for torchvision vit)
+        raise RuntimeError("Unexpected ViT head structure in torchvision.")
+    return model
 
 
 def build_model(model_name: str, num_classes: int) -> nn.Module:
@@ -314,7 +338,9 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
         return SimpleCNN(num_classes=num_classes)
     if model_name == "resnet":
         return SmallResNet(num_classes=num_classes)
-    raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn' or 'resnet'.")
+    if model_name == "vit":
+        return build_vit_b_16(num_classes=num_classes)
+    raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn', 'resnet', or 'vit'.")
 
 
 # -----------------------------
@@ -354,7 +380,7 @@ def build_transforms(
             translate=(aug_translate, aug_translate),
             scale=(max(0.7, 1.0 - aug_scale), 1.0 + aug_scale),
             shear=None,
-            fill=255,  # white background
+            fill=255,
         ),
         transforms.ColorJitter(
             brightness=aug_brightness,
@@ -377,8 +403,7 @@ def build_transforms(
             )
         )
 
-    train_tfm = transforms.Compose(train_ops)
-    return train_tfm, test_tfm
+    return transforms.Compose(train_ops), test_tfm
 
 
 # -----------------------------
@@ -423,6 +448,7 @@ def save_checkpoint(
     history: Dict[str, List[float]],
     augment_cfg: Dict[str, float],
     model_name: str,
+    optim_cfg: Dict[str, float],
 ) -> None:
     payload = {
         "state_dict": model.state_dict(),
@@ -432,6 +458,8 @@ def save_checkpoint(
         "epoch": int(epoch),
         "history": history,
         "augment_cfg": augment_cfg,
+        "optim_cfg": optim_cfg,
+        "torchvision_version": getattr(torchvision, "__version__", "unknown"),
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, model_path)
@@ -497,9 +525,10 @@ def train_loop(
     augment_cfg: Dict[str, float],
     model_name: str,
 ) -> None:
-    # AdamW works well for both CNN and ResNet and helps generalization.
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
+
+    optim_cfg = {"optimizer": "AdamW", "lr": float(lr), "weight_decay": float(weight_decay)}
 
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
 
@@ -513,7 +542,6 @@ def train_loop(
         if total_batches <= 0:
             raise RuntimeError("Training DataLoader has no batches. Check batch_size and dataset size.")
 
-        # Progress reporting every next 5% of mini-batches
         step_pct = 0.05
         reported = set()
         epoch_start = datetime.now()
@@ -572,6 +600,7 @@ def train_loop(
             history=history,
             augment_cfg=augment_cfg,
             model_name=model_name,
+            optim_cfg=optim_cfg,
         )
         logger.info(f"Saved checkpoint: {ckpt_path.resolve()}")
 
@@ -591,10 +620,10 @@ def train_loop(
 # CLI / Main
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train/test CNN or ResNet on robot-arm image->action data.")
+    p = argparse.ArgumentParser(description="Train/test CNN, ResNet, or ViT on robot-arm image->action data.")
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
-    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet"], help="Which model architecture to use.")
+    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet", "vit"], help="Which model architecture to use.")
 
     p.add_argument("--model_path", type=str, required=True,
                    help="Model filename or path; will be saved/loaded inside --exp_dir.")
@@ -613,7 +642,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_path", type=str, default="",
                    help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).")
 
-    # Augmentation controls
     aug = p.add_argument_group("augmentation")
     aug.add_argument("--augment", dest="augment", action="store_true", help="Enable training data augmentation (default).")
     aug.add_argument("--no_augment", dest="augment", action="store_false", help="Disable training data augmentation.")
@@ -678,6 +706,7 @@ def main() -> int:
     logger.info(f"Device: {device}")
     logger.info(f"Hyperparams: epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, wd={args.weight_decay}")
     logger.info(f"Augment cfg: {augment_cfg}")
+    logger.info(f"torchvision: {torchvision.__version__}")
 
     train_tfm, test_tfm = build_transforms(
         image_size=args.image_size,
@@ -752,6 +781,7 @@ def main() -> int:
     saved_image_size = int(payload.get("image_size", args.image_size))
     saved_epoch = int(payload.get("epoch", 0))
     saved_aug_cfg = payload.get("augment_cfg", {})
+    saved_optim_cfg = payload.get("optim_cfg", {})
 
     if saved_action_dim != action_dim:
         logger.warning(
@@ -784,6 +814,8 @@ def main() -> int:
     logger.info(f"Checkpoint epoch: {saved_epoch}")
     if saved_aug_cfg:
         logger.info(f"Checkpoint augment cfg: {saved_aug_cfg}")
+    if saved_optim_cfg:
+        logger.info(f"Checkpoint optim cfg: {saved_optim_cfg}")
 
     test_loss, test_acc = evaluate(model, test_loader, device)
     logger.info(f"Test loss: {test_loss:.4f}")
