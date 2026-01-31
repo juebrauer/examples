@@ -30,16 +30,17 @@ Augmentation:
 - Training augmentation is applied ONLY in train mode.
 - Enable/disable via --augment / --no_augment and control via --aug_* options.
 
-NEW: faster evaluation
-- Use --test_frac and/or --test_max_samples to evaluate only a subset of the test split
-  (useful for quick sanity checks / overfitting tests).
+IMPORTANT CHANGE (Jan 2026):
+- We avoid RandomResizedCrop by default because it can crop out essential structures
+  (target/end-effector). Augmentation is now "safe": Resize -> RandomAffine -> ColorJitter.
 
-NEW: ViT-friendly training options
-- --warmup_epochs: linear LR warmup
-- --scheduler: none or cosine
-- --min_lr: cosine LR floor
-- --label_smoothing: CrossEntropy label smoothing
-- --amp: automatic mixed precision (CUDA)
+NEW: faster evaluation
+- Use --test_frac and/or --test_max_samples to evaluate only a subset of the test split.
+
+NEW: ViT options
+- ViT uses pretrained weights by default (ImageNet). Use --vit_no_pretrained to disable.
+- Pretrained mean/std normalization is applied automatically for ViT when pretrained is enabled.
+- Warmup/cosine/label_smoothing/AMP supported.
 
 Requirements:
   pip install torch torchvision pillow matplotlib
@@ -305,32 +306,63 @@ class SmallResNet(nn.Module):
         return self.fc(x)
 
 
-def build_vit_b_16(num_classes: int) -> nn.Module:
+def build_vit_b_16(num_classes: int, pretrained: bool) -> nn.Module:
+    """
+    Build torchvision ViT-B/16. If pretrained=True, load ImageNet weights and replace the head.
+    """
     from torchvision.models import vit_b_16
-    model = vit_b_16(weights=None)
+
+    weights = None
+    if pretrained:
+        # Works in torchvision 0.24+; keeps code robust across minor version naming changes.
+        try:
+            from torchvision.models import ViT_B_16_Weights
+            weights = ViT_B_16_Weights.DEFAULT
+        except Exception:
+            weights = None
+
+    model = vit_b_16(weights=weights)
+
     # Replace classification head
     if hasattr(model, "heads") and hasattr(model.heads, "head"):
         in_features = model.heads.head.in_features
         model.heads.head = nn.Linear(in_features, num_classes)
     else:
         raise RuntimeError("Unexpected ViT head structure in torchvision.")
+
     return model
 
 
-def build_model(model_name: str, num_classes: int) -> nn.Module:
+def build_model(model_name: str, num_classes: int, vit_pretrained: bool) -> nn.Module:
     model_name = model_name.lower().strip()
     if model_name == "cnn":
         return SimpleCNN(num_classes=num_classes)
     if model_name == "resnet":
         return SmallResNet(num_classes=num_classes)
     if model_name == "vit":
-        return build_vit_b_16(num_classes=num_classes)
+        return build_vit_b_16(num_classes=num_classes, pretrained=vit_pretrained)
     raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn', 'resnet', or 'vit'.")
 
 
 # -----------------------------
 # Transforms
 # -----------------------------
+def _vit_pretrained_norm() -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Return mean/std matching torchvision ViT pretrained weights (ImageNet).
+    If weights API is unavailable, fall back to standard ImageNet mean/std.
+    """
+    try:
+        from torchvision.models import ViT_B_16_Weights
+        w = ViT_B_16_Weights.DEFAULT
+        mean = tuple(float(x) for x in w.meta["mean"])
+        std = tuple(float(x) for x in w.meta["std"])
+        return mean, std
+    except Exception:
+        # Standard ImageNet normalization
+        return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+
 def build_transforms(
     image_size: int,
     augment: bool,
@@ -340,43 +372,59 @@ def build_transforms(
     aug_brightness: float,
     aug_contrast: float,
     aug_erasing_p: float,
+    model_name: str,
+    vit_pretrained: bool,
 ) -> Tuple[transforms.Compose, transforms.Compose]:
+    """
+    IMPORTANT: No RandomResizedCrop here.
+    We use "safe augmentation" that preserves the full scene:
+        Resize -> RandomAffine (with fill) -> ColorJitter -> ToTensor -> Normalize
+    """
+    model_name = model_name.lower().strip()
+
+    if model_name == "vit" and vit_pretrained:
+        mean, std = _vit_pretrained_norm()
+    else:
+        # Original synthetic-friendly normalization
+        mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+
     test_tfm = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
     if not augment:
         return test_tfm, test_tfm
 
+    # SAFE AUGMENTATION (no cropping)
+    # - Keep aug_scale effect only inside RandomAffine scaling (not cropping).
+    min_scale = max(0.7, 1.0 - float(aug_scale))
+    max_scale = 1.0 + float(aug_scale)
+
     train_ops = [
-        transforms.RandomResizedCrop(
-            size=(image_size, image_size),
-            scale=(max(0.7, 1.0 - aug_scale), 1.0),
-            ratio=(0.95, 1.05),
-        ),
+        transforms.Resize((image_size, image_size)),
         transforms.RandomAffine(
-            degrees=aug_rotate_deg,
-            translate=(aug_translate, aug_translate),
-            scale=(max(0.7, 1.0 - aug_scale), 1.0 + aug_scale),
+            degrees=float(aug_rotate_deg),
+            translate=(float(aug_translate), float(aug_translate)),
+            scale=(min_scale, max_scale),
             shear=None,
             fill=255,
         ),
         transforms.ColorJitter(
-            brightness=aug_brightness,
-            contrast=aug_contrast,
+            brightness=float(aug_brightness),
+            contrast=float(aug_contrast),
             saturation=0.0,
             hue=0.0,
         ),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        transforms.Normalize(mean=mean, std=std),
     ]
 
     if aug_erasing_p > 0.0:
         train_ops.append(
             transforms.RandomErasing(
-                p=aug_erasing_p,
+                p=float(aug_erasing_p),
                 scale=(0.01, 0.06),
                 ratio=(0.3, 3.3),
                 value=0.0,
@@ -526,10 +574,8 @@ def train_loop(
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 
-    scaler = None
     amp_enabled = bool(use_amp and device.type == "cuda")
-    if amp_enabled:
-        scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler("cuda") if amp_enabled else None
 
     optim_cfg = {
         "optimizer": "AdamW",
@@ -593,7 +639,7 @@ def train_loop(
 
             if amp_enabled:
                 assert scaler is not None
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                     logits = model(x)
                     loss = criterion(logits, y)
                 scaler.scale(loss).backward()
@@ -677,15 +723,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train/test CNN, ResNet, or ViT on robot-arm image->action data.")
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
-    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet", "vit"], help="Which model architecture to use.")
+    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet", "vit"],
+                   help="Which model architecture to use.")
 
     p.add_argument("--model_path", type=str, required=True,
                    help="Model filename or path; will be saved/loaded inside --exp_dir.")
     p.add_argument("--exp_dir", type=str, required=True, help="Experiment output directory (all outputs go here).")
 
-    p.add_argument("--train_frac", type=float, default=0.8, help="Fraction of samples used for training (default: 0.8).")
+    p.add_argument("--train_frac", type=float, default=0.8,
+                   help="Fraction of samples used for training (default: 0.8).")
 
-    # NEW: limit evaluation size
+    # Limit evaluation size
     p.add_argument("--test_frac", type=float, default=1.0,
                    help="Fraction of test split to evaluate each epoch (default: 1.0).")
     p.add_argument("--test_max_samples", type=int, default=0,
@@ -697,7 +745,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_lr", type=float, default=1e-6, help="Minimum LR for cosine schedule.")
     p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW.")
 
-    # NEW: ViT-friendly knobs (also fine for CNN/ResNet)
+    # ViT-friendly knobs (also fine for CNN/ResNet)
     p.add_argument("--warmup_epochs", type=int, default=0, help="Linear warmup epochs (recommended for ViT).")
     p.add_argument("--scheduler", type=str, default="none", choices=["none", "cosine"],
                    help="LR scheduler: none or cosine.")
@@ -712,14 +760,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_path", type=str, default="",
                    help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).")
 
+    # ViT pretrained toggle (default: on)
+    vit = p.add_argument_group("vit")
+    vit.add_argument("--vit_pretrained", dest="vit_pretrained", action="store_true",
+                     help="Use pretrained ViT weights (default).")
+    vit.add_argument("--vit_no_pretrained", dest="vit_pretrained", action="store_false",
+                     help="Train ViT from scratch (not recommended).")
+    p.set_defaults(vit_pretrained=True)
+
     aug = p.add_argument_group("augmentation")
-    aug.add_argument("--augment", dest="augment", action="store_true", help="Enable training data augmentation (default).")
-    aug.add_argument("--no_augment", dest="augment", action="store_false", help="Disable training data augmentation.")
+    aug.add_argument("--augment", dest="augment", action="store_true",
+                     help="Enable training data augmentation (safe, no cropping).")
+    aug.add_argument("--no_augment", dest="augment", action="store_false",
+                     help="Disable training data augmentation.")
     p.set_defaults(augment=True)
 
     aug.add_argument("--aug_rotate_deg", type=float, default=10.0, help="Random rotation degrees for RandomAffine.")
     aug.add_argument("--aug_translate", type=float, default=0.05, help="Random translation fraction for RandomAffine.")
-    aug.add_argument("--aug_scale", type=float, default=0.10, help="Random scale fraction for crop/affine.")
+    aug.add_argument("--aug_scale", type=float, default=0.10, help="Random scale fraction for RandomAffine.")
     aug.add_argument("--aug_brightness", type=float, default=0.15, help="ColorJitter brightness.")
     aug.add_argument("--aug_contrast", type=float, default=0.15, help="ColorJitter contrast.")
     aug.add_argument("--aug_erasing_p", type=float, default=0.0, help="RandomErasing probability (0 disables).")
@@ -764,6 +822,8 @@ def main() -> int:
         "aug_brightness": float(args.aug_brightness),
         "aug_contrast": float(args.aug_contrast),
         "aug_erasing_p": float(args.aug_erasing_p),
+        "vit_pretrained": bool(args.vit_pretrained),
+        "safe_augmentation_no_crop": True,
     }
 
     train_cfg = {
@@ -780,11 +840,13 @@ def main() -> int:
         "label_smoothing": float(args.label_smoothing),
         "amp": bool(args.amp),
         "image_size": int(args.image_size),
+        "vit_pretrained": bool(args.vit_pretrained),
     }
 
     logger.info("=== Run ===")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Model: {args.model}")
+    logger.info(f"ViT pretrained: {args.vit_pretrained if args.model == 'vit' else 'n/a'}")
     logger.info(f"Data dir: {data_dir.resolve()}")
     logger.info(f"Experiment dir: {exp_dir.resolve()}")
     logger.info(f"Base model file: {base_model_path.resolve()}")
@@ -808,6 +870,8 @@ def main() -> int:
         aug_brightness=args.aug_brightness,
         aug_contrast=args.aug_contrast,
         aug_erasing_p=args.aug_erasing_p,
+        model_name=args.model,
+        vit_pretrained=bool(args.vit_pretrained),
     )
 
     train_ds = RobotArmImageActionDataset(data_dir, train_pairs, transform=train_tfm)
@@ -834,7 +898,7 @@ def main() -> int:
     history_path = exp_dir / f"{base_model_path.stem}_history.json"
 
     if args.mode == "train":
-        model = build_model(args.model, num_classes=action_dim).to(device)
+        model = build_model(args.model, num_classes=action_dim, vit_pretrained=bool(args.vit_pretrained)).to(device)
 
         logger.info("=== Training ===")
         logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt (in exp_dir)")
@@ -895,7 +959,9 @@ def main() -> int:
             "Will instantiate the CLI model type; if this is wrong, loading may fail."
         )
 
-    model = build_model(args.model, num_classes=saved_action_dim).to(device)
+    # Note: for test mode, we instantiate according to CLI. For ViT, you can keep pretrained on/off;
+    # loading state_dict will overwrite weights anyway.
+    model = build_model(args.model, num_classes=saved_action_dim, vit_pretrained=bool(args.vit_pretrained)).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
 
