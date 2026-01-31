@@ -9,20 +9,19 @@ Dataset format (inside --data_dir):
 - images/ folder containing the PNG files
 
 Modes:
-- train: trains on the first --train_frac portion (default 0.8), tests on the rest, and:
-    1) writes a log file
-    2) saves a model checkpoint after each epoch: <model_stem>_epoch001.pt, ...
-    3) prints/logs progress every next 5% of mini-batches within an epoch
-    4) plots and saves learning curves (loss + accuracy) after each epoch
+- train:
+    - trains on first --train_frac portion of samples.csv
+    - tests on the remaining portion
+    - writes a log file
+    - saves a checkpoint after each epoch: <model_stem>_epoch001.pt, ...
+    - prints/logs progress every next 5% of mini-batches per epoch
+    - plots and saves learning curves after each epoch
 
-- test: loads a saved model and evaluates on the remaining (1 - train_frac) portion.
+- test:
+    - loads a saved checkpoint and evaluates on the test split.
 
 Output management:
-- All generated files are saved inside --exp_dir:
-    - model checkpoints (.pt)
-    - log file (.log)
-    - history json (.json)
-    - learning curve plots (.png)
+- All generated files are saved inside --exp_dir.
 
 Model selection:
 - Use --model {cnn,resnet,vit} to choose architecture.
@@ -31,47 +30,16 @@ Augmentation:
 - Training augmentation is applied ONLY in train mode.
 - Enable/disable via --augment / --no_augment and control via --aug_* options.
 
-ViT notes:
-- Uses torchvision.models.vit_b_16 by default (weights=None).
-- Replace the classification head to match num_actions.
-- ViTs often work well with AdamW and larger weight decay (e.g. 0.05); you can set --weight_decay.
+NEW: faster evaluation
+- Use --test_frac and/or --test_max_samples to evaluate only a subset of the test split
+  (useful for quick sanity checks / overfitting tests).
 
-Examples:
-  # Train ResNet
-  python robot_arm_controller_models.py \
-      --data_dir ./data_dof2_100000 \
-      --mode train \
-      --model resnet \
-      --exp_dir ./experiments/exp_resnet \
-      --model_path model.pt \
-      --epochs 50
-
-  # Train CNN
-  python robot_arm_controller_models.py \
-      --data_dir ./data_dof2_100000 \
-      --mode train \
-      --model cnn \
-      --exp_dir ./experiments/exp_cnn \
-      --model_path model.pt \
-      --epochs 50
-
-  # Train ViT
-  python robot_arm_controller_models.py \
-      --data_dir ./data_dof2_100000 \
-      --mode train \
-      --model vit \
-      --exp_dir ./experiments/exp_vit \
-      --model_path model.pt \
-      --epochs 50 \
-      --lr 3e-4 --weight_decay 0.05
-
-  # Test
-  python robot_arm_controller_models.py \
-      --data_dir ./data_dof2_100000 \
-      --mode test \
-      --model vit \
-      --exp_dir ./experiments/exp_vit \
-      --model_path model_epoch050.pt
+NEW: ViT-friendly training options
+- --warmup_epochs: linear LR warmup
+- --scheduler: none or cosine
+- --min_lr: cosine LR floor
+- --label_smoothing: CrossEntropy label smoothing
+- --amp: automatic mixed precision (CUDA)
 
 Requirements:
   pip install torch torchvision pillow matplotlib
@@ -210,6 +178,28 @@ def split_pairs(
     return pairs[:n_train], pairs[n_train:]
 
 
+def limit_test_pairs(
+    test_pairs: List[Tuple[str, int]],
+    test_frac: float,
+    test_max_samples: int
+) -> List[Tuple[str, int]]:
+    """
+    Returns a deterministic subset of test_pairs (prefix) for faster evaluation.
+    Apply both constraints: fraction first, then max_samples.
+    """
+    if not (0.0 < test_frac <= 1.0):
+        raise ValueError("--test_frac must be in (0, 1].")
+
+    n = len(test_pairs)
+    n_frac = max(1, int(round(n * test_frac)))
+    subset = test_pairs[:n_frac]
+
+    if test_max_samples > 0:
+        subset = subset[: max(1, min(len(subset), test_max_samples))]
+
+    return subset
+
+
 # -----------------------------
 # Models
 # -----------------------------
@@ -316,10 +306,6 @@ class SmallResNet(nn.Module):
 
 
 def build_vit_b_16(num_classes: int) -> nn.Module:
-    """
-    Build torchvision ViT-B/16 (weights=None) and replace classifier head.
-    torchvision >= 0.13 has vit_b_16; you have 0.24.1 so this is available.
-    """
     from torchvision.models import vit_b_16
     model = vit_b_16(weights=None)
     # Replace classification head
@@ -327,7 +313,6 @@ def build_vit_b_16(num_classes: int) -> nn.Module:
         in_features = model.heads.head.in_features
         model.heads.head = nn.Linear(in_features, num_classes)
     else:
-        # Fallback (unlikely for torchvision vit)
         raise RuntimeError("Unexpected ViT head structure in torchvision.")
     return model
 
@@ -356,10 +341,6 @@ def build_transforms(
     aug_contrast: float,
     aug_erasing_p: float,
 ) -> Tuple[transforms.Compose, transforms.Compose]:
-    """
-    Returns (train_transform, test_transform).
-    Augmentations are applied ONLY to train_transform if augment=True.
-    """
     test_tfm = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -410,9 +391,9 @@ def build_transforms(
 # Eval / Train
 # -----------------------------
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, label_smoothing: float) -> Tuple[float, float]:
     model.eval()
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 
     total_loss = 0.0
     correct = 0
@@ -449,6 +430,7 @@ def save_checkpoint(
     augment_cfg: Dict[str, float],
     model_name: str,
     optim_cfg: Dict[str, float],
+    train_cfg: Dict[str, float],
 ) -> None:
     payload = {
         "state_dict": model.state_dict(),
@@ -459,6 +441,7 @@ def save_checkpoint(
         "history": history,
         "augment_cfg": augment_cfg,
         "optim_cfg": optim_cfg,
+        "train_cfg": train_cfg,
         "torchvision_version": getattr(torchvision, "__version__", "unknown"),
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -508,14 +491,28 @@ def plot_learning_curves(out_path: Path, history: Dict[str, List[float]], title:
     plt.close()
 
 
+def _get_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def _set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for pg in optimizer.param_groups:
+        pg["lr"] = float(lr)
+
+
 def train_loop(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
     device: torch.device,
     epochs: int,
-    lr: float,
+    base_lr: float,
+    min_lr: float,
     weight_decay: float,
+    warmup_epochs: int,
+    scheduler: str,
+    label_smoothing: float,
+    use_amp: bool,
     logger: logging.Logger,
     base_model_path: Path,
     action_dim: int,
@@ -524,13 +521,51 @@ def train_loop(
     history_path: Path,
     augment_cfg: Dict[str, float],
     model_name: str,
+    train_cfg: Dict[str, float],
 ) -> None:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 
-    optim_cfg = {"optimizer": "AdamW", "lr": float(lr), "weight_decay": float(weight_decay)}
+    scaler = None
+    amp_enabled = bool(use_amp and device.type == "cuda")
+    if amp_enabled:
+        scaler = torch.cuda.amp.GradScaler()
+
+    optim_cfg = {
+        "optimizer": "AdamW",
+        "base_lr": float(base_lr),
+        "min_lr": float(min_lr),
+        "weight_decay": float(weight_decay),
+        "scheduler": str(scheduler),
+        "warmup_epochs": int(warmup_epochs),
+        "label_smoothing": float(label_smoothing),
+        "amp": bool(amp_enabled),
+    }
 
     history: Dict[str, List[float]] = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
+
+    total_steps = epochs * len(train_loader)
+    warmup_steps = max(0, warmup_epochs * len(train_loader))
+    global_step = 0
+
+    def lr_for_step(step: int) -> float:
+        # Linear warmup then cosine decay (if selected)
+        if warmup_steps > 0 and step < warmup_steps:
+            return base_lr * (step + 1) / warmup_steps
+
+        if scheduler.lower() != "cosine":
+            return base_lr
+
+        # Cosine from base_lr down to min_lr over remaining steps
+        if total_steps <= warmup_steps:
+            return min_lr
+
+        t = (step - warmup_steps) / float(total_steps - warmup_steps)
+        t = max(0.0, min(1.0, t))
+        return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * t))
+
+    # Initialize LR to warmup start if warmup is enabled
+    _set_lr(optimizer, lr_for_step(0))
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -550,11 +585,27 @@ def train_loop(
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # Update LR per step (warmup + optional cosine)
+            lr_now = lr_for_step(global_step)
+            _set_lr(optimizer, lr_now)
+
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
+
+            if amp_enabled:
+                assert scaler is not None
+                with torch.cuda.amp.autocast():
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits = model(x)
+                loss = criterion(logits, y)
+                loss.backward()
+                optimizer.step()
+
+            global_step += 1
 
             running_loss += float(loss.item()) * x.size(0)
             preds = torch.argmax(logits, dim=1)
@@ -569,13 +620,15 @@ def train_loop(
                 logger.info(
                     f"[{model_name}] Epoch {epoch:03d}/{epochs} | progress ~{pct:3d}% "
                     f"({b_idx}/{total_batches} batches) | "
+                    f"lr={_get_lr(optimizer):.6g} | "
                     f"running_loss={running_loss / max(1, total):.4f} | "
                     f"running_acc={correct / max(1, total) * 100:.2f}%"
                 )
 
         train_loss = running_loss / max(1, total)
         train_acc = correct / max(1, total)
-        test_loss, test_acc = evaluate(model, test_loader, device)
+
+        test_loss, test_acc = evaluate(model, test_loader, device, label_smoothing=label_smoothing)
 
         history["train_loss"].append(float(train_loss))
         history["train_acc"].append(float(train_acc))
@@ -601,6 +654,7 @@ def train_loop(
             augment_cfg=augment_cfg,
             model_name=model_name,
             optim_cfg=optim_cfg,
+            train_cfg=train_cfg,
         )
         logger.info(f"Saved checkpoint: {ckpt_path.resolve()}")
 
@@ -630,10 +684,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exp_dir", type=str, required=True, help="Experiment output directory (all outputs go here).")
 
     p.add_argument("--train_frac", type=float, default=0.8, help="Fraction of samples used for training (default: 0.8).")
+
+    # NEW: limit evaluation size
+    p.add_argument("--test_frac", type=float, default=1.0,
+                   help="Fraction of test split to evaluate each epoch (default: 1.0).")
+    p.add_argument("--test_max_samples", type=int, default=0,
+                   help="Max number of test samples to evaluate (0 = no limit).")
+
     p.add_argument("--epochs", type=int, default=10, help="Training epochs (train mode only).")
     p.add_argument("--batch_size", type=int, default=64, help="Batch size.")
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate (train mode only).")
-    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW (default: 1e-4).")
+    p.add_argument("--lr", type=float, default=1e-3, help="Base learning rate (train mode only).")
+    p.add_argument("--min_lr", type=float, default=1e-6, help="Minimum LR for cosine schedule.")
+    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW.")
+
+    # NEW: ViT-friendly knobs (also fine for CNN/ResNet)
+    p.add_argument("--warmup_epochs", type=int, default=0, help="Linear warmup epochs (recommended for ViT).")
+    p.add_argument("--scheduler", type=str, default="none", choices=["none", "cosine"],
+                   help="LR scheduler: none or cosine.")
+    p.add_argument("--label_smoothing", type=float, default=0.0,
+                   help="Cross-entropy label smoothing (e.g. 0.1).")
+    p.add_argument("--amp", action="store_true", help="Enable mixed precision training on CUDA.")
 
     p.add_argument("--image_size", type=int, default=224, help="Resize images to this square size (default: 224).")
     p.add_argument("--num_workers", type=int, default=2, help="DataLoader workers.")
@@ -679,7 +749,10 @@ def main() -> int:
     logger = setup_logger(log_path)
 
     pairs, action_dim = load_samples_csv(data_dir)
-    train_pairs, test_pairs = split_pairs(pairs, args.train_frac)
+    train_pairs, test_pairs_full = split_pairs(pairs, args.train_frac)
+
+    # Limit test evaluation subset (useful for quick sanity checks)
+    test_pairs = limit_test_pairs(test_pairs_full, test_frac=args.test_frac, test_max_samples=args.test_max_samples)
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
 
@@ -693,6 +766,22 @@ def main() -> int:
         "aug_erasing_p": float(args.aug_erasing_p),
     }
 
+    train_cfg = {
+        "train_frac": float(args.train_frac),
+        "test_frac": float(args.test_frac),
+        "test_max_samples": int(args.test_max_samples),
+        "epochs": int(args.epochs),
+        "batch_size": int(args.batch_size),
+        "lr": float(args.lr),
+        "min_lr": float(args.min_lr),
+        "weight_decay": float(args.weight_decay),
+        "warmup_epochs": int(args.warmup_epochs),
+        "scheduler": str(args.scheduler),
+        "label_smoothing": float(args.label_smoothing),
+        "amp": bool(args.amp),
+        "image_size": int(args.image_size),
+    }
+
     logger.info("=== Run ===")
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Model: {args.model}")
@@ -701,10 +790,12 @@ def main() -> int:
     logger.info(f"Base model file: {base_model_path.resolve()}")
     logger.info(f"Total samples: {len(pairs)}")
     logger.info(f"Train samples (first {args.train_frac*100:.1f}%): {len(train_pairs)}")
-    logger.info(f"Test samples (remaining): {len(test_pairs)}")
+    logger.info(f"Test samples (remaining): {len(test_pairs_full)}")
+    logger.info(f"Test samples evaluated per epoch: {len(test_pairs)} (test_frac={args.test_frac}, test_max_samples={args.test_max_samples})")
     logger.info(f"Action dim (num classes): {action_dim}")
     logger.info(f"Device: {device}")
-    logger.info(f"Hyperparams: epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, wd={args.weight_decay}")
+    logger.info(f"Hyperparams: epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, min_lr={args.min_lr}, wd={args.weight_decay}")
+    logger.info(f"Scheduler: {args.scheduler}, warmup_epochs={args.warmup_epochs}, label_smoothing={args.label_smoothing}, amp={args.amp}")
     logger.info(f"Augment cfg: {augment_cfg}")
     logger.info(f"torchvision: {torchvision.__version__}")
 
@@ -744,6 +835,7 @@ def main() -> int:
 
     if args.mode == "train":
         model = build_model(args.model, num_classes=action_dim).to(device)
+
         logger.info("=== Training ===")
         logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt (in exp_dir)")
         logger.info(f"Plot (latest): {plot_path.resolve()}")
@@ -755,8 +847,13 @@ def main() -> int:
             test_loader=test_loader,
             device=device,
             epochs=args.epochs,
-            lr=args.lr,
+            base_lr=args.lr,
+            min_lr=args.min_lr,
             weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            scheduler=args.scheduler,
+            label_smoothing=args.label_smoothing,
+            use_amp=args.amp,
             logger=logger,
             base_model_path=base_model_path,
             action_dim=action_dim,
@@ -765,6 +862,7 @@ def main() -> int:
             history_path=history_path,
             augment_cfg=augment_cfg,
             model_name=args.model,
+            train_cfg=train_cfg,
         )
         logger.info("Training finished.")
         return 0
@@ -778,14 +876,12 @@ def main() -> int:
     payload = load_checkpoint_payload(model_to_load, device=device)
     saved_model_name = str(payload.get("model_name", "unknown"))
     saved_action_dim = int(payload["action_dim"])
-    saved_image_size = int(payload.get("image_size", args.image_size))
     saved_epoch = int(payload.get("epoch", 0))
-    saved_aug_cfg = payload.get("augment_cfg", {})
-    saved_optim_cfg = payload.get("optim_cfg", {})
+    saved_cfg = payload.get("train_cfg", {})
 
     if saved_action_dim != action_dim:
         logger.warning(
-            "Action dim mismatch between dataset and saved model.\n"
+            "Action dim mismatch between dataset and checkpoint.\n"
             f"  dataset action_dim: {action_dim}\n"
             f"  checkpoint action_dim: {saved_action_dim}\n"
             "Results may be invalid."
@@ -799,25 +895,16 @@ def main() -> int:
             "Will instantiate the CLI model type; if this is wrong, loading may fail."
         )
 
-    if saved_image_size != args.image_size:
-        logger.warning(
-            "Image size differs from checkpoint metadata.\n"
-            f"  checkpoint image_size: {saved_image_size}\n"
-            f"  current --image_size: {args.image_size}\n"
-        )
-
     model = build_model(args.model, num_classes=saved_action_dim).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
 
     logger.info(f"Loaded checkpoint: {model_to_load.resolve()}")
     logger.info(f"Checkpoint epoch: {saved_epoch}")
-    if saved_aug_cfg:
-        logger.info(f"Checkpoint augment cfg: {saved_aug_cfg}")
-    if saved_optim_cfg:
-        logger.info(f"Checkpoint optim cfg: {saved_optim_cfg}")
+    if saved_cfg:
+        logger.info(f"Checkpoint train_cfg: {saved_cfg}")
 
-    test_loss, test_acc = evaluate(model, test_loader, device)
+    test_loss, test_acc = evaluate(model, test_loader, device, label_smoothing=float(args.label_smoothing))
     logger.info(f"Test loss: {test_loss:.4f}")
     logger.info(f"Test accuracy: {test_acc*100:.2f}%")
     return 0
