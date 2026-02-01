@@ -34,6 +34,7 @@
 021_robot_arm_simulator/data*
 021_robot_arm_simulator/experiment*
 021_robot_arm_simulator/backup
+021_robot_arm_simulator/unsloth_compiled_cache
 
 # Ignore checkpoint files
 *-checkpoint.ipynb

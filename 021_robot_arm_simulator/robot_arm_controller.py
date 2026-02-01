@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Train/Test a PyTorch CNN, custom ResNet, or torchvision ViT on the recorded robot-arm dataset.
+robot_arm_controller.py
+
+Train/Test:
+  - A PyTorch CNN, custom ResNet, or torchvision ViT (supervised classifier)
+  - OR a Vision-Language Model (VLM) finetuned with Unsloth (instruction -> action)
+
+Goal:
+Given an image of an n-DOF robot arm and a target position (red X),
+predict the expert action (a discrete action index in a 3*DOF action space).
 
 Dataset format (inside --data_dir):
 - samples.csv with columns: image_filename, action
@@ -13,37 +21,37 @@ Modes:
     - trains on first --train_frac portion of samples.csv
     - tests on the remaining portion
     - writes a log file
-    - saves a checkpoint after each epoch: <model_stem>_epoch001.pt, ...
-    - prints/logs progress every next 5% of mini-batches per epoch
-    - plots and saves learning curves after each epoch
+    - saves checkpoints / adapters into --exp_dir
 
 - test:
-    - loads a saved checkpoint and evaluates on the test split.
-
-Output management:
-- All generated files are saved inside --exp_dir.
+    - loads a saved checkpoint / adapter and evaluates on the test split.
 
 Model selection:
-- Use --model {cnn,resnet,vit} to choose architecture.
+- Use --model {cnn,resnet,vit,vlm} to choose architecture.
 
-Augmentation:
-- Training augmentation is applied ONLY in train mode.
-- Enable/disable via --augment / --no_augment and control via --aug_* options.
+VLM option (Unsloth):
+- Finetunes a VLM with LoRA adapters using:
+    - unsloth.FastVisionModel
+    - trl.SFTTrainer + unsloth.trainer.UnslothVisionDataCollator
+- Supervised target is a short text: the action index (integer).
 
-IMPORTANT CHANGE (Jan 2026):
-- We avoid RandomResizedCrop by default because it can crop out essential structures
-  (target/end-effector). Augmentation is now "safe": Resize -> RandomAffine -> ColorJitter.
+Notes:
+- VLM training is typically heavier than CNN/ViT training.
+- VLM checkpoints are saved as a directory (adapter + tokenizer), not a single .pt file.
 
-NEW: faster evaluation
-- Use --test_frac and/or --test_max_samples to evaluate only a subset of the test split.
-
-NEW: ViT options
-- ViT uses pretrained weights by default (ImageNet). Use --vit_no_pretrained to disable.
-- Pretrained mean/std normalization is applied automatically for ViT when pretrained is enabled.
-- Warmup/cosine/label_smoothing/AMP supported.
-
-Requirements:
+Requirements (classic models):
   pip install torch torchvision pillow matplotlib
+
+Additional requirements (VLM):
+  pip install unsloth trl transformers accelerate bitsandbytes
+
+Example usage (classic):
+  python robot_arm_controller.py --data_dir ./data_dof2_5000 --exp_dir ./exp --mode train --model vit --model_path vit.pt
+  python robot_arm_controller.py --data_dir ./data_dof2_5000 --exp_dir ./exp --mode test  --model vit --model_path vit_epoch010.pt
+
+Example usage (VLM):
+  python robot_arm_controller.py --data_dir ./data_dof2_5000 --exp_dir ./exp --mode train --model vlm --model_path vlm_adapter
+  python robot_arm_controller.py --data_dir ./data_dof2_5000 --exp_dir ./exp --mode test  --model vlm --model_path vlm_adapter
 """
 
 import argparse
@@ -51,9 +59,12 @@ import csv
 import json
 import logging
 import math
+import os
+import re
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 import torch
 import torch.nn as nn
@@ -73,9 +84,9 @@ except ImportError as e:
     raise ImportError("matplotlib is required (pip install matplotlib).") from e
 
 
-# -----------------------------
+# =============================================================================
 # Logging
-# -----------------------------
+# =============================================================================
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -100,9 +111,9 @@ def setup_logger(log_path: Path) -> logging.Logger:
     return logger
 
 
-# -----------------------------
-# Dataset
-# -----------------------------
+# =============================================================================
+# Dataset helpers (CSV -> (image_rel_path, class_idx))
+# =============================================================================
 class RobotArmImageActionDataset(Dataset):
     def __init__(self, data_dir: Path, pairs: List[Tuple[str, int]], transform=None):
         self.data_dir = data_dir
@@ -168,7 +179,7 @@ def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
 
 def split_pairs(
     pairs: List[Tuple[str, int]],
-    train_frac: float
+    train_frac: float,
 ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
     if not (0.0 < train_frac < 1.0):
         raise ValueError("--train_frac must be between 0 and 1 (exclusive).")
@@ -182,12 +193,9 @@ def split_pairs(
 def limit_test_pairs(
     test_pairs: List[Tuple[str, int]],
     test_frac: float,
-    test_max_samples: int
+    test_max_samples: int,
 ) -> List[Tuple[str, int]]:
-    """
-    Returns a deterministic subset of test_pairs (prefix) for faster evaluation.
-    Apply both constraints: fraction first, then max_samples.
-    """
+    """Deterministic subset of test_pairs (prefix) for faster evaluation."""
     if not (0.0 < test_frac <= 1.0):
         raise ValueError("--test_frac must be in (0, 1].")
 
@@ -201,9 +209,9 @@ def limit_test_pairs(
     return subset
 
 
-# -----------------------------
-# Models
-# -----------------------------
+# =============================================================================
+# Classic models (CNN / ResNet / ViT)
+# =============================================================================
 class SimpleCNN(nn.Module):
     """Baseline CNN."""
     def __init__(self, num_classes: int):
@@ -307,14 +315,11 @@ class SmallResNet(nn.Module):
 
 
 def build_vit_b_16(num_classes: int, pretrained: bool) -> nn.Module:
-    """
-    Build torchvision ViT-B/16. If pretrained=True, load ImageNet weights and replace the head.
-    """
+    """Build torchvision ViT-B/16 and replace head."""
     from torchvision.models import vit_b_16
 
     weights = None
     if pretrained:
-        # Works in torchvision 0.24+; keeps code robust across minor version naming changes.
         try:
             from torchvision.models import ViT_B_16_Weights
             weights = ViT_B_16_Weights.DEFAULT
@@ -323,7 +328,6 @@ def build_vit_b_16(num_classes: int, pretrained: bool) -> nn.Module:
 
     model = vit_b_16(weights=weights)
 
-    # Replace classification head
     if hasattr(model, "heads") and hasattr(model.heads, "head"):
         in_features = model.heads.head.in_features
         model.heads.head = nn.Linear(in_features, num_classes)
@@ -341,17 +345,14 @@ def build_model(model_name: str, num_classes: int, vit_pretrained: bool) -> nn.M
         return SmallResNet(num_classes=num_classes)
     if model_name == "vit":
         return build_vit_b_16(num_classes=num_classes, pretrained=vit_pretrained)
-    raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn', 'resnet', or 'vit'.")
+    raise ValueError(f"Unknown --model '{model_name}'. Use 'cnn', 'resnet', 'vit', or 'vlm'.")
 
 
-# -----------------------------
-# Transforms
-# -----------------------------
+# =============================================================================
+# Transforms (classic models only)
+# =============================================================================
 def _vit_pretrained_norm() -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """
-    Return mean/std matching torchvision ViT pretrained weights (ImageNet).
-    If weights API is unavailable, fall back to standard ImageNet mean/std.
-    """
+    """Return mean/std matching torchvision ViT pretrained weights."""
     try:
         from torchvision.models import ViT_B_16_Weights
         w = ViT_B_16_Weights.DEFAULT
@@ -359,7 +360,6 @@ def _vit_pretrained_norm() -> Tuple[Tuple[float, float, float], Tuple[float, flo
         std = tuple(float(x) for x in w.meta["std"])
         return mean, std
     except Exception:
-        # Standard ImageNet normalization
         return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 
@@ -374,18 +374,16 @@ def build_transforms(
     aug_erasing_p: float,
     model_name: str,
     vit_pretrained: bool,
-) -> Tuple[transforms.Compose, transforms.Compose]:
+):
     """
-    IMPORTANT: No RandomResizedCrop here.
-    We use "safe augmentation" that preserves the full scene:
-        Resize -> RandomAffine (with fill) -> ColorJitter -> ToTensor -> Normalize
+    "Safe augmentation" that preserves the full scene:
+        Resize -> RandomAffine -> ColorJitter -> ToTensor -> Normalize
     """
     model_name = model_name.lower().strip()
 
     if model_name == "vit" and vit_pretrained:
         mean, std = _vit_pretrained_norm()
     else:
-        # Original synthetic-friendly normalization
         mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
 
     test_tfm = transforms.Compose([
@@ -397,8 +395,6 @@ def build_transforms(
     if not augment:
         return test_tfm, test_tfm
 
-    # SAFE AUGMENTATION (no cropping)
-    # - Keep aug_scale effect only inside RandomAffine scaling (not cropping).
     min_scale = max(0.7, 1.0 - float(aug_scale))
     max_scale = 1.0 + float(aug_scale)
 
@@ -435,11 +431,16 @@ def build_transforms(
     return transforms.Compose(train_ops), test_tfm
 
 
-# -----------------------------
-# Eval / Train
-# -----------------------------
+# =============================================================================
+# Classic eval / train
+# =============================================================================
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, label_smoothing: float) -> Tuple[float, float]:
+def evaluate_classifier(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    label_smoothing: float,
+) -> Tuple[float, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss(label_smoothing=float(label_smoothing))
 
@@ -468,7 +469,7 @@ def _epoch_checkpoint_path(base_model_path: Path, epoch: int) -> Path:
     return base_model_path.with_name(f"{stem}_epoch{epoch:03d}{suffix}")
 
 
-def save_checkpoint(
+def save_classifier_checkpoint(
     model_path: Path,
     model: nn.Module,
     action_dim: int,
@@ -496,7 +497,7 @@ def save_checkpoint(
     torch.save(payload, model_path)
 
 
-def load_checkpoint_payload(model_path: Path, device: torch.device) -> Dict:
+def load_classifier_checkpoint_payload(model_path: Path, device: torch.device) -> Dict[str, Any]:
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     return torch.load(model_path, map_location=device)
@@ -548,7 +549,7 @@ def _set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         pg["lr"] = float(lr)
 
 
-def train_loop(
+def train_classifier_loop(
     model: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
@@ -595,14 +596,12 @@ def train_loop(
     global_step = 0
 
     def lr_for_step(step: int) -> float:
-        # Linear warmup then cosine decay (if selected)
         if warmup_steps > 0 and step < warmup_steps:
             return base_lr * (step + 1) / warmup_steps
 
         if scheduler.lower() != "cosine":
             return base_lr
 
-        # Cosine from base_lr down to min_lr over remaining steps
         if total_steps <= warmup_steps:
             return min_lr
 
@@ -610,7 +609,6 @@ def train_loop(
         t = max(0.0, min(1.0, t))
         return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * t))
 
-    # Initialize LR to warmup start if warmup is enabled
     _set_lr(optimizer, lr_for_step(0))
 
     for epoch in range(1, epochs + 1):
@@ -631,7 +629,6 @@ def train_loop(
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # Update LR per step (warmup + optional cosine)
             lr_now = lr_for_step(global_step)
             _set_lr(optimizer, lr_now)
 
@@ -674,7 +671,7 @@ def train_loop(
         train_loss = running_loss / max(1, total)
         train_acc = correct / max(1, total)
 
-        test_loss, test_acc = evaluate(model, test_loader, device, label_smoothing=label_smoothing)
+        test_loss, test_acc = evaluate_classifier(model, test_loader, device, label_smoothing=label_smoothing)
 
         history["train_loss"].append(float(train_loss))
         history["train_acc"].append(float(train_acc))
@@ -690,7 +687,7 @@ def train_loop(
         )
 
         ckpt_path = _epoch_checkpoint_path(base_model_path, epoch)
-        save_checkpoint(
+        save_classifier_checkpoint(
             model_path=ckpt_path,
             model=model,
             action_dim=action_dim,
@@ -716,22 +713,405 @@ def train_loop(
         logger.info(f"Saved history: {history_path.resolve()}")
 
 
-# -----------------------------
+# =============================================================================
+# VLM (Unsloth) training / evaluation
+# =============================================================================
+@dataclass
+class VLMConfig:
+    model_name: str
+    load_in_4bit: bool
+    max_seq_length: int
+    # LoRA
+    r: int
+    lora_alpha: int
+    lora_dropout: float
+    finetune_vision_layers: bool
+    finetune_language_layers: bool
+    finetune_attention_modules: bool
+    finetune_mlp_modules: bool
+    # Trainer
+    per_device_train_batch_size: int
+    gradient_accumulation_steps: int
+    learning_rate: float
+    weight_decay: float
+    warmup_steps: int
+    num_train_epochs: int
+    logging_steps: int
+    max_steps: int
+    disable_tqdm: bool
+    optim: str
+    lr_scheduler_type: str
+    seed: int
+    max_new_tokens: int
+    temperature: float
+
+
+def _require_vlm_deps() -> None:
+    try:
+        import unsloth  # noqa: F401
+        import trl      # noqa: F401
+        import transformers  # noqa: F401
+    except Exception as e:
+        raise ImportError(
+            "VLM mode requires extra packages.\n"
+            "Install with:\n"
+            "  pip install unsloth trl transformers accelerate bitsandbytes\n"
+        ) from e
+
+
+def _vlm_instruction(action_dim: int) -> str:
+    # Keep it short and unambiguous: output an integer.
+    # The expert encoding is defined in robot_arm_simulator.py:
+    #   idx = dof_index*3 + direction; direction: 0=no change, 1=-1 degree, 2=+1 degree
+    return (
+        "You control a planar robot arm. "
+        "Given the image, output the best expert action as a single integer in [0, "
+        f"{action_dim-1}]. "
+        "Action encoding: idx = dof_index*3 + direction; direction: 0=no change, 1=-1 degree, 2=+1 degree. "
+        "Answer with ONLY the integer."
+    )
+
+
+def make_vlm_conversation_records(
+    data_dir: Path,
+    pairs: List[Tuple[str, int]],
+    action_dim: int,
+) -> List[Dict[str, Any]]:
+    """
+    Converts (image, class_idx) pairs into Unsloth VLM SFT format:
+      {"messages": [ {role:'user', content:[{text},{image}]} , {role:'assistant', content:[{text}]} ]}
+    """
+    instruction = _vlm_instruction(action_dim)
+    records: List[Dict[str, Any]] = []
+    for rel_path, class_idx in pairs:
+        img_path = str((data_dir / rel_path).resolve())
+        records.append(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": instruction},
+                            {"type": "image", "image": img_path},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": str(int(class_idx))},
+                        ],
+                    },
+                ]
+            }
+        )
+    return records
+
+
+def train_vlm_with_unsloth(
+    train_records: List[Dict[str, Any]],
+    test_records: List[Dict[str, Any]],
+    exp_dir: Path,
+    adapter_dir_name: str,
+    cfg: VLMConfig,
+    logger: logging.Logger,
+) -> Path:
+    """
+    Trains a VLM with Unsloth and saves the adapter+tokenizer to exp_dir/adapter_dir_name.
+    Returns the adapter directory path.
+    """
+    _require_vlm_deps()
+
+    from unsloth import FastVisionModel
+    from unsloth.trainer import UnslothVisionDataCollator
+    from trl import SFTTrainer, SFTConfig
+
+    torch.manual_seed(int(cfg.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(cfg.seed))
+
+    logger.info("=== VLM (Unsloth) Training ===")
+    logger.info(f"VLM base model: {cfg.model_name}")
+    logger.info(f"load_in_4bit: {cfg.load_in_4bit}")
+    logger.info(f"Train records: {len(train_records)} | Test records: {len(test_records)}")
+
+    model, tokenizer = FastVisionModel.from_pretrained(
+        cfg.model_name,
+        load_in_4bit=bool(cfg.load_in_4bit),
+        use_gradient_checkpointing="unsloth",
+    )
+
+    model = FastVisionModel.get_peft_model(
+        model,
+        finetune_vision_layers=bool(cfg.finetune_vision_layers),
+        finetune_language_layers=bool(cfg.finetune_language_layers),
+        finetune_attention_modules=bool(cfg.finetune_attention_modules),
+        finetune_mlp_modules=bool(cfg.finetune_mlp_modules),
+        r=int(cfg.r),
+        lora_alpha=int(cfg.lora_alpha),
+        lora_dropout=float(cfg.lora_dropout),
+        bias="none",
+        random_state=int(cfg.seed),
+    )
+
+    FastVisionModel.for_training(model)
+
+    out_dir = exp_dir / adapter_dir_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save config for reproducibility
+    with open(out_dir / "vlm_config.json", "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
+    # Trainer config: closely matches your notebook style.
+    sft_args = SFTConfig(
+        per_device_train_batch_size=int(cfg.per_device_train_batch_size),
+        gradient_accumulation_steps=int(cfg.gradient_accumulation_steps),
+        warmup_steps=int(cfg.warmup_steps),
+        num_train_epochs=int(cfg.num_train_epochs),
+        learning_rate=float(cfg.learning_rate),
+        logging_steps=int(cfg.logging_steps),
+        max_steps=int(cfg.max_steps) if int(cfg.max_steps) > 0 else -1,
+        disable_tqdm=bool(cfg.disable_tqdm),
+        optim=str(cfg.optim),
+        weight_decay=float(cfg.weight_decay),
+        lr_scheduler_type=str(cfg.lr_scheduler_type),
+        seed=int(cfg.seed),
+        output_dir=str(out_dir / "trainer_outputs"),
+        report_to="none",
+        # REQUIRED for vision finetuning:
+        remove_unused_columns=False,
+        dataset_text_field="",
+        dataset_kwargs={"skip_prepare_dataset": True},
+        max_length=int(cfg.max_seq_length),
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        data_collator=UnslothVisionDataCollator(model, tokenizer),
+        train_dataset=train_records,
+        args=sft_args,
+    )
+
+    if torch.cuda.is_available():
+        gpu_stats = torch.cuda.get_device_properties(0)
+        start_gpu_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+        max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+        logger.info(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB. Start reserved = {start_gpu_memory} GB.")
+
+    trainer_stats = trainer.train()
+    # Save trainer metrics
+    try:
+        metrics = dict(trainer_stats.metrics)
+    except Exception:
+        metrics = {}
+    with open(out_dir / "trainer_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    # Save adapter + tokenizer (same pattern as your notebook)
+    model.save_pretrained(str(out_dir))
+    tokenizer.save_pretrained(str(out_dir))
+    logger.info(f"Saved VLM adapter+tokenizer to: {out_dir.resolve()}")
+
+    # Optional: quick eval on provided test_records (generative)
+    try:
+        acc = evaluate_vlm_action_accuracy(
+            adapter_dir=out_dir,
+            test_records=test_records,
+            max_new_tokens=int(cfg.max_new_tokens),
+            temperature=float(cfg.temperature),
+            logger=logger,
+            limit=min(200, len(test_records)),
+        )
+        logger.info(f"[VLM] Quick eval accuracy on up to 200 test samples: {acc*100:.2f}%")
+    except Exception as e:
+        logger.warning(f"VLM quick eval failed (non-fatal): {e}")
+
+    return out_dir
+
+
+def _parse_action_int(text: str, action_dim: int) -> Optional[int]:
+    """
+    Extract the first integer from model output and validate range.
+    Returns None if parsing fails.
+    """
+    if text is None:
+        return None
+    ms = re.findall(r"-?\d+", text)
+    if not ms:
+        return None
+    try:
+        val = int(ms[-1])
+    except Exception:
+        return None
+    if 0 <= val < action_dim:
+        return val
+    return None
+
+
+@torch.no_grad()
+def evaluate_vlm_action_accuracy(
+    adapter_dir: Path,
+    test_records: List[Dict[str, Any]],
+    max_new_tokens: int,
+    temperature: float,
+    logger: logging.Logger,
+    limit: int = 0,
+) -> float:
+    """
+    Loads a finetuned adapter dir (saved by train_vlm_with_unsloth) and computes accuracy on test_records.
+    test_records must be in the same "messages" format created by make_vlm_conversation_records.
+    """
+    _require_vlm_deps()
+
+    from unsloth import FastVisionModel
+
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Adapter dir not found: {adapter_dir}")
+
+    # Load from adapter dir (as in your notebook)
+    model, tokenizer = FastVisionModel.from_pretrained(
+        model_name=str(adapter_dir),
+        load_in_4bit=True,  # adapter dirs are typically 4bit LoRA; safe default
+    )
+    FastVisionModel.for_inference(model)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    # Infer action_dim from the instruction text in the first record
+    # (we keep it robust if you change instruction format later)
+    action_dim = None
+    if test_records:
+        first_user = test_records[0]["messages"][0]["content"]
+        for c in first_user:
+            if c.get("type") == "text":
+                m = re.search(r"\[0,\s*(\d+)\]", c.get("text", ""))
+                if m:
+                    action_dim = int(m.group(1)) + 1
+    # If not parsable, fall back to reading config if present
+    if action_dim is None:
+        cfg_path = adapter_dir / "vlm_config.json"
+        if cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text())
+                # action_dim is not stored in cfg; still ok.
+            except Exception:
+                pass
+
+    # We'll parse valid range from the instruction itself per sample to be safe.
+    def get_action_dim_from_instruction(instr: str) -> Optional[int]:
+        m = re.search(r"\[0,\s*(\d+)\]", instr)
+        if m:
+            return int(m.group(1)) + 1
+        m = re.search(r"in \[0,\s*(\d+)\]", instr)
+        if m:
+            return int(m.group(1)) + 1
+        return None
+
+    n = len(test_records) if limit <= 0 else min(len(test_records), int(limit))
+    correct = 0
+    total = 0
+
+    for i in range(n):
+        sample = test_records[i]
+        user_msg = sample["messages"][0]["content"]
+        assistant_gt = sample["messages"][1]["content"][0]["text"]
+
+        img_path = None
+        instr = ""
+        for c in user_msg:
+            if c.get("type") == "image":
+                img_path = c.get("image", None)
+            elif c.get("type") == "text":
+                instr = c.get("text", "")
+
+        if img_path is None:
+            continue
+
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except Exception:
+            continue
+
+        # Build inference messages: include image and instruction.
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": instr},
+                {"type": "image"},
+            ]}
+        ]
+
+        input_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = tokenizer(
+            image,
+            input_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).to(device)
+
+        gen_kwargs = dict(
+            max_new_tokens=int(max_new_tokens),
+            use_cache=True,
+            do_sample=float(temperature) > 0.0,
+        )
+        if gen_kwargs["do_sample"]:
+            gen_kwargs["temperature"] = float(temperature)
+        out = model.generate(**inputs, **gen_kwargs)
+
+        # Decode only generated part
+        gen_ids = out[0][inputs["input_ids"].shape[1]:]
+        pred_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        # Determine valid range
+        ad = get_action_dim_from_instruction(instr) or 1_000_000
+        gt = _parse_action_int(str(assistant_gt), ad)
+        pred = _parse_action_int(pred_text, ad)
+
+        if gt is None or pred is None:
+            total += 1
+            continue
+
+        correct += int(pred == gt)
+        total += 1
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"[VLM eval] {i+1}/{n} | running_acc={(correct/max(1,total))*100:.2f}%")
+
+    acc = correct / max(1, total)
+    logger.info(f"[VLM eval] done | evaluated={total} | acc={acc*100:.2f}%")
+    return acc
+
+
+# =============================================================================
 # CLI / Main
-# -----------------------------
+# =============================================================================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train/test CNN, ResNet, or ViT on robot-arm image->action data.")
+    p = argparse.ArgumentParser(description="Train/test CNN, ResNet, ViT, or a VLM on robot-arm image->action data.")
     p.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory containing samples.csv.")
     p.add_argument("--mode", type=str, required=True, choices=["train", "test"], help="train or test")
-    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet", "vit"],
+    p.add_argument("--model", type=str, required=True, choices=["cnn", "resnet", "vit", "vlm"],
                    help="Which model architecture to use.")
 
     p.add_argument("--model_path", type=str, required=True,
-                   help="Model filename or path; will be saved/loaded inside --exp_dir.")
+                   help="Model filename/path stem; saved/loaded inside --exp_dir. "
+                        "Classic: .pt file. VLM: adapter directory name.")
     p.add_argument("--exp_dir", type=str, required=True, help="Experiment output directory (all outputs go here).")
 
     p.add_argument("--train_frac", type=float, default=0.8,
                    help="Fraction of samples used for training (default: 0.8).")
+
+    # Quick-run / verbosity controls (applies to VLM; classic uses epoch logging)
+    p.add_argument("--train_subset", type=int, default=0,
+                   help="Use only the first N training samples (0 = use all). Useful for quick sanity tests.")
+    p.add_argument("--test_subset", type=int, default=0,
+                   help="Use only the first N test samples for evaluation (0 = use all).")
+    p.add_argument("--max_steps", type=int, default=-1,
+                   help="(VLM) Stop training after this many optimizer steps. -1 means 'no cap' (train full epochs).")
+    p.add_argument("--logging_steps", type=int, default=50,
+                   help="(VLM) Log trainer metrics every N steps (default: 50).")
+    p.add_argument("--disable_tqdm", action="store_true",
+                   help="(VLM) Disable the progress bar to reduce console spam.")
 
     # Limit evaluation size
     p.add_argument("--test_frac", type=float, default=1.0,
@@ -739,26 +1119,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test_max_samples", type=int, default=0,
                    help="Max number of test samples to evaluate (0 = no limit).")
 
-    p.add_argument("--epochs", type=int, default=10, help="Training epochs (train mode only).")
-    p.add_argument("--batch_size", type=int, default=64, help="Batch size.")
-    p.add_argument("--lr", type=float, default=1e-3, help="Base learning rate (train mode only).")
-    p.add_argument("--min_lr", type=float, default=1e-6, help="Minimum LR for cosine schedule.")
-    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW.")
+    # Classic training params (ignored in VLM mode unless they overlap)
+    p.add_argument("--epochs", type=int, default=10, help="Training epochs (classic models).")
+    p.add_argument("--batch_size", type=int, default=64, help="Batch size (classic models).")
+    p.add_argument("--lr", type=float, default=1e-3, help="Base learning rate (classic models).")
+    p.add_argument("--min_lr", type=float, default=1e-6, help="Minimum LR for cosine schedule (classic models).")
+    p.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW (classic models).")
 
-    # ViT-friendly knobs (also fine for CNN/ResNet)
-    p.add_argument("--warmup_epochs", type=int, default=0, help="Linear warmup epochs (recommended for ViT).")
+    p.add_argument("--warmup_epochs", type=int, default=0, help="Linear warmup epochs (classic models).")
     p.add_argument("--scheduler", type=str, default="none", choices=["none", "cosine"],
-                   help="LR scheduler: none or cosine.")
+                   help="LR scheduler (classic models): none or cosine.")
     p.add_argument("--label_smoothing", type=float, default=0.0,
-                   help="Cross-entropy label smoothing (e.g. 0.1).")
-    p.add_argument("--amp", action="store_true", help="Enable mixed precision training on CUDA.")
+                   help="Cross-entropy label smoothing (classic models).")
+    p.add_argument("--amp", action="store_true", help="Enable mixed precision training on CUDA (classic models).")
 
-    p.add_argument("--image_size", type=int, default=224, help="Resize images to this square size (default: 224).")
-    p.add_argument("--num_workers", type=int, default=2, help="DataLoader workers.")
-    p.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available.")
+    p.add_argument("--image_size", type=int, default=224, help="Resize images (classic models).")
+    p.add_argument("--num_workers", type=int, default=2, help="DataLoader workers (classic models).")
+    p.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available (classic models).")
 
     p.add_argument("--log_path", type=str, default="",
-                   help="Optional log filename/path; will be placed inside --exp_dir (only the name is used).")
+                   help="Optional log filename/path; placed inside --exp_dir (only the name is used).")
 
     # ViT pretrained toggle (default: on)
     vit = p.add_argument_group("vit")
@@ -768,6 +1148,7 @@ def parse_args() -> argparse.Namespace:
                      help="Train ViT from scratch (not recommended).")
     p.set_defaults(vit_pretrained=True)
 
+    # Augmentation (classic models)
     aug = p.add_argument_group("augmentation")
     aug.add_argument("--augment", dest="augment", action="store_true",
                      help="Enable training data augmentation (safe, no cropping).")
@@ -775,12 +1156,62 @@ def parse_args() -> argparse.Namespace:
                      help="Disable training data augmentation.")
     p.set_defaults(augment=True)
 
-    aug.add_argument("--aug_rotate_deg", type=float, default=10.0, help="Random rotation degrees for RandomAffine.")
-    aug.add_argument("--aug_translate", type=float, default=0.05, help="Random translation fraction for RandomAffine.")
-    aug.add_argument("--aug_scale", type=float, default=0.10, help="Random scale fraction for RandomAffine.")
-    aug.add_argument("--aug_brightness", type=float, default=0.15, help="ColorJitter brightness.")
-    aug.add_argument("--aug_contrast", type=float, default=0.15, help="ColorJitter contrast.")
-    aug.add_argument("--aug_erasing_p", type=float, default=0.0, help="RandomErasing probability (0 disables).")
+    aug.add_argument("--aug_rotate_deg", type=float, default=10.0)
+    aug.add_argument("--aug_translate", type=float, default=0.05)
+    aug.add_argument("--aug_scale", type=float, default=0.10)
+    aug.add_argument("--aug_brightness", type=float, default=0.15)
+    aug.add_argument("--aug_contrast", type=float, default=0.15)
+    aug.add_argument("--aug_erasing_p", type=float, default=0.0)
+
+    # VLM options (Unsloth)
+    vlm = p.add_argument_group("vlm (unsloth)")
+    vlm.add_argument("--vlm_model_name", type=str,
+                     default="unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit",
+                     help="Base VLM model name (HuggingFace/Unsloth).")
+    vlm.add_argument("--vlm_load_in_4bit", action="store_true", help="Load VLM in 4bit (recommended).")
+    vlm.add_argument("--vlm_no_4bit", dest="vlm_load_in_4bit", action="store_false",
+                     help="Disable 4bit loading (uses more VRAM).")
+    p.set_defaults(vlm_load_in_4bit=True)
+
+    vlm.add_argument("--vlm_max_seq_length", type=int, default=2048)
+    vlm.add_argument("--vlm_r", type=int, default=16)
+    vlm.add_argument("--vlm_lora_alpha", type=int, default=16)
+    vlm.add_argument("--vlm_lora_dropout", type=float, default=0.0)
+
+    vlm.add_argument("--vlm_finetune_vision_layers", action="store_true")
+    vlm.add_argument("--vlm_no_finetune_vision_layers", dest="vlm_finetune_vision_layers", action="store_false")
+    p.set_defaults(vlm_finetune_vision_layers=True)
+
+    vlm.add_argument("--vlm_finetune_language_layers", action="store_true")
+    vlm.add_argument("--vlm_no_finetune_language_layers", dest="vlm_finetune_language_layers", action="store_false")
+    p.set_defaults(vlm_finetune_language_layers=True)
+
+    vlm.add_argument("--vlm_finetune_attention_modules", action="store_true")
+    vlm.add_argument("--vlm_no_finetune_attention_modules", dest="vlm_finetune_attention_modules", action="store_false")
+    p.set_defaults(vlm_finetune_attention_modules=True)
+
+    vlm.add_argument("--vlm_finetune_mlp_modules", action="store_true")
+    vlm.add_argument("--vlm_no_finetune_mlp_modules", dest="vlm_finetune_mlp_modules", action="store_false")
+    p.set_defaults(vlm_finetune_mlp_modules=True)
+
+    vlm.add_argument("--vlm_train_batch_size", type=int, default=2)
+    vlm.add_argument("--vlm_grad_accum", type=int, default=4)
+    vlm.add_argument("--vlm_lr", type=float, default=2e-4)
+    vlm.add_argument("--vlm_weight_decay", type=float, default=1e-3)
+    vlm.add_argument("--vlm_warmup_steps", type=int, default=5)
+    vlm.add_argument("--vlm_epochs", type=int, default=2)
+    vlm.add_argument("--vlm_logging_steps", type=int, default=None,
+                     help="Override --logging_steps for VLM only (optional).")
+    vlm.add_argument("--vlm_optim", type=str, default="adamw_8bit")
+    vlm.add_argument("--vlm_lr_scheduler_type", type=str, default="linear")
+    vlm.add_argument("--vlm_seed", type=int, default=3407)
+
+    vlm.add_argument("--vlm_max_new_tokens", type=int, default=16)
+    vlm.add_argument("--vlm_temperature", type=float, default=0.2)
+
+    # VLM eval limit in train mode quick-eval
+    vlm.add_argument("--vlm_quick_eval_max", type=int, default=200,
+                     help="Max samples for quick eval after training (0 disables).")
 
     return p.parse_args()
 
@@ -797,22 +1228,101 @@ def main() -> int:
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Force all outputs into exp_dir by using only filenames.
-    base_model_name = Path(args.model_path).name
-    base_model_path = exp_dir / base_model_name
-    if not base_model_path.suffix:
-        base_model_path = base_model_path.with_suffix(".pt")
+    model_path_name = Path(args.model_path).name
 
-    log_name = Path(args.log_path).name if args.log_path.strip() else f"{base_model_path.stem}.log"
+    log_name = Path(args.log_path).name if args.log_path.strip() else f"{Path(model_path_name).stem}.log"
     log_path = exp_dir / log_name
     logger = setup_logger(log_path)
 
     pairs, action_dim = load_samples_csv(data_dir)
     train_pairs, test_pairs_full = split_pairs(pairs, args.train_frac)
 
-    # Limit test evaluation subset (useful for quick sanity checks)
+    # Optional quick-test subsets (deterministic: keep order as in CSV)
+    if int(args.train_subset) > 0:
+        train_pairs = train_pairs[: int(args.train_subset)]
+    if int(args.test_subset) > 0:
+        test_pairs_full = test_pairs_full[: int(args.test_subset)]
+
     test_pairs = limit_test_pairs(test_pairs_full, test_frac=args.test_frac, test_max_samples=args.test_max_samples)
 
+    logger.info("=== Run ===")
+    logger.info(f"Mode: {args.mode}")
+    logger.info(f"Model: {args.model}")
+    logger.info(f"Data dir: {data_dir.resolve()}")
+    logger.info(f"Experiment dir: {exp_dir.resolve()}")
+    logger.info(f"Total samples: {len(pairs)} | Train: {len(train_pairs)} | Test(full): {len(test_pairs_full)} | Test(eval): {len(test_pairs)}")
+    logger.info(f"Action dim (num classes): {action_dim}")
+
+    # -------------------------------------------------------------------------
+    # VLM PATH
+    # -------------------------------------------------------------------------
+    if args.model == "vlm":
+        adapter_dir = exp_dir / model_path_name  # directory
+
+        if args.mode == "train":
+            train_records = make_vlm_conversation_records(data_dir, train_pairs, action_dim=action_dim)
+            test_records = make_vlm_conversation_records(data_dir, test_pairs, action_dim=action_dim)
+
+            cfg = VLMConfig(
+                model_name=str(args.vlm_model_name),
+                load_in_4bit=bool(args.vlm_load_in_4bit),
+                max_seq_length=int(args.vlm_max_seq_length),
+                r=int(args.vlm_r),
+                lora_alpha=int(args.vlm_lora_alpha),
+                lora_dropout=float(args.vlm_lora_dropout),
+                finetune_vision_layers=bool(args.vlm_finetune_vision_layers),
+                finetune_language_layers=bool(args.vlm_finetune_language_layers),
+                finetune_attention_modules=bool(args.vlm_finetune_attention_modules),
+                finetune_mlp_modules=bool(args.vlm_finetune_mlp_modules),
+                per_device_train_batch_size=int(args.vlm_train_batch_size),
+                gradient_accumulation_steps=int(args.vlm_grad_accum),
+                learning_rate=float(args.vlm_lr),
+                weight_decay=float(args.vlm_weight_decay),
+                warmup_steps=int(args.vlm_warmup_steps),
+                num_train_epochs=int(args.vlm_epochs),
+                logging_steps=int(args.vlm_logging_steps if args.vlm_logging_steps is not None else args.logging_steps),
+                max_steps=int(args.max_steps),
+                disable_tqdm=bool(args.disable_tqdm),
+                optim=str(args.vlm_optim),
+                lr_scheduler_type=str(args.vlm_lr_scheduler_type),
+                seed=int(args.vlm_seed),
+                max_new_tokens=int(args.vlm_max_new_tokens),
+                temperature=float(args.vlm_temperature),
+            )
+
+            train_vlm_with_unsloth(
+                train_records=train_records,
+                test_records=test_records,
+                exp_dir=exp_dir,
+                adapter_dir_name=model_path_name,
+                cfg=cfg,
+                logger=logger,
+            )
+            logger.info("VLM training finished.")
+            return 0
+
+        # test mode
+        if not adapter_dir.exists():
+            logger.error(f"Adapter directory not found: {adapter_dir.resolve()}")
+            return 1
+
+        test_records = make_vlm_conversation_records(data_dir, test_pairs, action_dim=action_dim)
+        acc = evaluate_vlm_action_accuracy(
+            adapter_dir=adapter_dir,
+            test_records=test_records,
+            max_new_tokens=int(args.vlm_max_new_tokens),
+            temperature=float(args.vlm_temperature),
+            logger=logger,
+            limit=0,
+        )
+        logger.info(f"[VLM] Test accuracy: {acc*100:.2f}%")
+        return 0
+
+    # -------------------------------------------------------------------------
+    # CLASSIC PATH (CNN/ResNet/ViT)
+    # -------------------------------------------------------------------------
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    logger.info(f"Device: {device}")
 
     augment_cfg = {
         "augment": bool(args.augment),
@@ -843,19 +1353,6 @@ def main() -> int:
         "vit_pretrained": bool(args.vit_pretrained),
     }
 
-    logger.info("=== Run ===")
-    logger.info(f"Mode: {args.mode}")
-    logger.info(f"Model: {args.model}")
-    logger.info(f"ViT pretrained: {args.vit_pretrained if args.model == 'vit' else 'n/a'}")
-    logger.info(f"Data dir: {data_dir.resolve()}")
-    logger.info(f"Experiment dir: {exp_dir.resolve()}")
-    logger.info(f"Base model file: {base_model_path.resolve()}")
-    logger.info(f"Total samples: {len(pairs)}")
-    logger.info(f"Train samples (first {args.train_frac*100:.1f}%): {len(train_pairs)}")
-    logger.info(f"Test samples (remaining): {len(test_pairs_full)}")
-    logger.info(f"Test samples evaluated per epoch: {len(test_pairs)} (test_frac={args.test_frac}, test_max_samples={args.test_max_samples})")
-    logger.info(f"Action dim (num classes): {action_dim}")
-    logger.info(f"Device: {device}")
     logger.info(f"Hyperparams: epochs={args.epochs}, batch={args.batch_size}, lr={args.lr}, min_lr={args.min_lr}, wd={args.weight_decay}")
     logger.info(f"Scheduler: {args.scheduler}, warmup_epochs={args.warmup_epochs}, label_smoothing={args.label_smoothing}, amp={args.amp}")
     logger.info(f"Augment cfg: {augment_cfg}")
@@ -894,18 +1391,23 @@ def main() -> int:
         drop_last=False,
     )
 
+    # Classic model path (single file)
+    base_model_path = exp_dir / model_path_name
+    if not base_model_path.suffix:
+        base_model_path = base_model_path.with_suffix(".pt")
+
     plot_path = exp_dir / f"{base_model_path.stem}_learning_curve.png"
     history_path = exp_dir / f"{base_model_path.stem}_history.json"
 
     if args.mode == "train":
         model = build_model(args.model, num_classes=action_dim, vit_pretrained=bool(args.vit_pretrained)).to(device)
 
-        logger.info("=== Training ===")
+        logger.info("=== Training (classic) ===")
         logger.info(f"Checkpoints: {base_model_path.stem}_epoch###.pt (in exp_dir)")
         logger.info(f"Plot (latest): {plot_path.resolve()}")
         logger.info(f"History JSON: {history_path.resolve()}")
 
-        train_loop(
+        train_classifier_loop(
             model=model,
             train_loader=train_loader,
             test_loader=test_loader,
@@ -931,13 +1433,13 @@ def main() -> int:
         logger.info("Training finished.")
         return 0
 
-    # test mode
-    logger.info("=== Testing ===")
-    model_to_load = exp_dir / Path(args.model_path).name
+    # test mode (classic)
+    logger.info("=== Testing (classic) ===")
+    model_to_load = exp_dir / model_path_name
     if not model_to_load.suffix:
         model_to_load = model_to_load.with_suffix(".pt")
 
-    payload = load_checkpoint_payload(model_to_load, device=device)
+    payload = load_classifier_checkpoint_payload(model_to_load, device=device)
     saved_model_name = str(payload.get("model_name", "unknown"))
     saved_action_dim = int(payload["action_dim"])
     saved_epoch = int(payload.get("epoch", 0))
@@ -959,8 +1461,6 @@ def main() -> int:
             "Will instantiate the CLI model type; if this is wrong, loading may fail."
         )
 
-    # Note: for test mode, we instantiate according to CLI. For ViT, you can keep pretrained on/off;
-    # loading state_dict will overwrite weights anyway.
     model = build_model(args.model, num_classes=saved_action_dim, vit_pretrained=bool(args.vit_pretrained)).to(device)
     model.load_state_dict(payload["state_dict"])
     model.eval()
@@ -970,7 +1470,7 @@ def main() -> int:
     if saved_cfg:
         logger.info(f"Checkpoint train_cfg: {saved_cfg}")
 
-    test_loss, test_acc = evaluate(model, test_loader, device, label_smoothing=float(args.label_smoothing))
+    test_loss, test_acc = evaluate_classifier(model, test_loader, device, label_smoothing=float(args.label_smoothing))
     logger.info(f"Test loss: {test_loss:.4f}")
     logger.info(f"Test accuracy: {test_acc*100:.2f}%")
     return 0
