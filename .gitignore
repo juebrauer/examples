@@ -33,7 +33,7 @@
 015_automl_with_autogluon/autogluon_ts_predictor_using_covariates/*
 
 021_robot_arm_simulator/data*
-021_robot_arm_simulator/experiment*
+021_robot_arm_simulator/results*
 !021_robot_arm_simulator/experiments.yaml
 021_robot_arm_simulator/unsloth_compiled_cache
 

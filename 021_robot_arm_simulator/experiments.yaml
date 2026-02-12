@@ -3,21 +3,24 @@
 # ============================================================================
 #
 # Usage:
-#   python robot_arm_controller.py --config experiments.yaml              # run all
-#   python robot_arm_controller.py --config experiments.yaml --only 1     # run experiment 1
-#   python robot_arm_controller.py --config experiments.yaml --only 1,3,5 # run experiments 1, 3, 5
+#   python robot_arm_controller.py --config experiments.yaml
+#
+# Toggle experiments on/off with the "enabled" flag.
 #
 # Result folders are created automatically:
 #   results/experiment001_cnn_data_2dof_100000/
 #   results/experiment002_resnet_scratch_data_2dof_100000/
 #   ...
 # Each folder contains: training.log, learning_curves.png, final_model.pt
+# A combined results.txt summary table is written to the results directory.
 
 # ---------------------------------------------------------------------------
 # Shared defaults (applied to all experiments unless overridden)
 # ---------------------------------------------------------------------------
 defaults:
-  data_dir: ./data_2dof_100000       # folder with samples.csv + images/
+  quicktest: true                    # true = 1 epoch, 1% train, 1% test (smoke test)
+
+  data_dir: ./data_dof2_100000       # folder with samples.csv + images/
   results_dir: ./results             # base directory for all experiment outputs
 
   train_split: 0.8                   # 80% train, 20% test
@@ -67,33 +70,41 @@ defaults:
     temperature: 0.2
 
 # ---------------------------------------------------------------------------
-# Experiments
+# Experiments – set "enabled: false" to skip an experiment
 # ---------------------------------------------------------------------------
 experiments:
   - name: cnn
+    enabled: false
     model: cnn
-    # uses all defaults
+    epochs: 20
 
   - name: resnet_scratch
+    enabled: false
     model: resnet
     pretrained: false
+    epochs: 20
 
   - name: resnet_pretrained
+    enabled: false
     model: resnet
     pretrained: true
+    epochs: 20
 
   - name: vit_scratch
+    enabled: false
     model: vit
     pretrained: false
-    epochs: 10                       # ViT from scratch may need different tuning
+    epochs: 20
     lr: 5e-4
 
   - name: vit_pretrained
+    enabled: true
     model: vit
     pretrained: true
-    epochs: 10
-    lr: 1e-4                         # lower LR for finetuning
+    epochs: 20
+    lr: 1e-4
 
   - name: vla
+    enabled: false                    # heavy; enable when GPU is available
     model: vla
-    # uses vla defaults from above
+    epochs: 5                         # VLA training is much slower per epoch

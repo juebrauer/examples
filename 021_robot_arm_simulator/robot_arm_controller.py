@@ -5,15 +5,17 @@ robot_arm_controller.py  –  Config-driven experiment runner
 Compares CNN, ResNet, ViT, and VLA models on robot-arm image → action prediction.
 
 Usage:
-  python robot_arm_controller.py --config experiments.yaml              # run all experiments
-  python robot_arm_controller.py --config experiments.yaml --only 1     # run experiment 1 only
-  python robot_arm_controller.py --config experiments.yaml --only 1,3,5 # run specific experiments
+  python robot_arm_controller.py --config experiments.yaml
+
+Toggle experiments on/off via the "enabled" flag in the YAML.
 
 Each experiment produces a result folder:
   <results_dir>/experiment001_<name>_<dataset>/
       ├── training.log
       ├── learning_curves.png
       └── final_model.pt   (or final_model/ for VLA adapters)
+
+A combined results.txt table is written to <results_dir>/results.txt.
 
 Requirements (classic models): pip install torch torchvision pillow matplotlib pyyaml
 Requirements (VLA):            pip install unsloth trl transformers accelerate bitsandbytes
@@ -26,6 +28,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,7 +48,6 @@ except ImportError as e:
 
 try:
     import matplotlib
-
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 except ImportError as e:
@@ -57,24 +59,19 @@ except ImportError as e:
 # =============================================================================
 def setup_logger(log_path: Path) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-
     logger = logging.getLogger(f"experiment_{log_path.stem}")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
-
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
-
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
-
     return logger
 
 
@@ -102,10 +99,8 @@ def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
     csv_path = data_dir / "samples.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing samples.csv in {data_dir}")
-
     pairs: List[Tuple[str, int]] = []
     action_dim: Optional[int] = None
-
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -114,15 +109,12 @@ def load_samples_csv(data_dir: Path) -> Tuple[List[Tuple[str, int]], int]:
                 action_dim = len(onehot)
             class_idx = int(max(range(len(onehot)), key=lambda i: onehot[i]))
             pairs.append((row["image_filename"].strip(), class_idx))
-
     if action_dim is None:
         raise ValueError("samples.csv is empty")
     return pairs, action_dim
 
 
-def split_data(
-    pairs: List[Tuple[str, int]], train_frac: float
-) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+def split_data(pairs, train_frac):
     n_train = max(1, min(len(pairs) - 1, int(len(pairs) * train_frac)))
     return pairs[:n_train], pairs[n_train:]
 
@@ -200,15 +192,12 @@ class SmallResNet(nn.Module):
 
 
 def build_resnet18_pretrained(num_classes: int) -> nn.Module:
-    """torchvision ResNet-18 with pretrained ImageNet weights, head replaced."""
     from torchvision.models import resnet18
-
     try:
         from torchvision.models import ResNet18_Weights
         weights = ResNet18_Weights.DEFAULT
     except ImportError:
         weights = "imagenet"
-
     model = resnet18(weights=weights)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
@@ -216,7 +205,6 @@ def build_resnet18_pretrained(num_classes: int) -> nn.Module:
 
 def build_vit(num_classes: int, pretrained: bool) -> nn.Module:
     from torchvision.models import vit_b_16
-
     weights = None
     if pretrained:
         try:
@@ -224,7 +212,6 @@ def build_vit(num_classes: int, pretrained: bool) -> nn.Module:
             weights = ViT_B_16_Weights.DEFAULT
         except Exception:
             pass
-
     model = vit_b_16(weights=weights)
     if hasattr(model, "heads") and hasattr(model.heads, "head"):
         model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
@@ -238,9 +225,7 @@ def build_model(model_name: str, num_classes: int, pretrained: bool = False) -> 
     if name == "cnn":
         return SimpleCNN(num_classes)
     if name == "resnet":
-        if pretrained:
-            return build_resnet18_pretrained(num_classes)
-        return SmallResNet(num_classes)
+        return build_resnet18_pretrained(num_classes) if pretrained else SmallResNet(num_classes)
     if name == "vit":
         return build_vit(num_classes, pretrained)
     raise ValueError(f"Unknown model: '{name}'. Use 'cnn', 'resnet', 'vit', or 'vla'.")
@@ -257,20 +242,16 @@ def build_transforms(cfg: dict, model_name: str, pretrained: bool):
     img_size = cfg["image_size"]
     use_imagenet = pretrained and model_name in ("vit", "resnet")
     mean, std = _imagenet_norm() if use_imagenet else ((0.5,) * 3, (0.5,) * 3)
-
     test_tfm = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
-
     aug = cfg.get("augmentation", {})
     if not aug.get("enabled", False):
         return test_tfm, test_tfm
-
     min_scale = max(0.7, 1.0 - aug.get("scale", 0.1))
     max_scale = 1.0 + aug.get("scale", 0.1)
-
     train_ops = [
         transforms.Resize((img_size, img_size)),
         transforms.RandomAffine(
@@ -289,12 +270,11 @@ def build_transforms(cfg: dict, model_name: str, pretrained: bool):
     erasing_p = aug.get("erasing_p", 0.0)
     if erasing_p > 0:
         train_ops.append(transforms.RandomErasing(p=erasing_p, scale=(0.01, 0.06)))
-
     return transforms.Compose(train_ops), test_tfm
 
 
 # =============================================================================
-# Training & Evaluation (classic models)
+# Evaluation & Inference Timing
 # =============================================================================
 @torch.no_grad()
 def evaluate(model, loader, device, label_smoothing=0.0):
@@ -310,6 +290,38 @@ def evaluate(model, loader, device, label_smoothing=0.0):
     return total_loss / max(1, total), correct / max(1, total)
 
 
+@torch.no_grad()
+def measure_inference_time_ms(model, device, image_size, num_warmup=10, num_runs=100):
+    """Measure average inference time per single image in milliseconds."""
+    model.eval()
+    dummy = torch.randn(1, 3, image_size, image_size, device=device)
+
+    # Warmup
+    for _ in range(num_warmup):
+        model(dummy)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Timed runs
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            model(dummy)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+    else:
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            model(dummy)
+        elapsed = time.perf_counter() - start
+
+    return (elapsed / num_runs) * 1000.0  # ms per image
+
+
+# =============================================================================
+# Plotting
+# =============================================================================
 def plot_learning_curves(path: Path, history: dict, title: str):
     epochs = range(1, len(history["train_loss"]) + 1)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
@@ -336,9 +348,11 @@ def plot_learning_curves(path: Path, history: dict, title: str):
     plt.close(fig)
 
 
-def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logger: logging.Logger):
-    """Train a CNN / ResNet / ViT model."""
-    # Merge experiment overrides on top of defaults
+# =============================================================================
+# Training (classic models)
+# =============================================================================
+def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logger: logging.Logger) -> dict:
+    """Train a CNN / ResNet / ViT model. Returns metrics dict."""
     cfg = {**defaults}
     for key in ("epochs", "batch_size", "lr", "min_lr", "weight_decay",
                 "warmup_epochs", "scheduler", "label_smoothing", "image_size",
@@ -346,11 +360,28 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
         if key in exp_cfg:
             cfg[key] = exp_cfg[key]
 
+    # YAML parses scientific notation like 1e-3 as strings → cast numerics
+    for key in ("lr", "min_lr", "weight_decay", "label_smoothing"):
+        cfg[key] = float(cfg[key])
+    for key in ("epochs", "batch_size", "warmup_epochs", "image_size", "num_workers"):
+        cfg[key] = int(cfg[key])
+
     model_name = exp_cfg["model"]
     pretrained = exp_cfg.get("pretrained", False)
+    quicktest = defaults.get("quicktest", False)
 
     pairs, action_dim = load_samples_csv(data_dir)
-    train_pairs, test_pairs = split_data(pairs, cfg["train_split"])
+
+    if quicktest:
+        # Smoke test: first 5% for train, last 5% for test
+        n = len(pairs)
+        chunk = max(1, int(n * 0.01))
+        train_pairs = pairs[:chunk]
+        test_pairs = pairs[-chunk:]
+        cfg["epochs"] = 1
+        logger.info(f"*** QUICKTEST MODE: 1 epoch, {len(train_pairs)} train, {len(test_pairs)} test ***")
+    else:
+        train_pairs, test_pairs = split_data(pairs, cfg["train_split"])
 
     logger.info(f"Dataset: {data_dir} | Samples: {len(pairs)} | Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     logger.info(f"Action dim: {action_dim} | Model: {model_name} | Pretrained: {pretrained}")
@@ -397,20 +428,23 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
     history = {"train_loss": [], "train_acc": [], "test_loss": [], "test_acc": []}
     global_step = 0
 
+    # ---- Training loop with wall-clock timing ----
+    train_start = time.perf_counter()
+
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss, correct, total = 0.0, 0, 0
         epoch_start = datetime.now()
 
-        for x, y in train_loader:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        num_batches = len(train_loader)
+        next_log_pct = 10  # log at every 10% milestone
 
+        for b_idx, (x, y) in enumerate(train_loader, start=1):
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             lr_now = lr_for_step(global_step)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
-
             optimizer.zero_grad(set_to_none=True)
-
             if use_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                     logits = model(x)
@@ -429,6 +463,18 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
             correct += (logits.argmax(1) == y).sum().item()
             total += x.size(0)
 
+            # Progress log every 10% of batches
+            pct_done = b_idx * 100 // num_batches
+            if pct_done >= next_log_pct:
+                logger.info(
+                    f"  Epoch {epoch:03d}/{epochs} | {pct_done:3d}% "
+                    f"({b_idx}/{num_batches}) | "
+                    f"lr={lr_now:.6g} | "
+                    f"loss={running_loss/total:.4f} | "
+                    f"acc={correct/total*100:.2f}%"
+                )
+                next_log_pct = pct_done + 10
+
         train_loss = running_loss / max(1, total)
         train_acc = correct / max(1, total)
         test_loss, test_acc = evaluate(model, test_loader, device, cfg["label_smoothing"])
@@ -446,7 +492,15 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
             f"time={elapsed}"
         )
 
-    # Save only the final model
+    train_elapsed_sec = time.perf_counter() - train_start
+    train_minutes = train_elapsed_sec / 60.0
+    logger.info(f"Total training time: {format_time(train_elapsed_sec)}")
+
+    # ---- Inference timing ----
+    inference_ms = measure_inference_time_ms(model, device, cfg["image_size"])
+    logger.info(f"Inference time per image: {inference_ms:.2f} ms")
+
+    # ---- Save final model only ----
     model_path = exp_dir / "final_model.pt"
     torch.save({
         "state_dict": model.state_dict(),
@@ -457,52 +511,38 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
         "epochs_trained": epochs,
         "history": history,
         "config": cfg,
+        "train_time_sec": train_elapsed_sec,
+        "inference_ms_per_image": inference_ms,
     }, model_path)
     logger.info(f"Saved final model: {model_path}")
 
-    # Save learning curves plot
+    # ---- Plot ----
     plot_path = exp_dir / "learning_curves.png"
     title = f"{model_name.upper()}{' (pretrained)' if pretrained else ''}"
     plot_learning_curves(plot_path, history, title)
     logger.info(f"Saved plot: {plot_path}")
 
-    # Save history as JSON too (for later analysis)
     with open(exp_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    logger.info(f"Final test accuracy: {test_acc*100:.2f}%")
-    return test_acc
+    final_train_acc = history["train_acc"][-1]
+    final_test_acc = history["test_acc"][-1]
+    logger.info(f"Final train accuracy: {final_train_acc*100:.2f}%")
+    logger.info(f"Final test accuracy:  {final_test_acc*100:.2f}%")
+
+    return {
+        "train_acc": final_train_acc,
+        "test_acc": final_test_acc,
+        "train_time_sec": train_elapsed_sec,
+        "time_per_epoch_sec": train_elapsed_sec / max(1, epochs),
+        "epochs": epochs,
+        "inference_ms": inference_ms,
+    }
 
 
 # =============================================================================
 # VLA (Unsloth) training
 # =============================================================================
-@dataclass
-class VLAConfig:
-    model_name: str
-    load_in_4bit: bool
-    max_seq_length: int
-    r: int
-    lora_alpha: int
-    lora_dropout: float
-    finetune_vision_layers: bool
-    finetune_language_layers: bool
-    finetune_attention_modules: bool
-    finetune_mlp_modules: bool
-    per_device_train_batch_size: int
-    gradient_accumulation_steps: int
-    learning_rate: float
-    weight_decay: float
-    warmup_steps: int
-    num_train_epochs: int
-    max_steps: int
-    optim: str
-    lr_scheduler_type: str
-    seed: int
-    max_new_tokens: int
-    temperature: float
-
-
 def _vlm_instruction(action_dim: int) -> str:
     return (
         "You control a planar robot arm. "
@@ -551,6 +591,8 @@ def evaluate_vla(adapter_dir, test_records, max_new_tokens, temperature, logger,
     model = model.to(device)
 
     correct, total = 0, 0
+    total_inference_ms = 0.0
+
     for i, sample in enumerate(test_records):
         user_msg = sample["messages"][0]["content"]
         gt_text = sample["messages"][1]["content"][0]["text"]
@@ -579,7 +621,15 @@ def evaluate_vla(adapter_dir, test_records, max_new_tokens, temperature, logger,
                       "do_sample": temperature > 0.0}
         if gen_kwargs["do_sample"]:
             gen_kwargs["temperature"] = temperature
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         out = model.generate(**inputs, **gen_kwargs)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        total_inference_ms += (time.perf_counter() - t0) * 1000.0
+
         gen_ids = out[0][inputs["input_ids"].shape[1]:]
         pred_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
@@ -594,12 +644,13 @@ def evaluate_vla(adapter_dir, test_records, max_new_tokens, temperature, logger,
             logger.info(f"[VLA eval] {i+1}/{len(test_records)} | running_acc={correct/max(1,total)*100:.2f}%")
 
     acc = correct / max(1, total)
-    logger.info(f"[VLA eval] done | evaluated={total} | acc={acc*100:.2f}%")
-    return acc
+    avg_ms = total_inference_ms / max(1, total)
+    logger.info(f"[VLA eval] done | evaluated={total} | acc={acc*100:.2f}% | avg_inference={avg_ms:.2f} ms/image")
+    return acc, avg_ms
 
 
-def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logger: logging.Logger):
-    """Train a VLA (Vision-Language-Action) model with Unsloth."""
+def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logger: logging.Logger) -> dict:
+    """Train a VLA model. Returns metrics dict."""
     try:
         from unsloth import FastVisionModel
         from unsloth.trainer import UnslothVisionDataCollator
@@ -610,8 +661,31 @@ def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logg
     vla_defaults = defaults.get("vla", {})
     vla_cfg = {**vla_defaults, **exp_cfg.get("vla", {})}
 
+    # YAML parses scientific notation as strings → cast numerics
+    for key in ("lr", "weight_decay", "lora_dropout", "temperature"):
+        if key in vla_cfg:
+            vla_cfg[key] = float(vla_cfg[key])
+    for key in ("lora_r", "lora_alpha", "train_batch_size", "gradient_accumulation_steps",
+                "warmup_steps", "epochs", "seed", "max_new_tokens", "max_seq_length"):
+        if key in vla_cfg:
+            vla_cfg[key] = int(vla_cfg[key])
+
     pairs, action_dim = load_samples_csv(data_dir)
-    train_pairs, test_pairs = split_data(pairs, defaults["train_split"])
+    quicktest = defaults.get("quicktest", False)
+
+    # Experiment-level epochs override vla defaults
+    if "epochs" in exp_cfg and not quicktest:
+        vla_cfg["epochs"] = int(exp_cfg["epochs"])
+
+    if quicktest:
+        n = len(pairs)
+        chunk = max(1, int(n * 0.01))
+        train_pairs = pairs[:chunk]
+        test_pairs = pairs[-chunk:]
+        vla_cfg["epochs"] = 1
+        logger.info(f"*** QUICKTEST MODE: 1 epoch, {len(train_pairs)} train, {len(test_pairs)} test ***")
+    else:
+        train_pairs, test_pairs = split_data(pairs, defaults["train_split"])
 
     logger.info(f"Dataset: {data_dir} | Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     logger.info(f"Action dim: {action_dim} | VLA base: {vla_cfg['base_model']}")
@@ -677,7 +751,10 @@ def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logg
         args=sft_args,
     )
 
+    train_start = time.perf_counter()
     trainer_stats = trainer.train()
+    train_elapsed_sec = time.perf_counter() - train_start
+    logger.info(f"Total VLA training time: {format_time(train_elapsed_sec)}")
 
     try:
         metrics = dict(trainer_stats.metrics)
@@ -690,16 +767,18 @@ def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logg
     tokenizer.save_pretrained(str(adapter_dir))
     logger.info(f"Saved VLA adapter to: {adapter_dir}")
 
-    # Evaluate
+    # Evaluate + measure inference time
     max_new_tokens = vla_cfg.get("max_new_tokens", 16)
     temperature = vla_cfg.get("temperature", 0.2)
+    train_acc = 0.0  # VLA: we don't re-evaluate on train set (too expensive)
+    test_acc = 0.0
+    inference_ms = 0.0
 
     try:
-        acc = evaluate_vla(adapter_dir, test_records, max_new_tokens, temperature, logger, action_dim)
-        logger.info(f"Final VLA test accuracy: {acc*100:.2f}%")
+        test_acc, inference_ms = evaluate_vla(adapter_dir, test_records, max_new_tokens, temperature, logger, action_dim)
+        logger.info(f"Final VLA test accuracy: {test_acc*100:.2f}%")
     except Exception as e:
         logger.warning(f"VLA evaluation failed: {e}")
-        acc = 0.0
 
     # Clean up trainer temp files
     import shutil
@@ -707,12 +786,34 @@ def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logg
     if trainer_tmp.exists():
         shutil.rmtree(trainer_tmp, ignore_errors=True)
 
-    return acc
+    vla_epochs = vla_cfg.get("epochs", 2)
+
+    return {
+        "train_acc": train_acc,
+        "test_acc": test_acc,
+        "train_time_sec": train_elapsed_sec,
+        "time_per_epoch_sec": train_elapsed_sec / max(1, vla_epochs),
+        "epochs": vla_epochs,
+        "inference_ms": inference_ms,
+    }
 
 
 # =============================================================================
-# Config loading
+# Helpers
 # =============================================================================
+def format_time(seconds: float) -> str:
+    """Format seconds into a human readable string like '12m 34s' or '1h 23m 45s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {secs:.0f}s"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}h {mins}m {secs:.0f}s"
+
+
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
@@ -723,14 +824,60 @@ def make_experiment_dir_name(index: int, exp_name: str, data_dir: str) -> str:
     return f"experiment{index:03d}_{exp_name}_{dataset_name}"
 
 
+def write_results_table(results_path: Path, rows: list):
+    """Write a formatted results summary table."""
+    header = (
+        f"{'#':>3}  {'Experiment':<25}  {'Epochs':>6}  {'Train Acc':>10}  {'Test Acc':>10}  "
+        f"{'Total Time':>12}  {'Time/Epoch':>12}  {'Infer (ms)':>11}"
+    )
+    sep = "-" * len(header)
+
+    lines = [
+        "=" * len(header),
+        "EXPERIMENT RESULTS SUMMARY",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "=" * len(header),
+        "",
+        header,
+        sep,
+    ]
+
+    for row in rows:
+        if row["status"] == "ok":
+            epochs_str = str(row["epochs"])
+            train_acc_str = f"{row['train_acc']*100:.2f}%"
+            test_acc_str = f"{row['test_acc']*100:.2f}%"
+            total_str = format_time(row["train_time_sec"])
+            per_epoch_str = format_time(row["time_per_epoch_sec"])
+            infer_str = f"{row['inference_ms']:.2f}"
+        elif row["status"] == "skipped":
+            epochs_str = train_acc_str = test_acc_str = total_str = per_epoch_str = infer_str = "—"
+        else:
+            epochs_str = train_acc_str = test_acc_str = total_str = per_epoch_str = infer_str = "FAILED"
+
+        lines.append(
+            f"{row['index']:>3}  {row['name']:<25}  {epochs_str:>6}  {train_acc_str:>10}  {test_acc_str:>10}  "
+            f"{total_str:>12}  {per_epoch_str:>12}  {infer_str:>11}"
+        )
+
+    lines.append(sep)
+    lines.append("")
+
+    text = "\n".join(lines)
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    # Also print to console
+    print("\n" + text)
+
+
 # =============================================================================
 # CLI & Main
 # =============================================================================
 def parse_args():
     p = argparse.ArgumentParser(description="Run robot arm model comparison experiments.")
     p.add_argument("--config", type=str, required=True, help="Path to experiments YAML config file.")
-    p.add_argument("--only", type=str, default="",
-                   help="Comma-separated experiment numbers to run (1-indexed). Empty = run all.")
     return p.parse_args()
 
 
@@ -745,24 +892,21 @@ def main() -> int:
         print("No experiments defined in config.")
         return 1
 
-    # Parse --only filter
-    run_indices = set()
-    if args.only.strip():
-        for part in args.only.split(","):
-            run_indices.add(int(part.strip()))
-
     results_dir = Path(defaults.get("results_dir", "./results"))
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = []
+    result_rows = []
 
     for i, exp_cfg in enumerate(experiments, start=1):
-        if run_indices and i not in run_indices:
+        exp_name = exp_cfg.get("name", exp_cfg["model"])
+
+        # Check enabled flag
+        if not exp_cfg.get("enabled", True):
+            print(f"[{i}] {exp_name}: SKIPPED (enabled: false)")
+            result_rows.append({"index": i, "name": exp_name, "status": "skipped"})
             continue
 
-        exp_name = exp_cfg.get("name", exp_cfg["model"])
         data_dir = Path(exp_cfg.get("data_dir", defaults.get("data_dir", "./data")))
-
         dir_name = make_experiment_dir_name(i, exp_name, str(data_dir))
         exp_dir = results_dir / dir_name
         exp_dir.mkdir(parents=True, exist_ok=True)
@@ -772,36 +916,36 @@ def main() -> int:
 
         logger.info("=" * 70)
         logger.info(f"EXPERIMENT {i}: {exp_name}")
+        if defaults.get("quicktest", False):
+            logger.info("*** QUICKTEST MODE ***")
         logger.info("=" * 70)
 
-        # Save the resolved config for this experiment
         with open(exp_dir / "experiment_config.json", "w") as f:
             json.dump({"index": i, "experiment": exp_cfg, "defaults": defaults}, f, indent=2)
 
         model_type = exp_cfg["model"].lower()
         try:
             if model_type == "vla":
-                acc = train_vla(exp_cfg, defaults, data_dir, exp_dir, logger)
+                metrics = train_vla(exp_cfg, defaults, data_dir, exp_dir, logger)
             else:
-                acc = train_classic(exp_cfg, defaults, data_dir, exp_dir, logger)
-            summary.append((i, exp_name, f"{acc*100:.2f}%"))
+                metrics = train_classic(exp_cfg, defaults, data_dir, exp_dir, logger)
+
+            result_rows.append({"index": i, "name": exp_name, "status": "ok", **metrics})
             logger.info(f"Experiment {i} ({exp_name}) completed successfully.")
+
         except Exception as e:
             logger.error(f"Experiment {i} ({exp_name}) FAILED: {e}", exc_info=True)
-            summary.append((i, exp_name, "FAILED"))
+            result_rows.append({"index": i, "name": exp_name, "status": "failed"})
 
         # Close logger handlers
         for h in logger.handlers[:]:
             h.close()
             logger.removeHandler(h)
 
-    # Print summary
-    print("\n" + "=" * 60)
-    print("EXPERIMENT SUMMARY")
-    print("=" * 60)
-    for idx, name, result in summary:
-        print(f"  {idx:3d}. {name:<25s} → Test Acc: {result}")
-    print("=" * 60)
+    # Write combined results table
+    results_path = results_dir / "results.txt"
+    write_results_table(results_path, result_rows)
+    print(f"\nResults written to: {results_path.resolve()}")
 
     return 0
 
