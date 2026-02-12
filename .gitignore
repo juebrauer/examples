@@ -16,6 +16,7 @@
 !*.html
 !*.sh
 !*.md
+!*.yaml
 
 # Ignore specific folders
 005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
@@ -33,12 +34,8 @@
 
 021_robot_arm_simulator/data*
 021_robot_arm_simulator/experiment*
-021_robot_arm_simulator/backup
+!021_robot_arm_simulator/experiments.yaml
 021_robot_arm_simulator/unsloth_compiled_cache
-021_robot_arm_simulator/copilot
-021_robot_arm_simulator/claude/experiments
-021_robot_arm_simulator/claude/README.md
-021_robot_arm_simulator/claude/requirements.txt
 
 
 # Ignore checkpoint files
