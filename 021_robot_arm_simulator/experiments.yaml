@@ -24,8 +24,8 @@ defaults:
   results_dir: ./results             # base directory for all experiment outputs
 
   train_split: 0.8                   # 80% train, 20% test
-  train_test_subsample: 1.0          # fraction of train AND test data actually used (1.0 = all)
-  epochs: 20
+  train_test_subsample: 0.25         # fraction of train AND test data actually used (1.0 = all)
+  epochs: 50
   batch_size: 64
   lr: 1e-3
   min_lr: 1e-6
@@ -92,24 +92,24 @@ experiments:
     epochs: 20
 
   - name: vit_scratch
-    enabled: false
+    enabled: true
     model: vit
     pretrained: false
     epochs: 50
-    lr: 1e-4                          # higher LR for small model from scratch
-    warmup_epochs: 3
-    train_test_subsample: 0.5         # ~20k train samples
+    lr: 1e-4                  
+    warmup_epochs: 10
+    train_test_subsample: 0.25
 
   - name: vit_pretrained
-    enabled: false
+    enabled: true
     model: vit
     pretrained: true
     epochs: 20
     lr: 1e-4
-    train_test_subsample: 0.5         # 4k train — pretrained needs less data
+    train_test_subsample: 0.25
 
   - name: vla
-    enabled: true                    # heavy; enable when GPU is available
+    enabled: true             
     model: vla
-    epochs: 1                        # VLA training is much slower per epoch
+    epochs: 5                 
     train_test_subsample: 0.05
