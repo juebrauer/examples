@@ -119,6 +119,16 @@ def split_data(pairs, train_frac):
     return pairs[:n_train], pairs[n_train:]
 
 
+def subsample_pairs(pairs, fraction, seed=42):
+    """Randomly subsample a fraction of pairs (deterministic)."""
+    if fraction >= 1.0:
+        return pairs
+    import random
+    rng = random.Random(seed)
+    n = max(1, int(len(pairs) * fraction))
+    return rng.sample(pairs, n)
+
+
 # =============================================================================
 # Models
 # =============================================================================
@@ -203,15 +213,106 @@ def build_resnet18_pretrained(num_classes: int) -> nn.Module:
     return model
 
 
+class ViTMicro(nn.Module):
+    """
+    Tiny Vision Transformer for training from scratch on small/medium datasets.
+    ~900K params (vs 86M ViT-B/16) — comparable to SmallResNet.
+
+    Architecture: embed_dim=128, depth=6, heads=4, patch_size=16, MLP ratio=2.
+    """
+    def __init__(self, num_classes: int, image_size: int = 224, patch_size: int = 16,
+                 embed_dim: int = 128, depth: int = 6, num_heads: int = 4,
+                 mlp_ratio: float = 2.0, drop_rate: float = 0.1):
+        super().__init__()
+        assert image_size % patch_size == 0
+        num_patches = (image_size // patch_size) ** 2
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.pos_drop = nn.Dropout(drop_rate)
+
+        self.blocks = nn.Sequential(*[
+            _ViTBlock(embed_dim, num_heads, mlp_ratio, drop_rate)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        x = self.blocks(x)
+        x = self.norm(x)
+        return self.head(x[:, 0])
+
+
+class _ViTBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio, drop):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = _MultiHeadSelfAttention(dim, num_heads)
+        self.drop1 = nn.Dropout(drop)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(mlp_hidden, dim), nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        x = x + self.drop1(self.attn(self.norm1(x)))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class _MultiHeadSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+
 def build_vit(num_classes: int, pretrained: bool) -> nn.Module:
+    if not pretrained:
+        # ViT-Micro (~900K params) — trainable from scratch on small datasets
+        return ViTMicro(num_classes=num_classes)
+
+    # ViT-B/16 with pretrained ImageNet weights for finetuning
     from torchvision.models import vit_b_16
     weights = None
-    if pretrained:
-        try:
-            from torchvision.models import ViT_B_16_Weights
-            weights = ViT_B_16_Weights.DEFAULT
-        except Exception:
-            pass
+    try:
+        from torchvision.models import ViT_B_16_Weights
+        weights = ViT_B_16_Weights.DEFAULT
+    except Exception:
+        pass
     model = vit_b_16(weights=weights)
     if hasattr(model, "heads") and hasattr(model.heads, "head"):
         model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
@@ -356,7 +457,7 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
     cfg = {**defaults}
     for key in ("epochs", "batch_size", "lr", "min_lr", "weight_decay",
                 "warmup_epochs", "scheduler", "label_smoothing", "image_size",
-                "num_workers", "use_amp"):
+                "num_workers", "use_amp", "train_test_subsample"):
         if key in exp_cfg:
             cfg[key] = exp_cfg[key]
 
@@ -382,6 +483,13 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
         logger.info(f"*** QUICKTEST MODE: 1 epoch, {len(train_pairs)} train, {len(test_pairs)} test ***")
     else:
         train_pairs, test_pairs = split_data(pairs, cfg["train_split"])
+        # Subsample train and test data (useful when many images are similar)
+        subsample = float(cfg.get("train_test_subsample", 1.0))
+        if subsample < 1.0:
+            full_train, full_test = len(train_pairs), len(test_pairs)
+            train_pairs = subsample_pairs(train_pairs, subsample, seed=42)
+            test_pairs = subsample_pairs(test_pairs, subsample, seed=43)
+            logger.info(f"Subsample: {subsample*100:.0f}% → train {len(train_pairs)}/{full_train}, test {len(test_pairs)}/{full_test}")
 
     logger.info(f"Dataset: {data_dir} | Samples: {len(pairs)} | Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     logger.info(f"Action dim: {action_dim} | Model: {model_name} | Pretrained: {pretrained}")
@@ -400,6 +508,8 @@ def train_classic(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, 
                              num_workers=cfg["num_workers"], pin_memory=(device.type == "cuda"))
 
     model = build_model(model_name, action_dim, pretrained).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {num_params:,}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg["label_smoothing"])
 
@@ -686,6 +796,13 @@ def train_vla(exp_cfg: dict, defaults: dict, data_dir: Path, exp_dir: Path, logg
         logger.info(f"*** QUICKTEST MODE: 1 epoch, {len(train_pairs)} train, {len(test_pairs)} test ***")
     else:
         train_pairs, test_pairs = split_data(pairs, defaults["train_split"])
+        # Subsample train and test data
+        subsample = float(exp_cfg.get("train_test_subsample", defaults.get("train_test_subsample", 1.0)))
+        if subsample < 1.0:
+            full_train, full_test = len(train_pairs), len(test_pairs)
+            train_pairs = subsample_pairs(train_pairs, subsample, seed=42)
+            test_pairs = subsample_pairs(test_pairs, subsample, seed=43)
+            logger.info(f"Subsample: {subsample*100:.0f}% → train {len(train_pairs)}/{full_train}, test {len(test_pairs)}/{full_test}")
 
     logger.info(f"Dataset: {data_dir} | Train: {len(train_pairs)} | Test: {len(test_pairs)}")
     logger.info(f"Action dim: {action_dim} | VLA base: {vla_cfg['base_model']}")
