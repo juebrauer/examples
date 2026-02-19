@@ -92,7 +92,7 @@ experiments:
     epochs: 20
 
   - name: vit_scratch
-    enabled: true
+    enabled: false
     model: vit
     pretrained: false
     epochs: 50
@@ -101,7 +101,7 @@ experiments:
     train_test_subsample: 0.25
 
   - name: vit_pretrained
-    enabled: true
+    enabled: false
     model: vit
     pretrained: true
     epochs: 20
@@ -109,7 +109,7 @@ experiments:
     train_test_subsample: 0.25
 
   - name: vla
-    enabled: true             
+    enabled: true
     model: vla
-    epochs: 5                 
-    train_test_subsample: 0.05
+    epochs: 20                 
+    train_test_subsample: 0.25
