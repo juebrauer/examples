@@ -37,6 +37,8 @@
 !021_robot_arm_simulator/experiments.yaml
 021_robot_arm_simulator/unsloth_compiled_cache
 
+024_robot_navigation/dataset*
+
 
 # Ignore checkpoint files
 *-checkpoint.ipynb
