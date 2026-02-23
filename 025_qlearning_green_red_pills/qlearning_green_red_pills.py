@@ -1,9 +1,12 @@
 """
-Simple Q-Learning demo (PySide6) — clean world view (no text overlay)
---------------------------------------------------------------------
+Simple Q-Learning demo (tabular Q-Learning)
+-------------------------------------------
 A circle "robot" lives in a 2D torus world (wrap-around edges) with:
 - green pills  (+reward)
 - red pills    (-reward)
+
+For realizing tabular Q-Learning we need to discretize
+the state space into a manageable number of states:
 
 State (DISCRETIZED):
     (angle_to_nearest_green, dist_to_nearest_green,
@@ -15,7 +18,7 @@ Actions:
     B: move forward (MOVE_PX)
     C: turn right (TURN_DEG)
 
-Goal: trial-and-error learning to collect green and avoid red.
+Goal: trial-and-error learning to collect green and avoid red pills.
 
 Requirements:
     pip install PySide6 matplotlib
@@ -35,7 +38,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QMessageBox,
-    QDialog, QTableView, QHeaderView
+    QDialog, QTableView, QHeaderView, QCheckBox
 )
 
 try:
@@ -61,8 +64,8 @@ N_RED = 18
 PILL_RADIUS = 6
 
 ROBOT_RADIUS = 14
-TURN_DEG = 8.0          # A / C  (bigger turns = faster credit assignment)
-MOVE_PX = 4.0           # B      (bigger steps = more frequent pill hits)
+TURN_DEG = 8.0          # actions A / C
+MOVE_PX = 4.0           # action B
 
 # Simulation speed (RL updates per rendered frame)
 STEPS_PER_TICK = 40
@@ -78,7 +81,7 @@ MA_HISTORY_MAX = 5000    # max stored points; older points get compressed to kee
 # Rewards
 R_GREEN = +10.0
 R_RED = -10.0
-R_STEP = -0.01          # small living cost (keep it small so turning isn't too "expensive")
+R_STEP = -0.01          # small living cost
 
 # Dense reward shaping (potential-based) to speed up learning.
 # r' = r + shaping_scale * (gamma * Phi(s') - Phi(s))
@@ -278,6 +281,7 @@ class World:
         self.reset_pills()
 
         self.agent = QLearningAgent()
+        self.use_reward_shaping = USE_REWARD_SHAPING
         self.steps = 0
         self.score = 0.0
         self.last_reward = 0.0
@@ -413,7 +417,7 @@ class World:
         s = self.get_state()
 
         # Potential before acting (for potential-based shaping)
-        if USE_REWARD_SHAPING:
+        if self.use_reward_shaping:
             _, gd0, _, _ = self.nearest_pill(True)
             _, rd0, _, _ = self.nearest_pill(False)
             phi0 = (-PHI_GREEN_W * (gd0 / MAX_DIST)) + (PHI_RED_W * (rd0 / MAX_DIST))
@@ -426,7 +430,7 @@ class World:
         r_train = r_env
 
         # Potential-based reward shaping: r' = r + scale*(gamma*Phi(s') - Phi(s))
-        if USE_REWARD_SHAPING:
+        if self.use_reward_shaping:
             _, gd1, _, _ = self.nearest_pill(True)
             _, rd1, _, _ = self.nearest_pill(False)
             phi1 = (-PHI_GREEN_W * (gd1 / MAX_DIST)) + (PHI_RED_W * (rd1 / MAX_DIST))
@@ -801,6 +805,11 @@ class MainWindow(QMainWindow):
         self.btn_save_q = QPushButton("Save Q-table")
         self.btn_load_q = QPushButton("Load Q-table")
         self.btn_view_q = QPushButton("View Q-table")
+
+        self.chk_reward_shaping = QCheckBox("Reward shaping")
+        self.chk_reward_shaping.setChecked(USE_REWARD_SHAPING)
+        self.chk_reward_shaping.toggled.connect(self.on_toggle_reward_shaping)
+
         self.btn_run.clicked.connect(self.toggle_run)
         self.btn_step.clicked.connect(self.single_step)
         self.btn_reset.clicked.connect(self.reset_world)
@@ -823,6 +832,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.btn_run)
         controls.addWidget(self.btn_step)
         controls.addWidget(self.btn_reset)
+        controls.addWidget(self.chk_reward_shaping)
         controls.addSpacing(6)
         controls.addWidget(self.btn_save_q)
         controls.addWidget(self.btn_load_q)
@@ -853,17 +863,23 @@ class MainWindow(QMainWindow):
     def update_status_panel(self):
         w = self.world
         action_name = ACTIONS[w.last_action] if w.last_action is not None else "-"
+        shaping = "on" if w.use_reward_shaping else "off"
 
         self.lbl_status.setText(
             f"steps: {w.steps}\n"
             f"epsilon: {w.agent.eps:.3f}\n"
             f"score (sum r): {w.score:.2f}\n"
             f"ma1000(r): {w.reward_ma_1000:.3f}\n\n"
+            f"reward shaping: {shaping}\n"
             f"last action: {action_name}\n"
             f"last reward: {w.last_reward:.2f}\n\n"
             f"green collected: {w.collected_green}\n"
             f"red hit: {w.hit_red}"
         )
+
+    def on_toggle_reward_shaping(self, checked: bool):
+        self.world.use_reward_shaping = bool(checked)
+        self.update_status_panel()
 
     def on_tick(self):
         # do multiple steps per visual frame for faster learning
@@ -918,6 +934,7 @@ class MainWindow(QMainWindow):
         self.space_timer.stop()
 
         self.world = World()
+        self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
         self.view.world = self.world
         self.reward_plot.world = self.world
         if self.q_table_dialog is not None:
@@ -996,6 +1013,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("Missing 'agent' object in Q-table file")
 
             self.world.agent = QLearningAgent.from_serializable(agent_data)
+            self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
             self.update_status_panel()
             if self.q_table_dialog is not None:
                 self.q_table_dialog.refresh()
