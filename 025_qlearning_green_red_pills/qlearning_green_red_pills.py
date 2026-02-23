@@ -30,11 +30,12 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtCore import Qt, QTimer, QEvent, QAbstractTableModel
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QFrame, QFileDialog, QMessageBox
+    QPushButton, QLabel, QFrame, QFileDialog, QMessageBox,
+    QDialog, QTableView, QHeaderView
 )
 
 try:
@@ -104,6 +105,14 @@ MAX_DIST = math.hypot(WORLD_W / 2, WORLD_H / 2)  # max shortest distance on toru
 
 # Actions: indices 0,1,2 map to A,B,C
 ACTIONS = ["A: turn left", "B: forward", "C: turn right"]
+
+
+# =========================
+# Q-table viewer knobs
+# =========================
+
+QTABLE_VIEW_REFRESH_MS = 500
+QTABLE_VIEW_MAX_ROWS = 2000
 
 
 # =========================
@@ -658,6 +667,114 @@ class RewardPlot(QWidget):
         self.canvas.draw_idle()
 
 
+class QTableModel(QAbstractTableModel):
+    _COLUMNS = [
+        "ang_g",
+        "dist_g",
+        "ang_r",
+        "dist_r",
+        "Q(A)",
+        "Q(B)",
+        "Q(C)",
+        "best",
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._rows: list[tuple[tuple[int, int, int, int], list[float]]] = []
+
+    def set_rows(self, rows: list[tuple[tuple[int, int, int, int], list[float]]]):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def rowCount(self, _parent=None) -> int:
+        return len(self._rows)
+
+    def columnCount(self, _parent=None) -> int:
+        return len(self._COLUMNS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            if 0 <= section < len(self._COLUMNS):
+                return self._COLUMNS[section]
+            return None
+        return str(section)
+
+    def data(self, index, role: int = Qt.DisplayRole):
+        if not index.isValid() or role != Qt.DisplayRole:
+            return None
+
+        state, qs = self._rows[index.row()]
+        col = index.column()
+
+        if 0 <= col <= 3:
+            return str(state[col])
+        if col == 4:
+            return f"{qs[0]:.3f}"
+        if col == 5:
+            return f"{qs[1]:.3f}"
+        if col == 6:
+            return f"{qs[2]:.3f}"
+        if col == 7:
+            best = max(range(3), key=lambda a: qs[a])
+            return ("A", "B", "C")[best]
+
+        return None
+
+
+class QTableDialog(QDialog):
+    def __init__(self, world: "World", parent=None):
+        super().__init__(parent)
+        self.world = world
+        self.setWindowTitle("Q-table")
+        self.setMinimumSize(720, 480)
+
+        self.lbl_info = QLabel()
+        self.lbl_info.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.model = QTableModel()
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QTableView.SingleSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.lbl_info)
+        layout.addWidget(self.table, 1)
+        self.setLayout(layout)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(QTABLE_VIEW_REFRESH_MS)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+
+        self.refresh()
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        return super().closeEvent(event)
+
+    def refresh(self):
+        agent = self.world.agent
+        items = list(agent.Q.items())
+
+        items.sort(key=lambda kv: max(kv[1]), reverse=True)
+        total = len(items)
+        shown = min(total, QTABLE_VIEW_MAX_ROWS)
+        rows = items[:shown]
+
+        self.lbl_info.setText(
+            f"states learned: {total}    showing: {shown}    refresh: {QTABLE_VIEW_REFRESH_MS}ms"
+        )
+        self.model.set_rows(rows)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -666,6 +783,7 @@ class MainWindow(QMainWindow):
         self.world = World()
         self.view = WorldView(self.world)
         self.reward_plot = RewardPlot(self.world)
+        self.q_table_dialog: QTableDialog | None = None
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_tick)
@@ -682,11 +800,13 @@ class MainWindow(QMainWindow):
         self.btn_reset = QPushButton("Reset")
         self.btn_save_q = QPushButton("Save Q-table")
         self.btn_load_q = QPushButton("Load Q-table")
+        self.btn_view_q = QPushButton("View Q-table")
         self.btn_run.clicked.connect(self.toggle_run)
         self.btn_step.clicked.connect(self.single_step)
         self.btn_reset.clicked.connect(self.reset_world)
         self.btn_save_q.clicked.connect(self.save_q_table)
         self.btn_load_q.clicked.connect(self.load_q_table)
+        self.btn_view_q.clicked.connect(self.open_q_table_viewer)
 
         # status panel (moved from overlay to right side)
         self.lbl_status = QLabel()
@@ -706,6 +826,7 @@ class MainWindow(QMainWindow):
         controls.addSpacing(6)
         controls.addWidget(self.btn_save_q)
         controls.addWidget(self.btn_load_q)
+        controls.addWidget(self.btn_view_q)
         controls.addSpacing(10)
         controls.addWidget(self.lbl_status)
         controls.addSpacing(6)
@@ -799,6 +920,9 @@ class MainWindow(QMainWindow):
         self.world = World()
         self.view.world = self.world
         self.reward_plot.world = self.world
+        if self.q_table_dialog is not None:
+            self.q_table_dialog.world = self.world
+            self.q_table_dialog.refresh()
 
         self.view.update()
         self.update_status_panel()
@@ -873,12 +997,25 @@ class MainWindow(QMainWindow):
 
             self.world.agent = QLearningAgent.from_serializable(agent_data)
             self.update_status_panel()
+            if self.q_table_dialog is not None:
+                self.q_table_dialog.refresh()
         except Exception as e:
             QMessageBox.critical(self, "Load failed", str(e))
 
         if was_running:
             self.timer.start()
             self.btn_run.setText("Pause")
+
+    def open_q_table_viewer(self):
+        if self.q_table_dialog is None:
+            self.q_table_dialog = QTableDialog(self.world, self)
+        else:
+            self.q_table_dialog.world = self.world
+            self.q_table_dialog.refresh()
+
+        self.q_table_dialog.show()
+        self.q_table_dialog.raise_()
+        self.q_table_dialog.activateWindow()
 
 
 def main():
