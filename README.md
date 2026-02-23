@@ -26,4 +26,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 020      | Notebook, anomaly detection in ECG data with the help of an autoencoder built with Keras (in German) |
 | 021      | Python scripts, simple 2D (n-DOF) robot arm simulator and models that learn to control the robot arm |
 | 022      | C and C++ exercises for beginners |
+| 025      | Python script, Q-Learning agent learns to collect green pills and avoid red pills |
 | 0xx      |  |
