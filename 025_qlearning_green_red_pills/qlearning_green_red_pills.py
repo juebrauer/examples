@@ -18,23 +18,37 @@ Actions:
 Goal: trial-and-error learning to collect green and avoid red.
 
 Requirements:
-    pip install PySide6
+    pip install PySide6 matplotlib
 Run:
-    python qlearning_pills_pyside6.py
+    python qlearning_green_red_pills.py
 """
 
 import math
 import random
 import sys
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QEvent
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPolygonF
+from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QFrame
+    QPushButton, QLabel, QFrame, QFileDialog, QMessageBox
 )
+
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+    _HAS_MPL = True
+except Exception:
+    FigureCanvas = None
+    Figure = None
+    FuncFormatter = None
+    MaxNLocator = None
+    _HAS_MPL = False
 
 # =========================
 # Teaching-friendly knobs
@@ -164,6 +178,58 @@ class QLearningAgent:
         self.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
         self.eps = EPS_START
 
+    def to_serializable(self) -> dict:
+        # Convert tuple keys to lists so JSON can store them.
+        q_items: list[dict] = []
+        for state, qs in self.Q.items():
+            q_items.append(
+                {
+                    "state": list(state),
+                    "A_turn_left": float(qs[0]),
+                    "B_forward": float(qs[1]),
+                    "C_turn_right": float(qs[2]),
+                }
+            )
+
+        # Stable ordering for diff-friendly, teaching-friendly output.
+        q_items.sort(key=lambda item: item["state"])
+
+        return {
+            "eps": float(self.eps),
+            "actions": ACTIONS,
+            "q": q_items,
+        }
+
+    @classmethod
+    def from_serializable(cls, data: dict) -> "QLearningAgent":
+        agent = cls()
+        agent.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
+
+        agent.eps = float(data.get("eps", EPS_START))
+        items = data.get("q", [])
+        for item in items:
+            state_list = item.get("state")
+            if not isinstance(state_list, list) or len(state_list) != 4:
+                continue
+
+            try:
+                state = tuple(int(x) for x in state_list)
+            except Exception:
+                continue
+
+            try:
+                qv = [
+                    float(item["A_turn_left"]),
+                    float(item["B_forward"]),
+                    float(item["C_turn_right"]),
+                ]
+            except Exception:
+                continue
+
+            agent.Q[state] = qv
+
+        return agent
+
     def choose_action(self, state: tuple[int, int, int, int]) -> int:
         """Epsilon-greedy policy."""
         if random.random() < self.eps:
@@ -217,6 +283,7 @@ class World:
         self._reward_block_count = 0
         self.reward_ma_1000 = 0.0  # last completed block average
         self.reward_ma_history: list[float] = []
+        self.reward_ma_dirty = False
 
     def _append_ma_history(self, value: float):
         """Append a new MA point; compress history if it grows too long.
@@ -234,6 +301,8 @@ class World:
             if len(h) % 2 == 1:
                 compressed.append(h[-1])
             self.reward_ma_history = compressed
+
+        self.reward_ma_dirty = True
 
     def reset_pills(self):
         self.pills = []
@@ -502,103 +571,91 @@ class WorldView(QWidget):
 
 
 class RewardPlot(QWidget):
+    """Matplotlib reward curve embedded into the Qt UI."""
+
     def __init__(self, world: World):
         super().__init__()
         self.world = world
-        self.setFixedSize(260, 120)
+        self.setFixedSize(380, 120)
 
-    def paintEvent(self, _):
-        w = self.world
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
+        self._last_signature: tuple[int, float] | None = None
 
-        # background + border
-        p.fillRect(0, 0, self.width(), self.height(), QColor(250, 250, 250))
-        p.setPen(QPen(QColor(180, 180, 180), 1))
-        p.setBrush(QBrush(Qt.NoBrush))
-        p.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        values_full = w.reward_ma_history
-        if len(values_full) < 2:
-            p.end()
+        if not _HAS_MPL:
+            self._fallback = QLabel("Matplotlib not installed.\nRun: pip install matplotlib")
+            self._fallback.setAlignment(Qt.AlignCenter)
+            self._fallback.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+            layout.addWidget(self._fallback)
+            self.canvas = None
+            self.fig = None
+            self.ax = None
+            self._line = None
             return
 
-        # margins for numeric axis ticks
-        pad_left = 28
-        pad_right = 8
-        pad_top = 8
-        pad_bottom = 22
-        left = pad_left
-        top = pad_top
-        right = self.width() - pad_right
-        bottom = self.height() - pad_bottom
+        dpi = 100
+        self.fig = Figure(figsize=(self.width() / dpi, self.height() / dpi), dpi=dpi)
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
 
-        def _fmt_steps(n: int) -> str:
+        self.ax = self.fig.add_subplot(111)
+        self._line, = self.ax.plot([], [], linewidth=1.8)
+        self.ax.grid(True, alpha=0.25)
+
+        for spine in ("top", "right"):
+            self.ax.spines[spine].set_visible(False)
+
+        self.ax.xaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+
+        def _fmt_steps(x, _pos):
+            n = int(x)
             if n >= 1_000_000:
                 return f"{n / 1_000_000:.1f}M"
             if n >= 1_000:
                 return f"{n / 1_000:.0f}k"
             return str(n)
 
-        # Numeric tick labels
-        p.setPen(QPen(QColor(80, 80, 80), 1))
-        p.setFont(QFont("Arial", 8))
+        self.ax.xaxis.set_major_formatter(FuncFormatter(_fmt_steps))
+        self.ax.tick_params(axis="both", labelsize=8)
 
-        # x ticks: 0 .. current steps
-        x0 = 0
-        x1 = int(w.steps)
-        xm = int((x0 + x1) / 2)
-        p.drawText(int(left), int(bottom + 6), 1, 14, int(Qt.AlignLeft | Qt.AlignTop), _fmt_steps(x0))
-        p.drawText(int((left + right) / 2), int(bottom + 6), 1, 14, int(Qt.AlignHCenter | Qt.AlignTop), _fmt_steps(xm))
-        p.drawText(int(right), int(bottom + 6), 1, 14, int(Qt.AlignRight | Qt.AlignTop), _fmt_steps(x1))
+        self.fig.subplots_adjust(left=0.18, right=0.98, top=0.96, bottom=0.28)
+        self.refresh(force=True)
 
-        # Downsample for drawing so the whole history always fits.
-        # We map the entire stored overview to the available pixel width.
-        max_points = max(2, int(right - left))
-        if len(values_full) <= max_points:
-            values = values_full
+    def refresh(self, force: bool = False):
+        if not _HAS_MPL or self.canvas is None:
+            return
+
+        history = self.world.reward_ma_history
+        if not history:
+            self._line.set_data([], [])
+            self.ax.set_xlim(0, MA_WINDOW)
+            self.canvas.draw_idle()
+            return
+
+        signature = (len(history), float(history[-1]))
+        if (not force) and self._last_signature == signature:
+            return
+        self._last_signature = signature
+
+        n = len(history)
+        if n == 1:
+            xs = [0.0]
         else:
-            stride = math.ceil(len(values_full) / max_points)
-            values = [
-                sum(values_full[i:i + stride]) / len(values_full[i:i + stride])
-                for i in range(0, len(values_full), stride)
-            ]
+            xs = [i * MA_WINDOW for i in range(n)]
 
-        vmin = min(values_full)
-        vmax = max(values_full)
-        if abs(vmax - vmin) < 1e-9:
-            vmax = vmin + 1.0
+        ys = history
+        self._line.set_data(xs, ys)
 
-        # y ticks: vmin, mid, vmax
-        vmid = 0.5 * (vmin + vmax)
+        self.ax.set_xlim(0, max(MA_WINDOW, int((n - 1) * MA_WINDOW)))
+        ymin = min(ys)
+        ymax = max(ys)
+        if abs(ymax - ymin) < 1e-9:
+            ymax = ymin + 1.0
+        pad = 0.08 * (ymax - ymin)
+        self.ax.set_ylim(ymin - pad, ymax + pad)
 
-        def _y_to_px(v: float) -> float:
-            t = (v - vmin) / (vmax - vmin)
-            return bottom - t * (bottom - top)
-
-        tick_color = QColor(120, 120, 120)
-        p.setPen(QPen(tick_color, 1))
-        for val in (vmax, vmid, vmin):
-            y = _y_to_px(val)
-            # tick mark
-            p.drawLine(int(left - 4), int(y), int(left), int(y))
-            # label
-            p.drawText(0, int(y - 7), int(left - 6), 14, int(Qt.AlignRight | Qt.AlignVCenter), f"{val:.2f}")
-
-        n = len(values)
-        xs = right - left
-        ys = bottom - top
-
-        pts: list[QPointF] = []
-        for i, v in enumerate(values):
-            x = left + (i / (n - 1)) * xs
-            t = (v - vmin) / (vmax - vmin)
-            y = bottom - t * ys
-            pts.append(QPointF(x, y))
-
-        p.setPen(QPen(QColor(30, 30, 30), 2))
-        p.drawPolyline(QPolygonF(pts))
-        p.end()
+        self.canvas.draw_idle()
 
 
 class MainWindow(QMainWindow):
@@ -623,9 +680,13 @@ class MainWindow(QMainWindow):
         self.btn_run = QPushButton("Run")
         self.btn_step = QPushButton("Step")
         self.btn_reset = QPushButton("Reset")
+        self.btn_save_q = QPushButton("Save Q-table")
+        self.btn_load_q = QPushButton("Load Q-table")
         self.btn_run.clicked.connect(self.toggle_run)
         self.btn_step.clicked.connect(self.single_step)
         self.btn_reset.clicked.connect(self.reset_world)
+        self.btn_save_q.clicked.connect(self.save_q_table)
+        self.btn_load_q.clicked.connect(self.load_q_table)
 
         # status panel (moved from overlay to right side)
         self.lbl_status = QLabel()
@@ -637,28 +698,21 @@ class MainWindow(QMainWindow):
         self.lbl_plot_title = QLabel("Avg reward per 1000 steps")
         self.lbl_plot_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
-        # teaching notes
-        self.lbl_hint = QLabel(
-            "Teaching notes:\n"
-            "- Q-table is a dict: state -> [Q(s,A), Q(s,B), Q(s,C)]\n"
-            "- Find 'Q-LEARNING UPDATE RULE' in the code.\n"
-            "- World wraps around (torus), no borders."
-        )
-        self.lbl_hint.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        self.lbl_hint.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-
         # layout
         controls = QVBoxLayout()
         controls.addWidget(self.btn_run)
         controls.addWidget(self.btn_step)
         controls.addWidget(self.btn_reset)
+        controls.addSpacing(6)
+        controls.addWidget(self.btn_save_q)
+        controls.addWidget(self.btn_load_q)
         controls.addSpacing(10)
         controls.addWidget(self.lbl_status)
         controls.addSpacing(6)
         controls.addWidget(self.lbl_plot_title)
         controls.addWidget(self.reward_plot)
         controls.addSpacing(10)
-        controls.addWidget(self.lbl_hint, 1)
+        controls.addStretch(1)
 
         root = QHBoxLayout()
         root.addWidget(self.view)
@@ -696,7 +750,9 @@ class MainWindow(QMainWindow):
             self.world.step()
         self.update_status_panel()
         self.view.update()
-        self.reward_plot.update()
+        if self.world.reward_ma_dirty:
+            self.reward_plot.refresh()
+            self.world.reward_ma_dirty = False
 
     def toggle_run(self):
         if self.timer.isActive():
@@ -731,7 +787,9 @@ class MainWindow(QMainWindow):
         self.world.step()
         self.update_status_panel()
         self.view.update()
-        self.reward_plot.update()
+        if self.world.reward_ma_dirty:
+            self.reward_plot.refresh()
+            self.world.reward_ma_dirty = False
 
     def reset_world(self):
         was_running = self.timer.isActive()
@@ -744,9 +802,80 @@ class MainWindow(QMainWindow):
 
         self.view.update()
         self.update_status_panel()
-        self.reward_plot.update()
+        self.reward_plot.refresh(force=True)
+        self.world.reward_ma_dirty = False
 
         self.btn_run.setText("Run")
+        if was_running:
+            self.timer.start()
+            self.btn_run.setText("Pause")
+
+    def save_q_table(self):
+        was_running = self.timer.isActive()
+        self.timer.stop()
+        self.space_timer.stop()
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Q-table",
+            "q_table.json",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            if was_running:
+                self.timer.start()
+                self.btn_run.setText("Pause")
+            return
+
+        payload = {
+            "format": "qlearning_green_red_pills_qtable",
+            "version": 1,
+            "ma_window": MA_WINDOW,
+            "agent": self.world.agent.to_serializable(),
+        }
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+        if was_running:
+            self.timer.start()
+            self.btn_run.setText("Pause")
+
+    def load_q_table(self):
+        was_running = self.timer.isActive()
+        self.timer.stop()
+        self.space_timer.stop()
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Q-table",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            if was_running:
+                self.timer.start()
+                self.btn_run.setText("Pause")
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not isinstance(payload, dict) or payload.get("format") != "qlearning_green_red_pills_qtable":
+                raise ValueError("Unsupported Q-table file format")
+            agent_data = payload.get("agent")
+            if not isinstance(agent_data, dict):
+                raise ValueError("Missing 'agent' object in Q-table file")
+
+            self.world.agent = QLearningAgent.from_serializable(agent_data)
+            self.update_status_panel()
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", str(e))
+
         if was_running:
             self.timer.start()
             self.btn_run.setText("Pause")
