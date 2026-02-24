@@ -39,6 +39,7 @@
 
 024_robot_navigation/dataset*
 024_robot_navigation/cnn*
+024_robot_navigation/resnet*
 
 !025_qlearning_green_red_pills/q_table_agent_1million_steps.json
 

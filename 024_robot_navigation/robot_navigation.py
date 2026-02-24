@@ -21,6 +21,9 @@ QT_QPA_PLATFORM=offscreen python robot_navigation.py record --dataset ./dataset5
 python robot_navigation.py train --dataset ./dataset500 --out-model cnn.pt --epochs 30 --device auto \
   --lr 5e-4 --weight-decay 1e-4 --sched plateau --patience 8 --split-seed 0
 
+# 2b) train a pretrained ResNet18 instead
+python robot_navigation.py train --dataset ./dataset500 --out-model resnet18.pt --epochs 30 --device auto --arch resnet18
+
 # 3) offline test accuracy (last 20% episodes)
 python robot_navigation.py test-offline --model cnn.pt.best.pt --dataset ./dataset500 --device auto
 
@@ -327,6 +330,49 @@ class DemoDataset(Dataset):
 # CNN (deeper + spatial head)
 # ----------------------------
 
+class _Normalize(nn.Module):
+    def __init__(self, mean: list[float], std: list[float]):
+        super().__init__()
+        mean_t = torch.tensor(mean, dtype=torch.float32).view(1, -1, 1, 1)
+        std_t = torch.tensor(std, dtype=torch.float32).view(1, -1, 1, 1)
+        self.register_buffer("mean", mean_t, persistent=False)
+        self.register_buffer("std", std_t, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+
+class ResNet18Classifier(nn.Module):
+    def __init__(self, num_actions: int = 4, pretrained: bool = True):
+        super().__init__()
+        try:
+            from torchvision import models
+        except Exception as e:
+            raise RuntimeError(
+                "torchvision is required for --arch resnet18. Install it via pip/conda (matching your torch version)."
+            ) from e
+
+        # Newer torchvision uses Weights enums; older versions use `pretrained=True`.
+        try:
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            backbone = models.resnet18(weights=weights)
+        except Exception:
+            backbone = models.resnet18(pretrained=bool(pretrained))
+
+        if pretrained:
+            # ImageNet normalization expected for pretrained weights
+            self.normalize = _Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        else:
+            self.normalize = nn.Identity()
+
+        in_features = int(backbone.fc.in_features)
+        backbone.fc = nn.Linear(in_features, num_actions)
+        self.backbone = backbone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.normalize(x)
+        return self.backbone(x)
+
 class DeeperSpatialCNN(nn.Module):
     """
     Deeper CNN while keeping spatial info:
@@ -381,16 +427,44 @@ class DeeperSpatialCNN(nn.Module):
         return self.head(x)
 
 
-def save_model(path: Path, model: nn.Module, meta: dict):
-    torch.save({"state_dict": model.state_dict(), "meta": meta}, str(Path(path)))
+def build_model(arch: str, *, num_actions: int = 4) -> nn.Module:
+    arch_n = (arch or "").strip().lower()
+    if arch_n in ("cnn", "deepercnn", "deeperspatialcnn"):
+        return DeeperSpatialCNN(num_actions=num_actions)
+    if arch_n in ("resnet18", "resnet"):
+        return ResNet18Classifier(num_actions=num_actions, pretrained=True)
+    raise ValueError(f"Unknown --arch '{arch}'. Expected: cnn, resnet18")
 
 
-def load_model(path: Path, device: str):
+def save_model(path: Path, model: nn.Module, meta: dict, *, arch: str):
+    torch.save({"state_dict": model.state_dict(), "meta": meta, "arch": str(arch)}, str(Path(path)))
+
+
+def load_model(path: Path, device: str, *, arch_override: str | None = None):
     payload = torch.load(str(Path(path)), map_location=device)
-    model = DeeperSpatialCNN(num_actions=4).to(device)
-    model.load_state_dict(payload["state_dict"])
+
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+        meta = payload.get("meta", {})
+        arch_in_ckpt = payload.get("arch")
+    else:
+        # Backward compatibility: allow loading plain state_dict checkpoints
+        state_dict = payload
+        meta = {}
+        arch_in_ckpt = None
+
+    arch = (arch_override or arch_in_ckpt or meta.get("arch_id") or "cnn")
+    model = build_model(arch, num_actions=4).to(device)
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load checkpoint '{Path(path)}' with --arch {arch}. "
+            "If this is an older CNN checkpoint, try --arch cnn; for ResNet checkpoints, use --arch resnet18."
+        ) from e
+
     model.eval()
-    return model, payload.get("meta", {})
+    return model, meta
 
 
 def resolve_device(device_str: str) -> str:
@@ -507,6 +581,7 @@ def mode_train(
     split_seed: int | None,
     sched: str,
     patience: int,
+    arch: str,
 ):
     device = resolve_device(device_str)
     train_eps, test_eps = split_episodes_80_20(dataset_dir, split_seed=split_seed)
@@ -520,7 +595,7 @@ def mode_train(
     dl_train = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=0)
     dl_test = DataLoader(ds_test, batch_size=max(64, batch), shuffle=False, num_workers=0)
 
-    model = DeeperSpatialCNN().to(device)
+    model = build_model(arch).to(device)
 
     # AdamW = Adam + decoupled weight decay
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -598,7 +673,7 @@ def mode_train(
                 "split": ("shuffled80_20_by_seed" if split_seed is not None else "first80_train_last20_test_by_episode_order"),
                 "split_seed": split_seed,
                 "device_trained": device,
-                "arch": "DeeperSpatialCNN(pool=4x4,mlp_head)",
+                "arch_id": str(arch),
                 "optimizer": "AdamW",
                 "lr": lr,
                 "weight_decay": weight_decay,
@@ -608,7 +683,7 @@ def mode_train(
                 "best_val_loss": best_val_loss,
                 "best_val_acc": val_acc,
             }
-            save_model(best_path, model, meta)
+            save_model(best_path, model, meta, arch=str(arch))
         else:
             bad_epochs += 1
 
@@ -648,7 +723,7 @@ def mode_train(
         "split": ("shuffled80_20_by_seed" if split_seed is not None else "first80_train_last20_test_by_episode_order"),
         "split_seed": split_seed,
         "device_trained": device,
-        "arch": "DeeperSpatialCNN(pool=4x4,mlp_head)",
+        "arch_id": str(arch),
         "optimizer": "AdamW",
         "lr": lr,
         "weight_decay": weight_decay,
@@ -658,7 +733,7 @@ def mode_train(
         "best_val_loss": best_val_loss,
         "best_val_acc": best_val_acc,
     }
-    save_model(out_model, model, final_meta)
+    save_model(out_model, model, final_meta, arch=str(arch))
 
     _write_train_log_csv(log_csv, log_rows)
     _save_train_curves_png(plot_png, log_rows, title=f"Training curves ({out_model.name})")
@@ -673,7 +748,14 @@ def mode_train(
 # Mode: test-offline
 # ----------------------------
 
-def mode_test_offline(model_path: Path, dataset_dir: Path, batch: int, device_str: str, split_seed: int | None):
+def mode_test_offline(
+    model_path: Path,
+    dataset_dir: Path,
+    batch: int,
+    device_str: str,
+    split_seed: int | None,
+    arch_override: str | None,
+):
     device = resolve_device(device_str)
     _, test_eps = split_episodes_80_20(dataset_dir, split_seed=split_seed)
     ds = DemoDataset(dataset_dir, test_eps)
@@ -681,7 +763,7 @@ def mode_test_offline(model_path: Path, dataset_dir: Path, batch: int, device_st
         raise RuntimeError("Offline test set empty. Add more episodes.")
     dl = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=0)
 
-    model, meta = load_model(model_path, device=device)
+    model, meta = load_model(model_path, device=device, arch_override=arch_override)
 
     correct = total = 0
     loss_sum = 0.0
@@ -734,13 +816,25 @@ class GridView(QWidget):
 
 
 class OnlineWindow(QMainWindow):
-    def __init__(self, model_path: Path, num_episodes: int, w: int, h: int, p: float,
-                 cell_px: int, seed: int | None, device: str, fps: int):
+    def __init__(
+        self,
+        model_path: Path,
+        num_episodes: int,
+        w: int,
+        h: int,
+        p: float,
+        cell_px: int,
+        seed: int | None,
+        device: str,
+        fps: int,
+        arch_override: str | None,
+    ):
         super().__init__()
-        self.setWindowTitle("test-online: CNN controls the robot (live)")
 
         self.device = device
-        self.model, _ = load_model(model_path, device=device)
+        self.model, meta = load_model(model_path, device=device, arch_override=arch_override)
+        arch_label = arch_override or meta.get("arch_id") or "cnn"
+        self.setWindowTitle(f"test-online: {arch_label} controls the robot (live)")
 
         self.rng = random.Random(seed)
         self.env = GridWorld(w, h, p, self.rng)
@@ -844,11 +938,21 @@ class OnlineWindow(QMainWindow):
         )
 
 
-def mode_test_online(model_path: Path, episodes: int, w: int, h: int, p: float, cell: int,
-                     seed: int | None, device_str: str, fps: int):
+def mode_test_online(
+    model_path: Path,
+    episodes: int,
+    w: int,
+    h: int,
+    p: float,
+    cell: int,
+    seed: int | None,
+    device_str: str,
+    fps: int,
+    arch_override: str | None,
+):
     device = resolve_device(device_str)
     app = QApplication.instance() or QApplication([])
-    win = OnlineWindow(model_path, episodes, w, h, p, cell, seed, device, fps)
+    win = OnlineWindow(model_path, episodes, w, h, p, cell, seed, device, fps, arch_override)
     win.show()
     app.exec()
 
@@ -874,7 +978,7 @@ def main():
     ap_rec.add_argument("--img-digits", type=int, default=6)
 
     # train
-    ap_tr = sub.add_parser("train", help="Train CNN on 80% episodes; validate on 20%.")
+    ap_tr = sub.add_parser("train", help="Train a model on 80% episodes; validate on 20%.")
     ap_tr.add_argument("--dataset", type=str, required=True)
     ap_tr.add_argument("--out-model", type=str, default="./cnn.pt")
     ap_tr.add_argument("--epochs", type=int, default=20)
@@ -887,6 +991,8 @@ def main():
                       help="Learning-rate scheduler.")
     ap_tr.add_argument("--patience", type=int, default=0,
                       help="Early stopping patience (epochs without val_loss improvement). 0 disables.")
+    ap_tr.add_argument("--arch", type=str, default="cnn", choices=["cnn", "resnet18"],
+                      help="Model architecture: 'cnn' (train from scratch) or 'resnet18' (pretrained ImageNet weights).")
 
     # test-offline
     ap_to = sub.add_parser("test-offline", help="Evaluate on last 20% episodes from dataset (no visualization).")
@@ -895,9 +1001,11 @@ def main():
     ap_to.add_argument("--batch", type=int, default=128)
     ap_to.add_argument("--device", type=str, default="auto", help="auto|cpu|cuda|mps")
     ap_to.add_argument("--split-seed", type=int, default=None, help="Must match training split if you used shuffling.")
+    ap_to.add_argument("--arch", type=str, default="auto", choices=["auto", "cnn", "resnet18"],
+                      help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).")
 
     # test-online
-    ap_tn = sub.add_parser("test-online", help="Run N new episodes online; visualize CNN controlling the robot.")
+    ap_tn = sub.add_parser("test-online", help="Run N new episodes online; visualize the model controlling the robot.")
     ap_tn.add_argument("--model", type=str, required=True)
     ap_tn.add_argument("--episodes", type=int, required=True)
     ap_tn.add_argument("--w", type=int, default=16)
@@ -907,6 +1015,8 @@ def main():
     ap_tn.add_argument("--seed", type=int, default=None)
     ap_tn.add_argument("--device", type=str, default="auto", help="auto|cpu|cuda|mps")
     ap_tn.add_argument("--fps", type=int, default=8, help="Visualization update rate.")
+    ap_tn.add_argument("--arch", type=str, default="auto", choices=["auto", "cnn", "resnet18"],
+                      help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).")
 
     args = ap.parse_args()
 
@@ -926,6 +1036,7 @@ def main():
             split_seed=args.split_seed,
             sched=args.sched,
             patience=args.patience,
+            arch=args.arch,
         )
 
     elif args.cmd == "test-offline":
@@ -935,11 +1046,22 @@ def main():
             batch=args.batch,
             device_str=args.device,
             split_seed=args.split_seed,
+            arch_override=None if args.arch == "auto" else args.arch,
         )
 
     elif args.cmd == "test-online":
-        mode_test_online(Path(args.model), args.episodes, args.w, args.h, args.p, args.cell,
-                         args.seed, args.device, args.fps)
+        mode_test_online(
+            model_path=Path(args.model),
+            episodes=args.episodes,
+            w=args.w,
+            h=args.h,
+            p=args.p,
+            cell=args.cell,
+            seed=args.seed,
+            device_str=args.device,
+            fps=args.fps,
+            arch_override=None if args.arch == "auto" else args.arch,
+        )
 
 
 if __name__ == "__main__":
