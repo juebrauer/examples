@@ -43,7 +43,7 @@ What this patch adds
 - Optional early stopping: --patience N (based on val_loss)
 - Optional LR scheduling: --sched {none,plateau,cosine}
 - Optional shuffled split: --split-seed SEED (deterministic shuffle before 80/20 split)
-- `test-online` appends a one-line summary to overall_results.txt in this script folder.
+- `test-online` appends a Markdown table row to overall_results.md (and also overall_results.txt) in this script folder.
 """
 
 import argparse
@@ -1005,15 +1005,48 @@ def _append_overall_results(
     device: str,
 ):
     root = Path(__file__).resolve().parent
-    out_path = root / "overall_results.txt"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = (
-        f"{ts} | arch={arch} | model={Path(model_path).resolve()} | "
-        f"episodes={episodes} | successes={successes} | success_rate={successes/max(1,episodes):.4f} | "
-        f"w={w} h={h} p={p} seed={seed} device={device}\n"
+
+    header = "| timestamp | arch | model | episodes | successes | success_rate | w | h | p | seed | device |\n"
+    sep = "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n"
+
+    model_s = f"`{Path(model_path).resolve()}`"
+    sr = successes / max(1, episodes)
+    row = (
+        f"| {ts} | {arch} | {model_s} | {int(episodes)} | {int(successes)} | {sr:.4f} | "
+        f"{int(w)} | {int(h)} | {float(p):.4f} | {seed} | {device} |\n"
     )
-    with out_path.open("a", encoding="utf-8") as f:
-        f.write(line)
+
+    def _ensure_header(path: Path):
+        if not path.exists() or path.stat().st_size == 0:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(header)
+                f.write(sep)
+            return
+
+        # Check tail so we don't re-add headers even if the file started as plain text.
+        try:
+            size = path.stat().st_size
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                if size > 8192:
+                    f.seek(max(0, size - 8192))
+                tail = f.read()
+            if header.strip() in tail:
+                return
+        except Exception:
+            # If we fail to read the file, fall back to just appending.
+            return
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write(header)
+            f.write(sep)
+
+    # Write to both .md (easy viewing) and .txt (backward compatibility).
+    for out_path in (root / "overall_results.md", root / "overall_results.txt"):
+        _ensure_header(out_path)
+        with out_path.open("a", encoding="utf-8") as f:
+            f.write(row)
 
 
 # ----------------------------
@@ -1180,7 +1213,7 @@ class OnlineWindow(QMainWindow):
                     device=self.device,
                 )
             except Exception as e:
-                print(f"Warning: failed to append overall_results.txt: {e}")
+                print(f"Warning: failed to append overall_results.md/.txt: {e}")
             self.timer.stop()
             return
 
@@ -1324,7 +1357,7 @@ def mode_test_online(
                 device=str(device),
             )
         except Exception as e:
-            print(f"Warning: failed to append overall_results.txt: {e}")
+            print(f"Warning: failed to append overall_results.md/.txt: {e}")
         return
 
     app = QApplication.instance() or QApplication([])
