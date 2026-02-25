@@ -1243,8 +1243,90 @@ def mode_test_online(
     device_str: str,
     fps: int,
     arch_override: str | None,
+    headless: bool,
 ):
     device = resolve_device(device_str)
+
+    if headless:
+        _app = QGuiApplication.instance() or QGuiApplication([])
+        rng = random.Random(seed)
+        env = GridWorld(w, h, p, rng)
+        model, meta = load_model(model_path, device=device, arch_override=arch_override)
+        arch_label = arch_override or meta.get("arch_id") or "cnn"
+
+        successes = 0
+        total_steps = 0
+        total_collisions = 0
+
+        for ep_i in range(1, episodes + 1):
+            ep = env.reset_solvable()
+            path = bfs_path(ep.w, ep.h, ep.obstacles, ep.start, ep.goal)
+            expert_len = max(1, len(path) - 1)
+            max_steps = 5 * expert_len
+            ep.steps = 0
+            ep.collisions = 0
+
+            success = False
+            while True:
+                if ep.robot == ep.goal:
+                    success = True
+                    break
+                if ep.steps >= max_steps:
+                    success = False
+                    break
+
+                img = render_image(ep.w, ep.h, cell, ep.obstacles, ep.start, ep.goal, ep.robot)
+                x = qimage_to_tensor(img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    a_i = int(model(x).argmax(dim=1).item())
+                a = I2A[a_i]
+                env.step(a)
+
+            total_steps += ep.steps
+            total_collisions += ep.collisions
+            if success:
+                successes += 1
+
+            # keep output minimal; users can compute stats from final JSON
+            if episodes <= 10 or ep_i in (1, episodes) or ep_i % 10 == 0:
+                print(
+                    f"episode {ep_i}/{episodes} | {'SUCCESS' if success else 'FAIL'} | "
+                    f"steps={ep.steps}/{max_steps} collisions={ep.collisions} expertX={expert_len}"
+                )
+
+        summary = {
+            "mode": "test-online-headless",
+            "model": str(Path(model_path).resolve()),
+            "arch": str(arch_label),
+            "episodes": int(episodes),
+            "successes": int(successes),
+            "success_rate": float(successes / max(1, episodes)),
+            "avg_steps": float(total_steps / max(1, episodes)),
+            "avg_collisions": float(total_collisions / max(1, episodes)),
+            "w": int(w),
+            "h": int(h),
+            "p": float(p),
+            "seed": seed,
+            "device": str(device),
+        }
+        print(json.dumps(summary, indent=2))
+
+        try:
+            _append_overall_results(
+                model_path=Path(model_path),
+                arch=str(arch_label),
+                episodes=int(episodes),
+                successes=int(successes),
+                w=int(w),
+                h=int(h),
+                p=float(p),
+                seed=seed,
+                device=str(device),
+            )
+        except Exception as e:
+            print(f"Warning: failed to append overall_results.txt: {e}")
+        return
+
     app = QApplication.instance() or QApplication([])
     win = OnlineWindow(model_path, episodes, w, h, p, cell, seed, device, fps, arch_override)
     win.show()
@@ -1353,6 +1435,7 @@ def main():
     ap_tn.add_argument("--seed", type=int, default=None)
     ap_tn.add_argument("--device", type=str, default="auto", help="auto|cpu|cuda|mps")
     ap_tn.add_argument("--fps", type=int, default=8, help="Visualization update rate.")
+    ap_tn.add_argument("--headless", action="store_true", help="Run online evaluation without opening a window (server-friendly).")
     ap_tn.add_argument(
         "--arch",
         type=str,
@@ -1411,6 +1494,7 @@ def main():
             device_str=args.device,
             fps=args.fps,
             arch_override=None if args.arch == "auto" else args.arch,
+            headless=bool(args.headless),
         )
 
 
