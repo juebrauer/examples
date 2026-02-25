@@ -43,6 +43,7 @@
 
 !025_qlearning_green_red_pills/q_table_agent_1million_steps.json
 
+026_deepeval/*
 
 # Ignore checkpoint files
 *-checkpoint.ipynb
