@@ -26,6 +26,15 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QGroupBox, QGridLayout
 )
 
+
+START_CELL_RGB = (140, 170, 220)
+GOAL_CELL_RGB = (140, 210, 140)
+
+
+def _rgb_to_css_hex(rgb: tuple[int, int, int]) -> str:
+    r, g, b = rgb
+    return f"#{r:02x}{g:02x}{b:02x}"
+
 ACTIONS = ["U", "D", "L", "R"]
 DELTA = {"U": (0, -1), "D": (0, 1), "L": (-1, 0), "R": (1, 0)}
 
@@ -56,12 +65,13 @@ def bfs_path_and_explored(w: int, h: int, obstacles: set[tuple[int, int]],
                           start: tuple[int, int], goal: tuple[int, int]):
     """
     BFS from start to goal.
-    Returns: (path or None, explored_order list, explored_set)
+    Returns: (path or None, explored_order list, explored_set, dist_map)
     """
     q = deque([start])
     parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     explored_order: list[tuple[int, int]] = []
     explored_set: set[tuple[int, int]] = set()
+    dist: dict[tuple[int, int], int] = {start: 0}
 
     while q:
         x, y = q.popleft()
@@ -77,10 +87,11 @@ def bfs_path_and_explored(w: int, h: int, obstacles: set[tuple[int, int]],
             if (nx, ny) in parent:
                 continue
             parent[(nx, ny)] = (x, y)
+            dist[(nx, ny)] = dist[(x, y)] + 1
             q.append((nx, ny))
 
     if goal not in parent:
-        return None, explored_order, explored_set
+        return None, explored_order, explored_set, dist
 
     # reconstruct path
     path = []
@@ -89,7 +100,7 @@ def bfs_path_and_explored(w: int, h: int, obstacles: set[tuple[int, int]],
         path.append(cur)
         cur = parent[cur]
     path.reverse()
-    return path, explored_order, explored_set
+    return path, explored_order, explored_set, dist
 
 
 def wavefront_distances(w: int, h: int, obstacles: set[tuple[int, int]],
@@ -174,6 +185,7 @@ def render_world_image(
     explored: set[tuple[int, int]] | None = None,
     path: list[tuple[int, int]] | None = None,
     wave_dist: dict[tuple[int, int], int] | None = None,
+    bfs_dist: dict[tuple[int, int], int] | None = None,
     show_wave_numbers: bool = False,
 ) -> QImage:
     img = QImage(w * cell_px, h * cell_px, QImage.Format_ARGB32)
@@ -216,14 +228,14 @@ def render_world_image(
 
     # goal (same as original)
     gx, gy = goal
-    p.setBrush(QColor(140, 210, 140))
-    p.setPen(QColor(140, 210, 140))
+    p.setBrush(QColor(*GOAL_CELL_RGB))
+    p.setPen(QColor(*GOAL_CELL_RGB))
     p.drawRect(gx * cell_px, gy * cell_px, cell_px, cell_px)
 
     # start (same as original)
     sx, sy = start
-    p.setBrush(QColor(140, 170, 220))
-    p.setPen(QColor(140, 170, 220))
+    p.setBrush(QColor(*START_CELL_RGB))
+    p.setPen(QColor(*START_CELL_RGB))
     p.drawRect(sx * cell_px, sy * cell_px, cell_px, cell_px)
 
     # path overlay (draw on top; soft red cells + line)
@@ -251,6 +263,18 @@ def render_world_image(
         p.setFont(f)
         p.setPen(QColor(90, 90, 90))
         for (x, y), d in wave_dist.items():
+            if (x, y) in obstacles:
+                continue
+            r = QRect(x * cell_px, y * cell_px, cell_px, cell_px)
+            p.drawText(r, Qt.AlignCenter, str(d))
+
+    # BFS distance numbers (distance from START)
+    if bfs_dist and cell_px >= 20:
+        f = QFont()
+        f.setPointSize(max(6, int(cell_px * 0.25)))
+        p.setFont(f)
+        p.setPen(QColor(90, 90, 90))
+        for (x, y), d in bfs_dist.items():
             if (x, y) in obstacles:
                 continue
             r = QRect(x * cell_px, y * cell_px, cell_px, cell_px)
@@ -322,6 +346,7 @@ class MainWindow(QMainWindow):
         self.explored: set[tuple[int, int]] | None = None
         self.path: list[tuple[int, int]] | None = None
         self.wave_dist: dict[tuple[int, int], int] | None = None
+        self.bfs_dist: dict[tuple[int, int], int] | None = None
         self.show_wave_numbers = True
 
         # init world
@@ -339,6 +364,10 @@ class MainWindow(QMainWindow):
         btn_goal = QPushButton("Select goal")
         btn_bfs = QPushButton("BFS")
         btn_wave = QPushButton("Wavefront")
+
+        # Match button colors to the start/goal cell colors.
+        btn_start.setStyleSheet(f"QPushButton {{ background-color: {_rgb_to_css_hex(START_CELL_RGB)}; }}")
+        btn_goal.setStyleSheet(f"QPushButton {{ background-color: {_rgb_to_css_hex(GOAL_CELL_RGB)}; }}")
 
         btn_generate.clicked.connect(self.on_generate_world)
         btn_start.clicked.connect(lambda: self.set_select_mode("start"))
@@ -363,22 +392,35 @@ class MainWindow(QMainWindow):
         apply_params.clicked.connect(self.on_apply_params)
         grid.addWidget(apply_params, 4, 0, 1, 2)
 
-        # layout
+        # Keep controls compact in the right-side panel.
+        control_max_w = 180
+        self.sb_w.setMaximumWidth(control_max_w)
+        self.sb_h.setMaximumWidth(control_max_w)
+        self.sb_p.setMaximumWidth(control_max_w)
+        self.sb_cell.setMaximumWidth(control_max_w)
+        apply_params.setMaximumWidth(control_max_w)
+
+        # layout: grid view on the left, controls on the right
         root = QWidget()
-        main = QVBoxLayout(root)
+        main = QHBoxLayout(root)
 
-        row = QHBoxLayout()
-        row.addWidget(btn_generate)
-        row.addWidget(btn_start)
-        row.addWidget(btn_goal)
-        row.addSpacing(10)
-        row.addWidget(btn_bfs)
-        row.addWidget(btn_wave)
-
-        main.addLayout(row)
-        main.addWidget(gb)
         main.addWidget(self.view)
-        main.addWidget(self.status)
+
+        right = QVBoxLayout()
+
+        buttons = QVBoxLayout()
+        buttons.addWidget(btn_generate)
+        buttons.addWidget(btn_start)
+        buttons.addWidget(btn_goal)
+        buttons.addWidget(btn_bfs)
+        buttons.addWidget(btn_wave)
+
+        right.addLayout(buttons)
+        right.addWidget(gb)
+        right.addWidget(self.status)
+        right.addStretch(1)
+
+        main.addLayout(right)
 
         self.setCentralWidget(root)
         self._refresh_view(initial=True)
@@ -406,7 +448,7 @@ class MainWindow(QMainWindow):
                 goal = self._random_free_cell(obstacles)
 
             # ensure solvable
-            path, _, _ = bfs_path_and_explored(self.w, self.h, obstacles, start, goal)
+            path, _, _, _ = bfs_path_and_explored(self.w, self.h, obstacles, start, goal)
             if path is None:
                 continue
 
@@ -433,6 +475,7 @@ class MainWindow(QMainWindow):
         self.explored = None
         self.path = None
         self.wave_dist = None
+        self.bfs_dist = None
 
     def on_apply_params(self):
         self.w = int(self.sb_w.value())
@@ -481,10 +524,11 @@ class MainWindow(QMainWindow):
 
     def on_run_bfs(self):
         self.set_select_mode(None)
-        path, _, explored = bfs_path_and_explored(
+        path, _, explored, dist = bfs_path_and_explored(
             self.world.w, self.world.h, self.world.obstacles, self.world.start, self.world.goal
         )
         self.wave_dist = None
+        self.bfs_dist = dist
         self.explored = explored
         self.path = path
         self._refresh_view()
@@ -506,6 +550,7 @@ class MainWindow(QMainWindow):
             self.world.w, self.world.h, self.world.obstacles, self.world.start, self.world.goal
         )
         self.explored = None
+        self.bfs_dist = None
         self.wave_dist = dist
         self.path = path
         self._refresh_view()
@@ -531,6 +576,7 @@ class MainWindow(QMainWindow):
             explored=self.explored,
             path=self.path,
             wave_dist=self.wave_dist,
+            bfs_dist=self.bfs_dist,
             show_wave_numbers=self.show_wave_numbers,
         )
         self.view.set_image(img)
