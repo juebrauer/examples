@@ -17,36 +17,42 @@ Examples
 # 1) record demonstrations
 QT_QPA_PLATFORM=offscreen python robot_navigation.py record --dataset ./dataset500 --episodes 500 --w 16 --h 12 --p 0.22
 
-# 2) train CNN (AdamW weight decay + best checkpoint + scheduler + plots)
-python robot_navigation.py train --dataset ./dataset500 --out-model cnn.pt --epochs 30 --device auto \
+# 2) train CNN into its own run directory (model + log + plots)
+python robot_navigation.py train --dataset ./dataset500 --run-dir ./runs/cnn_try1 --epochs 30 --device auto \
   --lr 5e-4 --weight-decay 1e-4 --sched plateau --patience 8 --split-seed 0
 
 # 2b) train a pretrained ResNet18 instead
-python robot_navigation.py train --dataset ./dataset500 --out-model resnet18.pt --epochs 30 --device auto --arch resnet18
+python robot_navigation.py train --dataset ./dataset500 --run-dir ./runs/resnet_try1 --epochs 30 --device auto --arch resnet18
+
+# 2c) train a pretrained ViT-B/16 instead
+python robot_navigation.py train --dataset ./dataset500 --run-dir ./runs/vit_try1 --epochs 30 --device auto --arch vit
 
 # 3) offline test accuracy (last 20% episodes)
-python robot_navigation.py test-offline --model cnn.pt.best.pt --dataset ./dataset500 --device auto
+python robot_navigation.py test-offline --model ./runs/cnn_try1/cnn.pt --dataset ./dataset500 --device auto
 
 # 4) online test (new episodes, live)
-python robot_navigation.py test-online --model cnn.pt.best.pt --episodes 30 --w 16 --h 12 --p 0.22 --device auto
+python robot_navigation.py test-online --model ./runs/cnn_try1/cnn.pt --episodes 30 --w 16 --h 12 --p 0.22 --device auto
 
 What this patch adds
 --------------------
-- Training now computes BOTH val_loss and val_acc each epoch.
-- Saves the best checkpoint automatically:
-    <out-model>.best.pt   (chosen by lowest val_loss)
+- `train` writes all artifacts to a per-run directory (`--run-dir`):
+    - best model: <arch>.pt (chosen by lowest val_loss)
+    - training log: training.log
+    - curves plot: train_curves.png (train/val loss + train/val acc)
+    - optional CSV log: train_log.csv
 - Optional early stopping: --patience N (based on val_loss)
 - Optional LR scheduling: --sched {none,plateau,cosine}
 - Optional shuffled split: --split-seed SEED (deterministic shuffle before 80/20 split)
-- Logs to CSV: <out-model>.train_log.csv
-- Saves training curves plot: <out-model>.train_curves.png
+- `test-online` appends a one-line summary to overall_results.txt in this script folder.
 """
 
 import argparse
 import csv
 import json
 import math
+import logging
 import random
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -237,6 +243,57 @@ def qimage_to_tensor(img: QImage) -> torch.Tensor:
     return x.float() / 255.0
 
 
+def load_image_as_tensor(path: Path) -> torch.Tensor:
+    """Load an RGB image as float tensor (3,H,W) in [0,1].
+
+    Training/test-offline can be bottlenecked by image decode + Qt conversion.
+    If torchvision is available, use torchvision.io.read_image (fast, worker-friendly).
+    Otherwise fall back to QImage.
+    """
+    p = str(Path(path))
+    try:
+        from torchvision.io import read_image
+        x = read_image(p)  # uint8 (C,H,W), typically RGB
+        if x.dim() != 3 or x.size(0) not in (1, 3, 4):
+            raise RuntimeError(f"Unexpected image tensor shape: {tuple(x.shape)}")
+        if x.size(0) == 4:
+            x = x[:3]
+        if x.size(0) == 1:
+            x = x.repeat(3, 1, 1)
+        return x.float() / 255.0
+    except Exception:
+        img = QImage(p)
+        return qimage_to_tensor(img)
+
+
+def pad_to_square(x: torch.Tensor, *, fill: float = 0.5) -> torch.Tensor:
+    """Pad (3,H,W) tensor to square with constant fill."""
+    if x.dim() != 3:
+        raise ValueError(f"Expected (C,H,W), got {tuple(x.shape)}")
+    _, h, w = x.shape
+    if h == w:
+        return x
+    size = max(h, w)
+    pad_h = size - h
+    pad_w = size - w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    # F.pad pads last dims: (left, right, top, bottom)
+    return F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=float(fill))
+
+
+def resize_chw(x: torch.Tensor, size: int) -> torch.Tensor:
+    """Resize (3,H,W) tensor to (3,size,size) using bilinear."""
+    if x.dim() != 3:
+        raise ValueError(f"Expected (C,H,W), got {tuple(x.shape)}")
+    size_i = int(size)
+    if x.shape[-2] == size_i and x.shape[-1] == size_i:
+        return x
+    return F.interpolate(x.unsqueeze(0), size=(size_i, size_i), mode="bilinear", align_corners=False).squeeze(0)
+
+
 # ----------------------------
 # Dataset I/O + splits
 # ----------------------------
@@ -304,10 +361,18 @@ def split_episodes_80_20(dataset_dir: Path, split_seed: int | None):
 
 
 class DemoDataset(Dataset):
-    def __init__(self, dataset_dir: Path, episodes_set: set[int], ep_digits=6, img_digits=6):
+    def __init__(
+        self,
+        dataset_dir: Path,
+        episodes_set: set[int],
+        ep_digits=6,
+        img_digits=6,
+        transform=None,
+    ):
         self.dataset_dir = Path(dataset_dir)
         self.ep_digits = ep_digits
         self.img_digits = img_digits
+        self.transform = transform
         self.samples = [(ep, im, a) for (ep, im, a) in read_actions_csv(self.dataset_dir) if ep in episodes_set]
 
     def __len__(self):
@@ -320,8 +385,9 @@ class DemoDataset(Dataset):
 
     def __getitem__(self, idx):
         ep, im, a = self.samples[idx]
-        img = QImage(str(self._img_path(ep, im)))
-        x = qimage_to_tensor(img)
+        x = load_image_as_tensor(self._img_path(ep, im))
+        if self.transform is not None:
+            x = self.transform(x)
         y = torch.tensor(A2I[a], dtype=torch.long)
         return x, y
 
@@ -370,6 +436,62 @@ class ResNet18Classifier(nn.Module):
         self.backbone = backbone
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.normalize(x)
+        return self.backbone(x)
+
+
+class ViTB16Classifier(nn.Module):
+    def __init__(
+        self,
+        num_actions: int = 4,
+        pretrained: bool = True,
+        image_size: int = 224,
+    ):
+        super().__init__()
+        self.image_size = int(image_size)
+        try:
+            from torchvision import models
+        except Exception as e:
+            raise RuntimeError(
+                "torchvision is required for --arch vit (ViT). Install it via pip/conda (matching your torch version)."
+            ) from e
+
+        # Newer torchvision uses Weights enums; older versions use `pretrained=True`.
+        try:
+            weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
+            backbone = models.vit_b_16(weights=weights)
+            if pretrained:
+                # Use the transform's normalization constants when available.
+                mean = list(weights.transforms().mean)
+                std = list(weights.transforms().std)
+                self.normalize = _Normalize(mean=mean, std=std)
+            else:
+                self.normalize = nn.Identity()
+        except Exception:
+            backbone = models.vit_b_16(pretrained=bool(pretrained))
+            if pretrained:
+                # Fallback to the common ImageNet normalization.
+                self.normalize = _Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            else:
+                self.normalize = nn.Identity()
+
+        # Replace classification head.
+        # torchvision ViT uses `heads.head` (Linear) in common versions.
+        if hasattr(backbone, "heads") and hasattr(backbone.heads, "head"):
+            in_features = int(backbone.heads.head.in_features)
+            backbone.heads.head = nn.Linear(in_features, num_actions)
+        else:
+            # Defensive fallback if torchvision changes internals.
+            raise RuntimeError("Unsupported torchvision ViT structure: expected backbone.heads.head")
+
+        self.backbone = backbone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ViT in torchvision expects a fixed input resolution (typically 224x224).
+        if x.dim() != 4:
+            raise ValueError(f"Expected input of shape (B,3,H,W), got {tuple(x.shape)}")
+        if x.shape[-2] != self.image_size or x.shape[-1] != self.image_size:
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         x = self.normalize(x)
         return self.backbone(x)
 
@@ -433,7 +555,9 @@ def build_model(arch: str, *, num_actions: int = 4) -> nn.Module:
         return DeeperSpatialCNN(num_actions=num_actions)
     if arch_n in ("resnet18", "resnet"):
         return ResNet18Classifier(num_actions=num_actions, pretrained=True)
-    raise ValueError(f"Unknown --arch '{arch}'. Expected: cnn, resnet18")
+    if arch_n in ("vit", "vit_b_16", "vitb16", "vit-b-16"):
+        return ViTB16Classifier(num_actions=num_actions, pretrained=True, image_size=224)
+    raise ValueError(f"Unknown --arch '{arch}'. Expected: cnn, resnet18, vit")
 
 
 def save_model(path: Path, model: nn.Module, meta: dict, *, arch: str):
@@ -526,7 +650,7 @@ def mode_record(dataset_dir: Path, episodes: int, w: int, h: int, p: float, cell
 # ----------------------------
 
 def _write_train_log_csv(path: Path, rows: list[dict]):
-    fields = ["epoch", "lr", "train_loss", "val_loss", "val_acc", "is_best"]
+    fields = ["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc", "is_best"]
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -543,36 +667,66 @@ def _save_train_curves_png(path: Path, rows: list[dict], title: str):
     epochs = [int(r["epoch"]) for r in rows]
     train_loss = [float(r["train_loss"]) for r in rows]
     val_loss = [float(r["val_loss"]) for r in rows]
+    train_acc = [float(r["train_acc"]) for r in rows]
     val_acc = [float(r["val_acc"]) for r in rows]
 
-    fig = plt.figure(figsize=(8.5, 4.8))
-    ax1 = fig.add_subplot(111)
-    ax2 = ax1.twinx()
+    fig, (ax_loss, ax_acc) = plt.subplots(2, 1, figsize=(8.5, 6.6), sharex=True)
 
-    ax1.plot(epochs, train_loss, marker="o", label="train loss")
-    ax1.plot(epochs, val_loss, marker="o", label="val loss")
-    ax2.plot(epochs, val_acc, marker="o", label="val acc")
+    ax_loss.plot(epochs, train_loss, marker="o", label="train loss")
+    ax_loss.plot(epochs, val_loss, marker="o", label="val loss")
+    ax_loss.set_ylabel("loss")
+    ax_loss.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
+    ax_loss.legend(loc="best")
 
-    ax1.set_xlabel("epoch")
-    ax1.set_ylabel("loss")
-    ax2.set_ylabel("accuracy")
+    ax_acc.plot(epochs, train_acc, marker="o", label="train acc")
+    ax_acc.plot(epochs, val_acc, marker="o", label="val acc")
+    ax_acc.set_xlabel("epoch")
+    ax_acc.set_ylabel("accuracy")
+    ax_acc.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
+    ax_acc.legend(loc="best")
 
-    ax1.set_title(title)
-    ax1.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
-
-    # combined legend
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="best")
-
-    fig.tight_layout()
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(str(path), dpi=150)
     plt.close(fig)
+
+
+def _setup_train_logger(run_dir: Path) -> logging.Logger:
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger(f"train:{run_dir}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # Avoid duplicate handlers if mode_train is called multiple times in-process.
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    fh = logging.FileHandler(run_dir / "training.log", mode="w")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+def _default_run_dir(arch: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_arch = (arch or "cnn").strip().lower()
+    return Path("./runs") / f"{ts}_{safe_arch}"
 
 
 def mode_train(
     dataset_dir: Path,
     out_model: Path,
+    run_dir: Path | None,
     epochs: int,
     batch: int,
     lr: float,
@@ -582,23 +736,103 @@ def mode_train(
     sched: str,
     patience: int,
     arch: str,
+    amp: str,
+    num_workers: int,
+    pin_memory: str,
+    vit_image_size: int,
+    vit_pad_square: bool,
+    freeze_backbone: bool,
 ):
     device = resolve_device(device_str)
     train_eps, test_eps = split_episodes_80_20(dataset_dir, split_seed=split_seed)
 
-    ds_train = DemoDataset(dataset_dir, train_eps)
-    ds_test = DemoDataset(dataset_dir, test_eps)
+    run_dir = Path(run_dir) if run_dir is not None else None
+    if run_dir is None:
+        run_dir = _default_run_dir(arch)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logger = _setup_train_logger(run_dir)
+    logger.info(f"run_dir={run_dir.resolve()}")
+    logger.info(f"dataset_dir={Path(dataset_dir).resolve()}")
+    logger.info(f"arch={arch} device={device} epochs={epochs} batch={batch} lr={lr} weight_decay={weight_decay}")
+    logger.info(f"split_seed={split_seed} sched={sched} patience={patience}")
+
+    if device == "cuda":
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+    arch_n = (arch or "").strip().lower()
+
+    amp_enabled = False
+    if (amp or "auto").lower() == "on":
+        amp_enabled = (device == "cuda")
+    elif (amp or "auto").lower() == "off":
+        amp_enabled = False
+    else:
+        # auto
+        amp_enabled = (device == "cuda" and arch_n in ("resnet18", "resnet", "vit", "vit_b_16", "vitb16", "vit-b-16"))
+
+    if (pin_memory or "auto").lower() == "on":
+        pin_memory_enabled = True
+    elif (pin_memory or "auto").lower() == "off":
+        pin_memory_enabled = False
+    else:
+        pin_memory_enabled = (device == "cuda")
+
+    logger.info(
+        f"amp={amp} (enabled={amp_enabled}) num_workers={int(num_workers)} pin_memory={pin_memory} (enabled={pin_memory_enabled}) "
+        f"vit_image_size={int(vit_image_size)} vit_pad_square={bool(vit_pad_square)} freeze_backbone={bool(freeze_backbone)}"
+    )
+
+    def _transform(x: torch.Tensor) -> torch.Tensor:
+        if arch_n in ("vit", "vit_b_16", "vitb16", "vit-b-16"):
+            if vit_pad_square:
+                x = pad_to_square(x, fill=0.5)
+            x = resize_chw(x, vit_image_size)
+        return x
+
+    ds_train = DemoDataset(dataset_dir, train_eps, transform=_transform)
+    ds_test = DemoDataset(dataset_dir, test_eps, transform=_transform)
 
     if len(ds_train) == 0 or len(ds_test) == 0:
         raise RuntimeError("Train/test split produced empty set. Add more episodes.")
 
-    dl_train = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=0)
-    dl_test = DataLoader(ds_test, batch_size=max(64, batch), shuffle=False, num_workers=0)
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=batch,
+        shuffle=True,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory_enabled),
+    )
+    dl_test = DataLoader(
+        ds_test,
+        batch_size=max(64, batch),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory_enabled),
+    )
 
     model = build_model(arch).to(device)
 
+    if freeze_backbone:
+        if arch_n in ("resnet18", "resnet"):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            for p in model.backbone.fc.parameters():
+                p.requires_grad = True
+        elif arch_n in ("vit", "vit_b_16", "vitb16", "vit-b-16"):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            for p in model.backbone.heads.head.parameters():
+                p.requires_grad = True
+        # CNN is trained end-to-end by default.
+
     # AdamW = Adam + decoupled weight decay
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable parameters (did you freeze everything?)")
+    opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
     scheduler = None
     if sched == "plateau":
@@ -621,9 +855,14 @@ def mode_train(
         loss_sum = 0.0
         with torch.no_grad():
             for x, y in dl_test:
-                x, y = x.to(device), y.to(device)
-                logits = model(x)
-                loss = F.cross_entropy(logits, y, reduction="sum")
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                if amp_enabled:
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits = model(x)
+                        loss = F.cross_entropy(logits, y, reduction="sum")
+                else:
+                    logits = model(x)
+                    loss = F.cross_entropy(logits, y, reduction="sum")
                 loss_sum += float(loss.item())
                 pred = logits.argmax(dim=1)
                 correct += (pred == y).sum().item()
@@ -633,10 +872,11 @@ def mode_train(
         val_acc = correct / max(1, total)
         return val_loss, val_acc
 
-    out_model = Path(out_model)
-    best_path = out_model.with_suffix(out_model.suffix + ".best.pt")
-    log_csv = out_model.with_suffix(out_model.suffix + ".train_log.csv")
-    plot_png = out_model.with_suffix(out_model.suffix + ".train_curves.png")
+    # Save all artifacts into the run_dir.
+    arch_name = (arch or "cnn").strip().lower()
+    best_path = run_dir / f"{arch_name}.pt"
+    log_csv = run_dir / "train_log.csv"
+    plot_png = run_dir / "train_curves.png"
 
     best_val_loss = float("inf")
     best_val_acc = 0.0
@@ -644,20 +884,39 @@ def mode_train(
 
     log_rows: list[dict] = []
 
+    scaler = None
+    if amp_enabled:
+        scaler = torch.cuda.amp.GradScaler()
+
     for e in range(1, epochs + 1):
         running = 0.0
         seen = 0
+        correct = 0
 
         for x, y in dl_train:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(model(x), y)
-            loss.backward()
-            opt.step()
+
+            if scaler is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = model(x)
+                    loss = F.cross_entropy(logits, y)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                logits = model(x)
+                loss = F.cross_entropy(logits, y)
+                loss.backward()
+                opt.step()
+
             running += float(loss.item()) * y.size(0)
             seen += y.size(0)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
 
         train_loss = running / max(1, seen)
+        train_acc = correct / max(1, seen)
         val_loss, val_acc = eval_val()
 
         cur_lr = float(opt.param_groups[0]["lr"])
@@ -679,6 +938,13 @@ def mode_train(
                 "weight_decay": weight_decay,
                 "batch": batch,
                 "sched": sched,
+                "amp": amp,
+                "amp_enabled": bool(amp_enabled),
+                "freeze_backbone": bool(freeze_backbone),
+                "num_workers": int(num_workers),
+                "pin_memory": str(pin_memory),
+                "vit_image_size": int(vit_image_size),
+                "vit_pad_square": bool(vit_pad_square),
                 "best_epoch": e,
                 "best_val_loss": best_val_loss,
                 "best_val_acc": val_acc,
@@ -687,9 +953,10 @@ def mode_train(
         else:
             bad_epochs += 1
 
-        print(
+        logger.info(
             f"epoch {e}/{epochs} | lr {cur_lr:.2e} | "
-            f"train loss {train_loss:.4f} | val loss {val_loss:.4f} | val acc {val_acc*100:.2f}%"
+            f"train loss {train_loss:.4f} | train acc {train_acc*100:.2f}% | "
+            f"val loss {val_loss:.4f} | val acc {val_acc*100:.2f}%"
             f"{'  [BEST]' if is_best else ''}"
         )
 
@@ -698,6 +965,7 @@ def mode_train(
                 "epoch": e,
                 "lr": cur_lr,
                 "train_loss": train_loss,
+                "train_acc": train_acc,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
                 "is_best": int(is_best),
@@ -713,35 +981,39 @@ def mode_train(
 
         # early stopping
         if patience > 0 and bad_epochs >= patience:
-            print(f"Early stopping: no val_loss improvement for {bad_epochs} epochs (patience={patience}).")
+            logger.info(f"Early stopping: no val_loss improvement for {bad_epochs} epochs (patience={patience}).")
             break
 
-    # Save final model too (useful for debugging); best is in *.best.pt
-    final_meta = {
-        "dataset_dir": str(Path(dataset_dir).resolve()),
-        "actions": ACTIONS,
-        "split": ("shuffled80_20_by_seed" if split_seed is not None else "first80_train_last20_test_by_episode_order"),
-        "split_seed": split_seed,
-        "device_trained": device,
-        "arch_id": str(arch),
-        "optimizer": "AdamW",
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "batch": batch,
-        "sched": sched,
-        "epochs_ran": int(log_rows[-1]["epoch"]) if log_rows else 0,
-        "best_val_loss": best_val_loss,
-        "best_val_acc": best_val_acc,
-    }
-    save_model(out_model, model, final_meta, arch=str(arch))
-
     _write_train_log_csv(log_csv, log_rows)
-    _save_train_curves_png(plot_png, log_rows, title=f"Training curves ({out_model.name})")
+    _save_train_curves_png(plot_png, log_rows, title=f"Training curves ({arch_name})")
 
-    print(f"Saved final model to: {out_model.resolve()}")
-    print(f"Saved best model to : {best_path.resolve()} (by lowest val_loss)")
-    print(f"Wrote train log     : {log_csv.resolve()}")
-    print(f"Wrote train plot    : {plot_png.resolve()}")
+    logger.info(f"Saved best model to: {best_path.resolve()} (by lowest val_loss)")
+    logger.info(f"Wrote train log CSV: {log_csv.resolve()}")
+    logger.info(f"Wrote train plot   : {plot_png.resolve()}")
+
+
+def _append_overall_results(
+    *,
+    model_path: Path,
+    arch: str,
+    episodes: int,
+    successes: int,
+    w: int,
+    h: int,
+    p: float,
+    seed: int | None,
+    device: str,
+):
+    root = Path(__file__).resolve().parent
+    out_path = root / "overall_results.txt"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = (
+        f"{ts} | arch={arch} | model={Path(model_path).resolve()} | "
+        f"episodes={episodes} | successes={successes} | success_rate={successes/max(1,episodes):.4f} | "
+        f"w={w} h={h} p={p} seed={seed} device={device}\n"
+    )
+    with out_path.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 # ----------------------------
@@ -832,12 +1104,19 @@ class OnlineWindow(QMainWindow):
         super().__init__()
 
         self.device = device
+        self.model_path = Path(model_path)
         self.model, meta = load_model(model_path, device=device, arch_override=arch_override)
         arch_label = arch_override or meta.get("arch_id") or "cnn"
+        self.arch_label = str(arch_label)
         self.setWindowTitle(f"test-online: {arch_label} controls the robot (live)")
 
         self.rng = random.Random(seed)
         self.env = GridWorld(w, h, p, self.rng)
+
+        self.w = int(w)
+        self.h = int(h)
+        self.p = float(p)
+        self.seed = seed
 
         self.num_episodes = num_episodes
         self.cell_px = cell_px
@@ -887,6 +1166,21 @@ class OnlineWindow(QMainWindow):
                 f"avg_steps={self.total_steps/max(1,self.num_episodes):.1f} | "
                 f"avg_collisions={self.total_collisions/max(1,self.num_episodes):.1f}"
             )
+            # Append summary line for tracking across runs.
+            try:
+                _append_overall_results(
+                    model_path=self.model_path,
+                    arch=self.arch_label,
+                    episodes=self.num_episodes,
+                    successes=self.successes,
+                    w=self.w,
+                    h=self.h,
+                    p=self.p,
+                    seed=self.seed,
+                    device=self.device,
+                )
+            except Exception as e:
+                print(f"Warning: failed to append overall_results.txt: {e}")
             self.timer.stop()
             return
 
@@ -980,7 +1274,18 @@ def main():
     # train
     ap_tr = sub.add_parser("train", help="Train a model on 80% episodes; validate on 20%.")
     ap_tr.add_argument("--dataset", type=str, required=True)
-    ap_tr.add_argument("--out-model", type=str, default="./cnn.pt")
+    ap_tr.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Directory name/path for this training run. Artifacts are written here (model/plot/log).",
+    )
+    ap_tr.add_argument(
+        "--out-model",
+        type=str,
+        default="./cnn.pt",
+        help="(Legacy) Ignored for artifact paths if --run-dir is set. Kept for backward compatibility.",
+    )
     ap_tr.add_argument("--epochs", type=int, default=20)
     ap_tr.add_argument("--batch", type=int, default=64)
     ap_tr.add_argument("--lr", type=float, default=5e-4)
@@ -991,8 +1296,36 @@ def main():
                       help="Learning-rate scheduler.")
     ap_tr.add_argument("--patience", type=int, default=0,
                       help="Early stopping patience (epochs without val_loss improvement). 0 disables.")
-    ap_tr.add_argument("--arch", type=str, default="cnn", choices=["cnn", "resnet18"],
-                      help="Model architecture: 'cnn' (train from scratch) or 'resnet18' (pretrained ImageNet weights).")
+    ap_tr.add_argument(
+        "--amp",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Mixed precision on CUDA. 'auto' enables for resnet/vit on cuda.",
+    )
+    ap_tr.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (0 is safest; >0 can speed up image loading).")
+    ap_tr.add_argument(
+        "--pin-memory",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="DataLoader pin_memory. 'auto' enables on cuda.",
+    )
+    ap_tr.add_argument("--freeze-backbone", action="store_true", help="For resnet/vit: train only the final classification head.")
+    ap_tr.add_argument("--vit-image-size", type=int, default=224, help="ViT preprocessing: resize to this square size.")
+    ap_tr.add_argument(
+        "--vit-pad-square",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="ViT preprocessing: pad to square before resize (recommended).",
+    )
+    ap_tr.add_argument(
+        "--arch",
+        type=str,
+        default="cnn",
+        choices=["cnn", "resnet18", "vit"],
+        help="Model architecture: 'cnn' (train from scratch), 'resnet18' (pretrained ImageNet), or 'vit' (pretrained ViT-B/16).",
+    )
 
     # test-offline
     ap_to = sub.add_parser("test-offline", help="Evaluate on last 20% episodes from dataset (no visualization).")
@@ -1001,8 +1334,13 @@ def main():
     ap_to.add_argument("--batch", type=int, default=128)
     ap_to.add_argument("--device", type=str, default="auto", help="auto|cpu|cuda|mps")
     ap_to.add_argument("--split-seed", type=int, default=None, help="Must match training split if you used shuffling.")
-    ap_to.add_argument("--arch", type=str, default="auto", choices=["auto", "cnn", "resnet18"],
-                      help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).")
+    ap_to.add_argument(
+        "--arch",
+        type=str,
+        default="auto",
+        choices=["auto", "cnn", "resnet18", "vit"],
+        help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).",
+    )
 
     # test-online
     ap_tn = sub.add_parser("test-online", help="Run N new episodes online; visualize the model controlling the robot.")
@@ -1015,8 +1353,13 @@ def main():
     ap_tn.add_argument("--seed", type=int, default=None)
     ap_tn.add_argument("--device", type=str, default="auto", help="auto|cpu|cuda|mps")
     ap_tn.add_argument("--fps", type=int, default=8, help="Visualization update rate.")
-    ap_tn.add_argument("--arch", type=str, default="auto", choices=["auto", "cnn", "resnet18"],
-                      help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).")
+    ap_tn.add_argument(
+        "--arch",
+        type=str,
+        default="auto",
+        choices=["auto", "cnn", "resnet18", "vit"],
+        help="Override model architecture. 'auto' uses the checkpoint's stored arch (or defaults to cnn).",
+    )
 
     args = ap.parse_args()
 
@@ -1028,6 +1371,7 @@ def main():
         mode_train(
             dataset_dir=Path(args.dataset),
             out_model=Path(args.out_model),
+            run_dir=None if args.run_dir is None else Path(args.run_dir),
             epochs=args.epochs,
             batch=args.batch,
             lr=args.lr,
@@ -1037,6 +1381,12 @@ def main():
             sched=args.sched,
             patience=args.patience,
             arch=args.arch,
+            amp=args.amp,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            vit_image_size=args.vit_image_size,
+            vit_pad_square=args.vit_pad_square,
+            freeze_backbone=args.freeze_backbone,
         )
 
     elif args.cmd == "test-offline":
