@@ -189,6 +189,7 @@ class QLearningAgent:
         # Slightly optimistic init helps exploration in sparse-reward worlds.
         self.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
         self.eps = EPS_START
+        self.use_epsilon_greedy = True
 
     def to_serializable(self) -> dict:
         # Convert tuple keys to lists so JSON can store them.
@@ -208,6 +209,7 @@ class QLearningAgent:
 
         return {
             "eps": float(self.eps),
+            "use_epsilon_greedy": bool(self.use_epsilon_greedy),
             "actions": ACTIONS,
             "q": q_items,
         }
@@ -218,6 +220,7 @@ class QLearningAgent:
         agent.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
 
         agent.eps = float(data.get("eps", EPS_START))
+        agent.use_epsilon_greedy = bool(data.get("use_epsilon_greedy", True))
         items = data.get("q", [])
         for item in items:
             state_list = item.get("state")
@@ -244,7 +247,7 @@ class QLearningAgent:
 
     def choose_action(self, state: tuple[int, int, int, int]) -> int:
         """Epsilon-greedy policy."""
-        if random.random() < self.eps:
+        if self.use_epsilon_greedy and (random.random() < self.eps):
             return random.randint(0, 2)
         qs = self.Q[state]
         # argmax with RANDOM tie-breaking (avoids bias toward lower indices)
@@ -253,7 +256,8 @@ class QLearningAgent:
         return random.choice(best_actions)
 
     def decay_epsilon(self):
-        self.eps = max(EPS_MIN, self.eps * EPS_DECAY)
+        if self.use_epsilon_greedy:
+            self.eps = max(EPS_MIN, self.eps * EPS_DECAY)
 
     # ==========================================================
     # >>>>>>>>>>>>   Q-LEARNING UPDATE RULE (core!)   <<<<<<<<<<
@@ -806,9 +810,13 @@ class MainWindow(QMainWindow):
         self.btn_load_q = QPushButton("Load Q-table")
         self.btn_view_q = QPushButton("View Q-table")
 
-        self.chk_reward_shaping = QCheckBox("Reward shaping")
+        self.chk_reward_shaping = QCheckBox("Potential-basiertes Shaping")
         self.chk_reward_shaping.setChecked(USE_REWARD_SHAPING)
         self.chk_reward_shaping.toggled.connect(self.on_toggle_reward_shaping)
+
+        self.chk_eps_greedy = QCheckBox("epsilon-greedy")
+        self.chk_eps_greedy.setChecked(True)
+        self.chk_eps_greedy.toggled.connect(self.on_toggle_eps_greedy)
 
         self.btn_run.clicked.connect(self.toggle_run)
         self.btn_step.clicked.connect(self.single_step)
@@ -833,6 +841,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.btn_step)
         controls.addWidget(self.btn_reset)
         controls.addWidget(self.chk_reward_shaping)
+        controls.addWidget(self.chk_eps_greedy)
         controls.addSpacing(6)
         controls.addWidget(self.btn_save_q)
         controls.addWidget(self.btn_load_q)
@@ -864,10 +873,12 @@ class MainWindow(QMainWindow):
         w = self.world
         action_name = ACTIONS[w.last_action] if w.last_action is not None else "-"
         shaping = "on" if w.use_reward_shaping else "off"
+        policy = "epsilon-greedy" if w.agent.use_epsilon_greedy else "greedy"
 
         self.lbl_status.setText(
             f"steps: {w.steps}\n"
             f"epsilon: {w.agent.eps:.3f}\n"
+            f"policy: {policy}\n"
             f"score (sum r): {w.score:.2f}\n"
             f"ma1000(r): {w.reward_ma_1000:.3f}\n\n"
             f"reward shaping: {shaping}\n"
@@ -879,6 +890,10 @@ class MainWindow(QMainWindow):
 
     def on_toggle_reward_shaping(self, checked: bool):
         self.world.use_reward_shaping = bool(checked)
+        self.update_status_panel()
+
+    def on_toggle_eps_greedy(self, checked: bool):
+        self.world.agent.use_epsilon_greedy = bool(checked)
         self.update_status_panel()
 
     def on_tick(self):
@@ -935,6 +950,7 @@ class MainWindow(QMainWindow):
 
         self.world = World()
         self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
+        self.world.agent.use_epsilon_greedy = bool(self.chk_eps_greedy.isChecked())
         self.view.world = self.world
         self.reward_plot.world = self.world
         if self.q_table_dialog is not None:
@@ -1014,6 +1030,8 @@ class MainWindow(QMainWindow):
 
             self.world.agent = QLearningAgent.from_serializable(agent_data)
             self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
+            # Reflect loaded agent setting in UI.
+            self.chk_eps_greedy.setChecked(bool(self.world.agent.use_epsilon_greedy))
             self.update_status_panel()
             if self.q_table_dialog is not None:
                 self.q_table_dialog.refresh()
