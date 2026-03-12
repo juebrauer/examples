@@ -28,4 +28,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 022      | C and C++ exercises for beginners |
 | 025      | Python script, Q-Learning agent learns to collect green pills and avoid red pills |
 | 027      | Python script, shows how to plan a path from a start to goal cell in a grid world using breadth-first-search |
+| 029      | DeepEval, notebook shows how to use the deepeval python lib to test LLMs |
 | 0xx      |  |

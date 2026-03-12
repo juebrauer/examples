@@ -1,0 +1,143 @@
+# Bedienungsanleitung der Zeitmaschine (DeLorean)
+
+# 1. Überblick über die Zeitmaschine
+
+Die Zeitmaschine besteht aus drei zentralen Systemen:
+
+-   **Fluxkompensator** -- ermöglicht die Manipulation der Raumzeit\
+-   **Zeit-Schaltkreise** -- definieren das Ziel in der Zeit\
+-   **Energiequelle** -- liefert die nötige Energie für den Zeittransfer
+
+Sobald das Fahrzeug eine Geschwindigkeit von **88 mph (ca. 142 km/h)**
+erreicht, wird der Zeittransfer ausgelöst.
+
+------------------------------------------------------------------------
+
+# 2. Startsystem aktivieren
+
+Vor jeder Zeitreise muss das System eingeschaltet werden.
+
+Schritte:
+
+1.  Hauptstromversorgung aktivieren\
+2.  Zeit-Schaltkreise einschalten\
+3.  Fluxkompensator aktivieren\
+4.  Energiequelle überprüfen
+
+Wenn alle Systeme korrekt laufen, beginnen die Zeit-Schaltkreise zu
+leuchten.
+
+------------------------------------------------------------------------
+
+# 3. Zielzeit einstellen
+
+Die Zeitmaschine besitzt ein Bedienfeld mit drei Zeitanzeigen:
+
+-   **Destination Time** -- Zielzeitpunkt\
+-   **Present Time** -- aktuelle Zeit\
+-   **Last Time Departed** -- Zeitpunkt der letzten Abreise
+
+Der gewünschte Zeitpunkt wird über das Bedienfeld eingegeben.
+
+------------------------------------------------------------------------
+
+# 4. Energiequelle vorbereiten
+
+Der Fluxkompensator benötigt eine enorme Energiemenge.
+
+Im Film wird diese Energie durch folgende Quellen bereitgestellt:
+
+-   Plutonium-Reaktor\
+-   Blitzenergie\
+-   später ein kompakter Fusionsreaktor
+
+Vor dem Start muss überprüft werden, ob ausreichend Energie vorhanden
+ist.
+
+------------------------------------------------------------------------
+
+# 5. Fahrzeug beschleunigen
+
+Sobald das Ziel eingestellt ist und genügend Energie vorhanden ist, muss
+das Fahrzeug beschleunigt werden.
+
+Der Zeittransfer wird ausgelöst, wenn die Geschwindigkeit **88 mph**
+erreicht.
+
+Während der Beschleunigung stabilisieren die Zeit-Schaltkreise den
+Transferpunkt.
+
+------------------------------------------------------------------------
+
+# 6. Zeittransfer
+
+Beim Erreichen der Zielgeschwindigkeit aktiviert sich der
+Fluxkompensator vollständig.
+
+Typische Effekte:
+
+-   starkes Leuchten des Fluxkompensators\
+-   elektrische Entladungen\
+-   kurzzeitige Raumzeitverzerrung
+
+Das Fahrzeug verschwindet anschließend aus der aktuellen Zeitlinie.
+
+------------------------------------------------------------------------
+
+# 7. Ankunft in der Zielzeit
+
+Nach dem Transfer erscheint das Fahrzeug am selben geografischen Ort,
+jedoch zu einem anderen Zeitpunkt.
+
+Nach der Ankunft sollten folgende Schritte durchgeführt werden:
+
+-   Systemstatus überprüfen\
+-   Energielevel kontrollieren\
+-   Umgebung analysieren
+
+------------------------------------------------------------------------
+
+# 8. Sicherheitsrichtlinien
+
+Bei Zeitreisen müssen bestimmte Regeln eingehalten werden.
+
+Wichtige Empfehlungen:
+
+-   historische Ereignisse nicht verändern\
+-   Begegnungen mit früheren Versionen der eigenen Person vermeiden\
+-   keine Technologie aus der Zukunft in die Vergangenheit bringen
+
+Diese Maßnahmen helfen, Paradoxien zu vermeiden.
+
+------------------------------------------------------------------------
+
+# 9. Häufige Probleme
+
+### Energieausfall
+
+Wenn der Reaktor keine Energie mehr liefert, ist kein erneuter
+Zeittransfer möglich.
+
+### Fehlfunktion der Zeit-Schaltkreise
+
+Falsche Eingaben können dazu führen, dass das Fahrzeug in einer falschen
+Zeit landet.
+
+### Beschädigter Fluxkompensator
+
+Ohne funktionierenden Fluxkompensator ist Zeitreise unmöglich.
+
+------------------------------------------------------------------------
+
+# 10. Wartung der Zeitmaschine
+
+Damit die Zeitmaschine zuverlässig funktioniert, sollten regelmäßige
+Wartungsarbeiten durchgeführt werden:
+
+-   Überprüfung der Zeit-Schaltkreise\
+-   Reinigung der Fluxkompensator-Leitungen\
+-   Kalibrierung des Navigationssystems\
+-   Kontrolle der Energiequelle
+
+Eine korrekt gewartete Zeitmaschine reduziert das Risiko von
+Fehlfunktionen erheblich.
