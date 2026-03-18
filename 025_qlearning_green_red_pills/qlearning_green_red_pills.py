@@ -38,7 +38,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QMessageBox,
-    QDialog, QTableView, QHeaderView, QCheckBox
+    QDialog, QTableView, QHeaderView, QCheckBox, QDoubleSpinBox, QFormLayout
 )
 
 try:
@@ -106,8 +106,15 @@ ANGLE_BINS = 24         # 360/24 = 15° bins
 DIST_BINS = 10
 MAX_DIST = math.hypot(WORLD_W / 2, WORLD_H / 2)  # max shortest distance on torus
 
-# Actions: indices 0,1,2 map to A,B,C
-ACTIONS = ["A: turn left", "B: forward", "C: turn right"]
+# Actions: indices map to A,B,C,D
+ACTION_KEYS = ["A", "B", "C", "D"]
+ACTIONS = [
+    "A: turn left",
+    "B: forward",
+    "C: turn right",
+    "D: backward",
+]
+N_ACTIONS = len(ACTIONS)
 
 
 # =========================
@@ -185,22 +192,41 @@ def discretize_dist(d: float) -> int:
 
 class QLearningAgent:
     def __init__(self):
-        # Q-table: dict[state_tuple] -> list[Q(s,a)] for a in {0,1,2}
+        # Q-table: dict[state_tuple] -> list[Q(s,a)] for enabled actions
         # Slightly optimistic init helps exploration in sparse-reward worlds.
-        self.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
-        self.eps = EPS_START
+        self.Q = defaultdict(lambda: [1.0] * N_ACTIONS)
+        self.alpha = float(ALPHA)
+        self.gamma = float(GAMMA)
+        self.eps_start = float(EPS_START)
+        self.eps_min = float(EPS_MIN)
+        self.eps_decay = float(EPS_DECAY)
+
+        self.eps = float(self.eps_start)
         self.use_epsilon_greedy = True
+        self.enabled_actions: list[int] = list(range(N_ACTIONS))
+
+    def set_enabled_actions(self, enabled_mask: list[bool]):
+        if len(enabled_mask) != N_ACTIONS:
+            raise ValueError(f"enabled_mask must have length {N_ACTIONS}")
+        enabled = [i for i, on in enumerate(enabled_mask) if on]
+        if not enabled:
+            raise ValueError("At least one action must be enabled")
+        self.enabled_actions = enabled
 
     def to_serializable(self) -> dict:
         # Convert tuple keys to lists so JSON can store them.
         q_items: list[dict] = []
         for state, qs in self.Q.items():
+            # Ensure we always serialize the full action vector.
+            if len(qs) < N_ACTIONS:
+                qs = list(qs) + ([1.0] * (N_ACTIONS - len(qs)))
             q_items.append(
                 {
                     "state": list(state),
                     "A_turn_left": float(qs[0]),
                     "B_forward": float(qs[1]),
                     "C_turn_right": float(qs[2]),
+                    "D_backward": float(qs[3]),
                 }
             )
 
@@ -210,6 +236,12 @@ class QLearningAgent:
         return {
             "eps": float(self.eps),
             "use_epsilon_greedy": bool(self.use_epsilon_greedy),
+            "enabled_action_keys": [ACTION_KEYS[i] for i in self.enabled_actions],
+            "alpha": float(self.alpha),
+            "gamma": float(self.gamma),
+            "eps_start": float(self.eps_start),
+            "eps_min": float(self.eps_min),
+            "eps_decay": float(self.eps_decay),
             "actions": ACTIONS,
             "q": q_items,
         }
@@ -217,10 +249,27 @@ class QLearningAgent:
     @classmethod
     def from_serializable(cls, data: dict) -> "QLearningAgent":
         agent = cls()
-        agent.Q = defaultdict(lambda: [1.0, 1.0, 1.0])
+        agent.Q = defaultdict(lambda: [1.0] * N_ACTIONS)
 
-        agent.eps = float(data.get("eps", EPS_START))
+        agent.alpha = float(data.get("alpha", ALPHA))
+        agent.gamma = float(data.get("gamma", GAMMA))
+        agent.eps_start = float(data.get("eps_start", EPS_START))
+        agent.eps_min = float(data.get("eps_min", EPS_MIN))
+        agent.eps_decay = float(data.get("eps_decay", EPS_DECAY))
+
+        agent.eps = float(data.get("eps", agent.eps_start))
         agent.use_epsilon_greedy = bool(data.get("use_epsilon_greedy", True))
+
+        enabled_keys = data.get("enabled_action_keys")
+        if isinstance(enabled_keys, list) and enabled_keys:
+            key_to_idx = {k: i for i, k in enumerate(ACTION_KEYS)}
+            enabled_idxs: list[int] = []
+            for k in enabled_keys:
+                if k in key_to_idx:
+                    enabled_idxs.append(key_to_idx[k])
+            if enabled_idxs:
+                agent.enabled_actions = sorted(set(enabled_idxs))
+
         items = data.get("q", [])
         for item in items:
             state_list = item.get("state")
@@ -232,11 +281,13 @@ class QLearningAgent:
             except Exception:
                 continue
 
+            # Backward-compatible: old files may not have D_backward.
             try:
                 qv = [
                     float(item["A_turn_left"]),
                     float(item["B_forward"]),
                     float(item["C_turn_right"]),
+                    float(item.get("D_backward", 1.0)),
                 ]
             except Exception:
                 continue
@@ -245,19 +296,47 @@ class QLearningAgent:
 
         return agent
 
+    def set_hyperparams(
+        self,
+        *,
+        alpha: float | None = None,
+        gamma: float | None = None,
+        eps_start: float | None = None,
+        eps_min: float | None = None,
+        eps_decay: float | None = None,
+        set_current_eps_to_start: bool = False,
+    ):
+        if alpha is not None:
+            self.alpha = float(alpha)
+        if gamma is not None:
+            self.gamma = float(gamma)
+        if eps_start is not None:
+            self.eps_start = float(eps_start)
+            if set_current_eps_to_start:
+                self.eps = float(self.eps_start)
+        if eps_min is not None:
+            self.eps_min = float(eps_min)
+        if eps_decay is not None:
+            self.eps_decay = float(eps_decay)
+
+        # Keep epsilon within bounds.
+        if self.eps < self.eps_min:
+            self.eps = float(self.eps_min)
+
     def choose_action(self, state: tuple[int, int, int, int]) -> int:
         """Epsilon-greedy policy."""
+        enabled = self.enabled_actions
         if self.use_epsilon_greedy and (random.random() < self.eps):
-            return random.randint(0, 2)
+            return random.choice(enabled)
         qs = self.Q[state]
-        # argmax with RANDOM tie-breaking (avoids bias toward lower indices)
-        max_q = max(qs)
-        best_actions = [a for a, q in enumerate(qs) if q == max_q]
+        # argmax (over enabled actions) with RANDOM tie-breaking
+        max_q = max(qs[a] for a in enabled)
+        best_actions = [a for a in enabled if qs[a] == max_q]
         return random.choice(best_actions)
 
     def decay_epsilon(self):
         if self.use_epsilon_greedy:
-            self.eps = max(EPS_MIN, self.eps * EPS_DECAY)
+            self.eps = max(self.eps_min, self.eps * self.eps_decay)
 
     # ==========================================================
     # >>>>>>>>>>>>   Q-LEARNING UPDATE RULE (core!)   <<<<<<<<<<
@@ -267,10 +346,10 @@ class QLearningAgent:
         Q(s,a) <- Q(s,a) + alpha * ( r + gamma*max_a' Q(s_next,a') - Q(s,a) )
         """
         q_sa = self.Q[s][a]
-        max_next = max(self.Q[s_next])
-        td_target = r + GAMMA * max_next
+        max_next = max(self.Q[s_next][aa] for aa in self.enabled_actions)
+        td_target = r + self.gamma * max_next
         td_error = td_target - q_sa
-        self.Q[s][a] = q_sa + ALPHA * td_error
+        self.Q[s][a] = q_sa + self.alpha * td_error
     # ==========================================================
 
 
@@ -393,6 +472,10 @@ class World:
             self.robot.x += math.cos(self.robot.heading_rad) * MOVE_PX
             self.robot.y += math.sin(self.robot.heading_rad) * MOVE_PX
             self.robot.x, self.robot.y = wrap_pos(self.robot.x, self.robot.y)
+        elif a == 3:  # D: backward
+            self.robot.x -= math.cos(self.robot.heading_rad) * MOVE_PX
+            self.robot.y -= math.sin(self.robot.heading_rad) * MOVE_PX
+            self.robot.x, self.robot.y = wrap_pos(self.robot.x, self.robot.y)
 
         self.robot.heading_rad = angle_normalize(self.robot.heading_rad)
 
@@ -438,7 +521,7 @@ class World:
             _, gd1, _, _ = self.nearest_pill(True)
             _, rd1, _, _ = self.nearest_pill(False)
             phi1 = (-PHI_GREEN_W * (gd1 / MAX_DIST)) + (PHI_RED_W * (rd1 / MAX_DIST))
-            r_train += SHAPING_SCALE * (GAMMA * phi1 - phi0)
+            r_train += SHAPING_SCALE * (self.agent.gamma * phi1 - phi0)
 
         self.agent.update(s, a, r_train, s_next)
         self.agent.decay_epsilon()
@@ -676,20 +759,24 @@ class RewardPlot(QWidget):
 
 
 class QTableModel(QAbstractTableModel):
-    _COLUMNS = [
-        "ang_g",
-        "dist_g",
-        "ang_r",
-        "dist_r",
-        "Q(A)",
-        "Q(B)",
-        "Q(C)",
-        "best",
-    ]
+    _STATE_COLUMNS = ["ang_g", "dist_g", "ang_r", "dist_r"]
 
     def __init__(self):
         super().__init__()
         self._rows: list[tuple[tuple[int, int, int, int], list[float]]] = []
+        self._enabled_actions: list[int] = list(range(N_ACTIONS))
+
+    def set_enabled_actions(self, enabled_actions: list[int]):
+        self.beginResetModel()
+        self._enabled_actions = list(enabled_actions)
+        self.endResetModel()
+
+    def _columns(self) -> list[str]:
+        cols = list(self._STATE_COLUMNS)
+        for a in self._enabled_actions:
+            cols.append(f"Q({ACTION_KEYS[a]})")
+        cols.append("best")
+        return cols
 
     def set_rows(self, rows: list[tuple[tuple[int, int, int, int], list[float]]]):
         self.beginResetModel()
@@ -700,14 +787,15 @@ class QTableModel(QAbstractTableModel):
         return len(self._rows)
 
     def columnCount(self, _parent=None) -> int:
-        return len(self._COLUMNS)
+        return len(self._columns())
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
-            if 0 <= section < len(self._COLUMNS):
-                return self._COLUMNS[section]
+            cols = self._columns()
+            if 0 <= section < len(cols):
+                return cols[section]
             return None
         return str(section)
 
@@ -720,15 +808,22 @@ class QTableModel(QAbstractTableModel):
 
         if 0 <= col <= 3:
             return str(state[col])
-        if col == 4:
-            return f"{qs[0]:.3f}"
-        if col == 5:
-            return f"{qs[1]:.3f}"
-        if col == 6:
-            return f"{qs[2]:.3f}"
-        if col == 7:
-            best = max(range(3), key=lambda a: qs[a])
-            return ("A", "B", "C")[best]
+
+        enabled = self._enabled_actions
+        q_col_start = 4
+        q_col_end = q_col_start + len(enabled)  # exclusive
+
+        if q_col_start <= col < q_col_end:
+            a = enabled[col - q_col_start]
+            # Backward-safe: if a loaded row has fewer Q values, fall back to 1.0.
+            qv = qs[a] if a < len(qs) else 1.0
+            return f"{qv:.3f}"
+
+        if col == q_col_end:
+            if not enabled:
+                return "-"
+            best = max(enabled, key=lambda a: (qs[a] if a < len(qs) else 1.0))
+            return ACTION_KEYS[best]
 
         return None
 
@@ -772,7 +867,11 @@ class QTableDialog(QDialog):
         agent = self.world.agent
         items = list(agent.Q.items())
 
-        items.sort(key=lambda kv: max(kv[1]), reverse=True)
+        enabled = agent.enabled_actions
+        if enabled:
+            items.sort(key=lambda kv: max(kv[1][a] for a in enabled), reverse=True)
+        else:
+            items.sort(key=lambda kv: 0.0, reverse=True)
         total = len(items)
         shown = min(total, QTABLE_VIEW_MAX_ROWS)
         rows = items[:shown]
@@ -780,6 +879,7 @@ class QTableDialog(QDialog):
         self.lbl_info.setText(
             f"states learned: {total}    showing: {shown}    refresh: {QTABLE_VIEW_REFRESH_MS}ms"
         )
+        self.model.set_enabled_actions(enabled)
         self.model.set_rows(rows)
 
 
@@ -810,6 +910,52 @@ class MainWindow(QMainWindow):
         self.btn_load_q = QPushButton("Load Q-table")
         self.btn_view_q = QPushButton("View Q-table")
 
+        # Action enable/disable checkboxes
+        self.chk_action_A = QCheckBox("Left")
+        self.chk_action_B = QCheckBox("Forward")
+        self.chk_action_C = QCheckBox("Right")
+        self.chk_action_D = QCheckBox("Backward")
+
+        for cb in (self.chk_action_A, self.chk_action_B, self.chk_action_C, self.chk_action_D):
+            cb.setChecked(True)
+            cb.toggled.connect(self.on_toggle_actions)
+
+        # Hyperparameter controls
+        self.spin_alpha = QDoubleSpinBox()
+        self.spin_alpha.setDecimals(4)
+        self.spin_alpha.setSingleStep(0.01)
+        self.spin_alpha.setRange(0.0, 1.0)
+        self.spin_alpha.setValue(ALPHA)
+        self.spin_alpha.valueChanged.connect(self.on_hyperparams_changed)
+
+        self.spin_gamma = QDoubleSpinBox()
+        self.spin_gamma.setDecimals(4)
+        self.spin_gamma.setSingleStep(0.01)
+        self.spin_gamma.setRange(0.0, 0.9999)
+        self.spin_gamma.setValue(GAMMA)
+        self.spin_gamma.valueChanged.connect(self.on_hyperparams_changed)
+
+        self.spin_eps_start = QDoubleSpinBox()
+        self.spin_eps_start.setDecimals(4)
+        self.spin_eps_start.setSingleStep(0.05)
+        self.spin_eps_start.setRange(0.0, 1.0)
+        self.spin_eps_start.setValue(EPS_START)
+        self.spin_eps_start.valueChanged.connect(self.on_hyperparams_changed)
+
+        self.spin_eps_min = QDoubleSpinBox()
+        self.spin_eps_min.setDecimals(4)
+        self.spin_eps_min.setSingleStep(0.01)
+        self.spin_eps_min.setRange(0.0, 1.0)
+        self.spin_eps_min.setValue(EPS_MIN)
+        self.spin_eps_min.valueChanged.connect(self.on_hyperparams_changed)
+
+        self.spin_eps_decay = QDoubleSpinBox()
+        self.spin_eps_decay.setDecimals(6)
+        self.spin_eps_decay.setSingleStep(0.0001)
+        self.spin_eps_decay.setRange(0.9, 0.999999)
+        self.spin_eps_decay.setValue(EPS_DECAY)
+        self.spin_eps_decay.valueChanged.connect(self.on_hyperparams_changed)
+
         self.chk_reward_shaping = QCheckBox("Potential-basiertes Shaping")
         self.chk_reward_shaping.setChecked(USE_REWARD_SHAPING)
         self.chk_reward_shaping.toggled.connect(self.on_toggle_reward_shaping)
@@ -825,6 +971,10 @@ class MainWindow(QMainWindow):
         self.btn_load_q.clicked.connect(self.load_q_table)
         self.btn_view_q.clicked.connect(self.open_q_table_viewer)
 
+        # Make the main control buttons compact for small screens.
+        for b in (self.btn_run, self.btn_step, self.btn_reset, self.btn_save_q, self.btn_load_q, self.btn_view_q):
+            b.setMinimumHeight(26)
+
         # status panel (moved from overlay to right side)
         self.lbl_status = QLabel()
         self.lbl_status.setFrameStyle(QFrame.Panel | QFrame.Sunken)
@@ -837,15 +987,48 @@ class MainWindow(QMainWindow):
 
         # layout
         controls = QVBoxLayout()
-        controls.addWidget(self.btn_run)
-        controls.addWidget(self.btn_step)
-        controls.addWidget(self.btn_reset)
+
+        top_buttons = QHBoxLayout()
+        top_buttons.setSpacing(6)
+        top_buttons.addWidget(self.btn_run)
+        top_buttons.addWidget(self.btn_step)
+        top_buttons.addWidget(self.btn_reset)
+        controls.addLayout(top_buttons)
+
+        controls.addSpacing(6)
+
+        controls.addWidget(QLabel("Actions"))
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(10)
+        actions_row.addWidget(self.chk_action_A)
+        actions_row.addWidget(self.chk_action_B)
+        actions_row.addWidget(self.chk_action_C)
+        actions_row.addWidget(self.chk_action_D)
+        controls.addLayout(actions_row)
+
+        controls.addSpacing(6)
+        controls.addWidget(QLabel("Hyperparameters"))
+        hyper_form = QFormLayout()
+        hyper_form.setContentsMargins(0, 0, 0, 0)
+        hyper_form.setHorizontalSpacing(8)
+        hyper_form.setVerticalSpacing(4)
+        hyper_form.addRow("ALPHA:", self.spin_alpha)
+        hyper_form.addRow("GAMMA:", self.spin_gamma)
+        hyper_form.addRow("EPS_START:", self.spin_eps_start)
+        hyper_form.addRow("EPS_MIN:", self.spin_eps_min)
+        hyper_form.addRow("EPS_DECAY:", self.spin_eps_decay)
+        controls.addLayout(hyper_form)
         controls.addWidget(self.chk_reward_shaping)
         controls.addWidget(self.chk_eps_greedy)
         controls.addSpacing(6)
-        controls.addWidget(self.btn_save_q)
-        controls.addWidget(self.btn_load_q)
-        controls.addWidget(self.btn_view_q)
+
+        qtable_buttons = QHBoxLayout()
+        qtable_buttons.setSpacing(6)
+        qtable_buttons.addWidget(self.btn_save_q)
+        qtable_buttons.addWidget(self.btn_load_q)
+        qtable_buttons.addWidget(self.btn_view_q)
+        controls.addLayout(qtable_buttons)
+
         controls.addSpacing(10)
         controls.addWidget(self.lbl_status)
         controls.addSpacing(6)
@@ -869,16 +1052,29 @@ class MainWindow(QMainWindow):
 
         self.update_status_panel()
 
+        # Apply action selection to the agent.
+        self.on_toggle_actions(True)
+
+        # Apply hyperparams from UI to the agent.
+        self.on_hyperparams_changed()
+
     def update_status_panel(self):
         w = self.world
         action_name = ACTIONS[w.last_action] if w.last_action is not None else "-"
         shaping = "on" if w.use_reward_shaping else "off"
         policy = "epsilon-greedy" if w.agent.use_epsilon_greedy else "greedy"
 
+        exploration_rate = w.agent.eps if w.agent.use_epsilon_greedy else 0.0
+
+        enabled_keys = ",".join(ACTION_KEYS[i] for i in w.agent.enabled_actions)
+
         self.lbl_status.setText(
             f"steps: {w.steps}\n"
-            f"epsilon: {w.agent.eps:.3f}\n"
+            f"alpha: {w.agent.alpha:.3f}   gamma: {w.agent.gamma:.3f}\n"
+            f"epsilon: {w.agent.eps:.3f} (min {w.agent.eps_min:.2f}, decay {w.agent.eps_decay:.6f})\n"
+            f"exploration rate: {exploration_rate * 100.0:.1f}%\n"
             f"policy: {policy}\n"
+            f"enabled actions: {enabled_keys}\n"
             f"score (sum r): {w.score:.2f}\n"
             f"ma1000(r): {w.reward_ma_1000:.3f}\n\n"
             f"reward shaping: {shaping}\n"
@@ -894,6 +1090,55 @@ class MainWindow(QMainWindow):
 
     def on_toggle_eps_greedy(self, checked: bool):
         self.world.agent.use_epsilon_greedy = bool(checked)
+        self.update_status_panel()
+
+    def on_hyperparams_changed(self):
+        # Keep eps_start >= eps_min in the UI.
+        eps_min = float(self.spin_eps_min.value())
+        if self.spin_eps_start.value() < eps_min:
+            self.spin_eps_start.blockSignals(True)
+            self.spin_eps_start.setValue(eps_min)
+            self.spin_eps_start.blockSignals(False)
+
+        # Apply to agent (live).
+        self.world.agent.set_hyperparams(
+            alpha=float(self.spin_alpha.value()),
+            gamma=float(self.spin_gamma.value()),
+            eps_start=float(self.spin_eps_start.value()),
+            eps_min=float(self.spin_eps_min.value()),
+            eps_decay=float(self.spin_eps_decay.value()),
+            # Don't reset epsilon mid-training; eps_start is used on Reset.
+            set_current_eps_to_start=False,
+        )
+        self.update_status_panel()
+
+    def _enabled_actions_mask_from_ui(self) -> list[bool]:
+        return [
+            bool(self.chk_action_A.isChecked()),
+            bool(self.chk_action_B.isChecked()),
+            bool(self.chk_action_C.isChecked()),
+            bool(self.chk_action_D.isChecked()),
+        ]
+
+    def on_toggle_actions(self, _checked: bool):
+        # Ensure at least one action remains enabled.
+        mask = self._enabled_actions_mask_from_ui()
+        if not any(mask):
+            sender = self.sender()
+            if isinstance(sender, QCheckBox):
+                sender.blockSignals(True)
+                sender.setChecked(True)
+                sender.blockSignals(False)
+            QMessageBox.warning(self, "Invalid action set", "At least one action must be enabled.")
+            mask = self._enabled_actions_mask_from_ui()
+
+        try:
+            self.world.agent.set_enabled_actions(mask)
+        except Exception as e:
+            QMessageBox.warning(self, "Action update failed", str(e))
+
+        if self.q_table_dialog is not None:
+            self.q_table_dialog.refresh()
         self.update_status_panel()
 
     def on_tick(self):
@@ -951,6 +1196,17 @@ class MainWindow(QMainWindow):
         self.world = World()
         self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
         self.world.agent.use_epsilon_greedy = bool(self.chk_eps_greedy.isChecked())
+        # Keep the action set selected in the UI.
+        self.world.agent.set_enabled_actions(self._enabled_actions_mask_from_ui())
+        # Keep hyperparameters selected in the UI.
+        self.world.agent.set_hyperparams(
+            alpha=float(self.spin_alpha.value()),
+            gamma=float(self.spin_gamma.value()),
+            eps_start=float(self.spin_eps_start.value()),
+            eps_min=float(self.spin_eps_min.value()),
+            eps_decay=float(self.spin_eps_decay.value()),
+            set_current_eps_to_start=True,
+        )
         self.view.world = self.world
         self.reward_plot.world = self.world
         if self.q_table_dialog is not None:
@@ -1032,6 +1288,16 @@ class MainWindow(QMainWindow):
             self.world.use_reward_shaping = bool(self.chk_reward_shaping.isChecked())
             # Reflect loaded agent setting in UI.
             self.chk_eps_greedy.setChecked(bool(self.world.agent.use_epsilon_greedy))
+            self.spin_alpha.setValue(float(self.world.agent.alpha))
+            self.spin_gamma.setValue(float(self.world.agent.gamma))
+            self.spin_eps_start.setValue(float(self.world.agent.eps_start))
+            self.spin_eps_min.setValue(float(self.world.agent.eps_min))
+            self.spin_eps_decay.setValue(float(self.world.agent.eps_decay))
+            enabled_keys = {ACTION_KEYS[i] for i in self.world.agent.enabled_actions}
+            self.chk_action_A.setChecked("A" in enabled_keys)
+            self.chk_action_B.setChecked("B" in enabled_keys)
+            self.chk_action_C.setChecked("C" in enabled_keys)
+            self.chk_action_D.setChecked("D" in enabled_keys)
             self.update_status_panel()
             if self.q_table_dialog is not None:
                 self.q_table_dialog.refresh()
