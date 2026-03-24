@@ -1,15 +1,19 @@
-# bfs_vs_wavefront_qt.py
-# PySide6 demo: BFS from START vs BFS from GOAL on a grid world (interactive)
+# path_planing.py
+# PySide6 demo: Wavefront (BFS) distance field + path reconstruction using ONLY distances.
+#
+# Goal: illustrate that both directions are equivalent:
+#   1) Wavefront starting at START, path reconstruction starting at GOAL (follow distances down to START)
+#   2) Wavefront starting at GOAL,  path reconstruction starting at START (follow distances down to GOAL)
 #
 # Controls:
 #   - Generate world: new random obstacles (tries to keep it solvable)
 #   - Select start: click a free cell to set start
 #   - Select goal : click a free cell to set goal
-#   - BFS from start: BFS expansion from START (explored + shortest path)
-#   - BFS from goal : BFS expansion from GOAL (distance field + path via decreasing distances)
+#   - Wavefront @start, path @goal
+#   - Wavefront @goal,  path @start
 #
 # Run:
-#   python bfs_vs_wavefront_qt.py
+#   python path_planing.py
 #
 # Requires: PySide6
 
@@ -61,64 +65,30 @@ def neighbors4(w: int, h: int, x: int, y: int):
             yield nx, ny
 
 
-def bfs_from_start_path_and_explored(w: int, h: int, obstacles: set[tuple[int, int]],
-                                     start: tuple[int, int], goal: tuple[int, int]):
+def wavefront_distance_field(
+    w: int,
+    h: int,
+    obstacles: set[tuple[int, int]],
+    origin: tuple[int, int],
+    *,
+    stop_at: tuple[int, int] | None = None,
+) -> dict[tuple[int, int], int]:
+    """Compute a BFS/Wavefront distance field rooted at `origin`.
+
+    Distances are measured in 4-neighborhood steps.
+    If `stop_at` is provided, BFS stops once `stop_at` is popped from the queue.
+
+    Returns dist_map.
     """
-    BFS from start to goal.
-    Returns: (path or None, explored_order list, explored_set, dist_map)
-    """
-    q = deque([start])
-    parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
-    explored_order: list[tuple[int, int]] = []
-    explored_set: set[tuple[int, int]] = set()
-    dist: dict[tuple[int, int], int] = {start: 0}
+    dist: dict[tuple[int, int], int] = {origin: 0}
+    q = deque([origin])
 
     while q:
         x, y = q.popleft()
-        explored_order.append((x, y))
-        explored_set.add((x, y))
 
-        if (x, y) == goal:
+        if stop_at is not None and (x, y) == stop_at:
             break
 
-        for nx, ny in neighbors4(w, h, x, y):
-            if (nx, ny) in obstacles:
-                continue
-            if (nx, ny) in parent:
-                continue
-            parent[(nx, ny)] = (x, y)
-            dist[(nx, ny)] = dist[(x, y)] + 1
-            q.append((nx, ny))
-
-    if goal not in parent:
-        return None, explored_order, explored_set, dist
-
-    # reconstruct path
-    path = []
-    cur = goal
-    while cur is not None:
-        path.append(cur)
-        cur = parent[cur]
-    path.reverse()
-    return path, explored_order, explored_set, dist
-
-
-def bfs_from_goal_dist_and_path(w: int, h: int, obstacles: set[tuple[int, int]],
-                                start: tuple[int, int], goal: tuple[int, int]):
-    """
-    BFS expansion starting at GOAL to compute distance-to-goal for each reachable cell.
-
-    Path reconstruction does NOT need parent pointers: starting at START, repeatedly step
-    to a neighbor whose distance is exactly one smaller until reaching GOAL.
-
-    Returns: (path or None, dist_map, expansion_order)
-    """
-    dist: dict[tuple[int, int], int] = {goal: 0}
-    order: list[tuple[int, int]] = [goal]
-    q = deque([goal])
-
-    while q:
-        x, y = q.popleft()
         d = dist[(x, y)]
         for nx, ny in neighbors4(w, h, x, y):
             if (nx, ny) in obstacles:
@@ -126,34 +96,56 @@ def bfs_from_goal_dist_and_path(w: int, h: int, obstacles: set[tuple[int, int]],
             if (nx, ny) in dist:
                 continue
             dist[(nx, ny)] = d + 1
-            order.append((nx, ny))
             q.append((nx, ny))
 
-    if start not in dist:
-        return None, dist, order
+    return dist
 
-    # Reconstruct a shortest path START->GOAL by following strictly decreasing distances.
-    cur = start
+
+def reconstruct_path_to_origin_using_distances(
+    w: int,
+    h: int,
+    obstacles: set[tuple[int, int]],
+    dist: dict[tuple[int, int], int],
+    *,
+    path_start: tuple[int, int],
+    origin: tuple[int, int],
+) -> list[tuple[int, int]] | None:
+    """Reconstruct a shortest path from `path_start` to `origin` using ONLY `dist`.
+
+    From a cell c, step to any neighbor with distance exactly dist[c] - 1.    
+    """
+    if dist.get(origin) != 0:
+        return None
+    if path_start not in dist:
+        return None
+
+    cur = path_start
     path = [cur]
-    while cur != goal:
-        x, y = cur
+
+    while cur != origin:
         cur_d = dist[cur]
+        if cur_d <= 0:
+            return None
+
+        x, y = cur
         nxt: tuple[int, int] | None = None
         for nx, ny in neighbors4(w, h, x, y):
             if (nx, ny) in obstacles:
                 continue
-            if (nx, ny) not in dist:
+            nd = dist.get((nx, ny))
+            if nd is None:
                 continue
-            if dist[(nx, ny)] == cur_d - 1:
+            if nd == cur_d - 1:
                 nxt = (nx, ny)
                 break
+
         if nxt is None:
-            # Shouldn't happen for a proper BFS distance field, but keep safe.
-            return None, dist, order
+            return None
+
         cur = nxt
         path.append(cur)
 
-    return path, dist, order
+    return path
 
 
 # --- Rendering (reuses the style from your original script) ---
@@ -168,18 +160,17 @@ def render_world_image(
     *,
     explored: set[tuple[int, int]] | None = None,
     path: list[tuple[int, int]] | None = None,
-    goal_dist: dict[tuple[int, int], int] | None = None,
-    bfs_dist: dict[tuple[int, int], int] | None = None,
-    show_goal_numbers: bool = False,
+    dist_map: dict[tuple[int, int], int] | None = None,
+    show_numbers: bool = True,
 ) -> QImage:
     img = QImage(w * cell_px, h * cell_px, QImage.Format_ARGB32)
     img.fill(QColor(245, 245, 245))
     p = QPainter(img)
 
-    # Optional: BFS-from-goal distance shading (very light, keeps original style dominant)
-    if goal_dist:
-        max_d = max(goal_dist.values()) if goal_dist else 1
-        for (x, y), d in goal_dist.items():
+    # Optional: distance shading (very light, keeps original style dominant)
+    if dist_map:
+        max_d = max(dist_map.values()) if dist_map else 1
+        for (x, y), d in dist_map.items():
             if (x, y) in obstacles:
                 continue
             # map distance to a gentle brightness; goal (0) stays near background
@@ -240,25 +231,13 @@ def render_world_image(
             cx1, cy1 = x1 * cell_px + cell_px // 2, y1 * cell_px + cell_px // 2
             p.drawLine(cx0, cy0, cx1, cy1)
 
-    # BFS-from-goal distance numbers (optional)
-    if goal_dist and show_goal_numbers and cell_px >= 20:
+    # Distance numbers
+    if dist_map and show_numbers and cell_px >= 20:
         f = QFont()
         f.setPointSize(max(6, int(cell_px * 0.25)))
         p.setFont(f)
         p.setPen(QColor(90, 90, 90))
-        for (x, y), d in goal_dist.items():
-            if (x, y) in obstacles:
-                continue
-            r = QRect(x * cell_px, y * cell_px, cell_px, cell_px)
-            p.drawText(r, Qt.AlignCenter, str(d))
-
-    # BFS distance numbers (distance from START)
-    if bfs_dist and cell_px >= 20:
-        f = QFont()
-        f.setPointSize(max(6, int(cell_px * 0.25)))
-        p.setFont(f)
-        p.setPen(QColor(90, 90, 90))
-        for (x, y), d in bfs_dist.items():
+        for (x, y), d in dist_map.items():
             if (x, y) in obstacles:
                 continue
             r = QRect(x * cell_px, y * cell_px, cell_px, cell_px)
@@ -316,7 +295,7 @@ class GridView(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BFS from Start vs BFS from Goal (Grid World Demo)")
+        self.setWindowTitle("Wavefront (BFS) Path Planning Demo (Distances only)")
 
         # world params
         self.rng = random.Random(None)
@@ -329,9 +308,9 @@ class MainWindow(QMainWindow):
         self.select_mode: str | None = None  # None | "start" | "goal"
         self.explored: set[tuple[int, int]] | None = None
         self.path: list[tuple[int, int]] | None = None
-        self.goal_dist: dict[tuple[int, int], int] | None = None
-        self.bfs_dist: dict[tuple[int, int], int] | None = None
-        self.show_goal_numbers = True
+        self.dist_map: dict[tuple[int, int], int] | None = None
+        self.show_numbers = True
+        self.last_mode: str | None = None  # "start" or "goal" (where the wavefront started)
 
         # init world
         self.world = self._generate_solvable_world()
@@ -346,8 +325,8 @@ class MainWindow(QMainWindow):
         btn_generate = QPushButton("Generate world")
         btn_start = QPushButton("Select start")
         btn_goal = QPushButton("Select goal")
-        btn_bfs_start = QPushButton("BFS from start")
-        btn_bfs_goal = QPushButton("BFS from goal")
+        btn_bfs_start = QPushButton("Wavefront @start, path @goal")
+        btn_bfs_goal = QPushButton("Wavefront @goal, path @start")
 
         # Match button colors to the start/goal cell colors.
         btn_start.setStyleSheet(f"QPushButton {{ background-color: {_rgb_to_css_hex(START_CELL_RGB)}; }}")
@@ -356,8 +335,8 @@ class MainWindow(QMainWindow):
         btn_generate.clicked.connect(self.on_generate_world)
         btn_start.clicked.connect(lambda: self.set_select_mode("start"))
         btn_goal.clicked.connect(lambda: self.set_select_mode("goal"))
-        btn_bfs_start.clicked.connect(self.on_run_bfs_from_start)
-        btn_bfs_goal.clicked.connect(self.on_run_bfs_from_goal)
+        btn_bfs_start.clicked.connect(self.on_run_wavefront_from_start_path_from_goal)
+        btn_bfs_goal.clicked.connect(self.on_run_wavefront_from_goal_path_from_start)
 
         # parameter controls (kept small + optional, useful for demos)
         gb = QGroupBox("World parameters")
@@ -431,9 +410,9 @@ class MainWindow(QMainWindow):
             while goal == start:
                 goal = self._random_free_cell(obstacles)
 
-            # ensure solvable
-            path, _, _, _ = bfs_from_start_path_and_explored(self.w, self.h, obstacles, start, goal)
-            if path is None:
+            # ensure solvable (reachability via distance field)
+            dist = wavefront_distance_field(self.w, self.h, obstacles, start, stop_at=goal)
+            if goal not in dist:
                 continue
 
             return World(self.w, self.h, self.p, obstacles, start, goal)
@@ -458,8 +437,8 @@ class MainWindow(QMainWindow):
     def clear_algorithm_overlays(self):
         self.explored = None
         self.path = None
-        self.goal_dist = None
-        self.bfs_dist = None
+        self.dist_map = None
+        self.last_mode = None
 
     def on_apply_params(self):
         self.w = int(self.sb_w.value())
@@ -476,7 +455,7 @@ class MainWindow(QMainWindow):
         self._refresh_view()
         self.status.setText(
             "Generated a new random world.\n"
-            "Use Select start / Select goal, then run BFS from start or BFS from goal."
+            "Use Select start / Select goal, then run one of the two wavefront modes."
         )
 
     def on_cell_clicked(self, x: int, y: int):
@@ -503,52 +482,82 @@ class MainWindow(QMainWindow):
             self.world.goal = (x, y)
             self.clear_algorithm_overlays()
             self._refresh_view()
-            self.status.setText(f"Goal set to {self.world.goal}. Now run BFS from start or BFS from goal.")
+            self.status.setText(f"Goal set to {self.world.goal}. Now run one of the wavefront modes.")
             return
 
 
-    def on_run_bfs_from_start(self):
+    def on_run_wavefront_from_start_path_from_goal(self):
+        """Case (1): Wavefront from START, then reconstruct path starting at GOAL."""
         self.set_select_mode(None)
-        path, _, explored, dist = bfs_from_start_path_and_explored(
-            self.world.w, self.world.h, self.world.obstacles, self.world.start, self.world.goal
+
+        dist = wavefront_distance_field(
+            self.world.w,
+            self.world.h,
+            self.world.obstacles,
+            self.world.start,
+            stop_at=self.world.goal,
         )
-        self.goal_dist = None
-        self.bfs_dist = dist
-        self.explored = explored
+        path = reconstruct_path_to_origin_using_distances(
+            self.world.w,
+            self.world.h,
+            self.world.obstacles,
+            dist,
+            path_start=self.world.goal,
+            origin=self.world.start,
+        )
+
+        self.last_mode = "start"
+        self.dist_map = dist
+        self.explored = set(dist.keys())
         self.path = path
         self._refresh_view()
 
         if path is None:
             self.status.setText(
-                "BFS from start: No path found.\n"
-                "Expands outward from START level-by-level until it reaches the GOAL."
+                "Wavefront @start, path @goal: No path found.\n"
+                "Wavefront expands from START and writes distances; path walks from GOAL to distance −1 neighbors until START."
             )
         else:
             self.status.setText(
-                f"BFS from start: Found a shortest path with length {len(path) - 1}.\n"
-                "Expands outward from START level-by-level, storing parents to reconstruct a shortest path."
+                f"Wavefront @start, path @goal: Found a shortest path with length {len(path) - 1}.\n"
+                "No parents stored: path uses ONLY the distance values in the cells."
             )
 
-    def on_run_bfs_from_goal(self):
+    def on_run_wavefront_from_goal_path_from_start(self):
+        """Case (2): Wavefront from GOAL, then reconstruct path starting at START."""
         self.set_select_mode(None)
-        path, dist, _ = bfs_from_goal_dist_and_path(
-            self.world.w, self.world.h, self.world.obstacles, self.world.start, self.world.goal
+
+        dist = wavefront_distance_field(
+            self.world.w,
+            self.world.h,
+            self.world.obstacles,
+            self.world.goal,
+            stop_at=self.world.start,
         )
-        self.explored = None
-        self.bfs_dist = None
-        self.goal_dist = dist
+        path = reconstruct_path_to_origin_using_distances(
+            self.world.w,
+            self.world.h,
+            self.world.obstacles,
+            dist,
+            path_start=self.world.start,
+            origin=self.world.goal,
+        )
+
+        self.last_mode = "goal"
+        self.dist_map = dist
+        self.explored = set(dist.keys())
         self.path = path
         self._refresh_view()
 
         if path is None:
             self.status.setText(
-                "BFS from goal: No path found (start not reachable).\n"
-                "Expands outward from GOAL (BFS), building a distance-to-goal field."
+                "Wavefront @goal, path @start: No path found (start not reachable).\n"
+                "Wavefront expands from GOAL and writes distances; path walks from START to distance −1 neighbors until GOAL."
             )
         else:
             self.status.setText(
-                f"BFS from goal: Found a shortest path with length {len(path) - 1}.\n"
-                "Expands outward from GOAL (BFS) to compute distances; then reconstructs a shortest path by stepping from START to a neighbor with distance −1 until reaching GOAL."
+                f"Wavefront @goal, path @start: Found a shortest path with length {len(path) - 1}.\n"
+                "No parents stored: path uses ONLY the distance values in the cells."
             )
 
     # --- Rendering ---
@@ -559,16 +568,15 @@ class MainWindow(QMainWindow):
             self.world.obstacles, self.world.start, self.world.goal,
             explored=self.explored,
             path=self.path,
-            goal_dist=self.goal_dist,
-            bfs_dist=self.bfs_dist,
-            show_goal_numbers=self.show_goal_numbers,
+            dist_map=self.dist_map,
+            show_numbers=self.show_numbers,
         )
         self.view.set_image(img)
 
         if initial:
             self.status.setText(
-                "Pick Select start / Select goal, then run BFS from start or BFS from goal.\n"
-                "BFS from start grows from START; BFS from goal grows from GOAL (distance field)."
+                "Pick Select start / Select goal, then run one of the two wavefront modes.\n"
+                "Both modes store ONLY distances; the path is reconstructed by stepping to neighbors with distance −1."
             )
 
 
