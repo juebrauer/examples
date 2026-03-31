@@ -13,11 +13,18 @@ from __future__ import annotations
 import math
 import random
 import sys
+import tempfile
 import time
+import wave
 from dataclasses import dataclass
 from typing import List, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+try:
+    from PySide6 import QtMultimedia
+except Exception:  # pragma: no cover
+    QtMultimedia = None
 
 
 @dataclass
@@ -199,7 +206,190 @@ class LanderWidget(QtWidgets.QWidget):
         self.terrain = Terrain(points=[], width=self.world_w)
         self.landing_pad = LandingPad(0.0, 0.0, 0.0)
         self.lander = self._spawn_lander()
+
+        self._sound_enabled = False
+        self._sound_available = QtMultimedia is not None
+        self._sfx_left = None
+        self._sfx_right = None
+        self._sfx_main = None
+        self._sfx_land_pass = None
+        self._sfx_land_fail = None
+        if self._sound_available:
+            self._init_sounds()
+
         self.reset()
+
+    def set_sound_enabled(self, enabled: bool) -> None:
+        if not self._sound_available:
+            self._sound_enabled = False
+            return
+        self._sound_enabled = bool(enabled)
+        if not self._sound_enabled:
+            self._stop_thruster_sounds()
+
+    def sound_available(self) -> bool:
+        return self._sound_available
+
+    def _sound_dir(self) -> str:
+        d = f"{tempfile.gettempdir()}/pyside6_lunar_lander_sfx"
+        QtCore.QDir().mkpath(d)
+        return d
+
+    def _write_wav(self, path: str, samples: list[int], sample_rate: int = 44100) -> None:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(sample_rate)
+            wf.writeframes(b"".join(int(s).to_bytes(2, "little", signed=True) for s in samples))
+
+    def _gen_tone(self, freq_hz: float, duration_s: float, *, sample_rate: int = 44100, amp: float = 0.35) -> list[int]:
+        n = max(1, int(duration_s * sample_rate))
+        out: list[int] = []
+        for i in range(n):
+            t = i / sample_rate
+            # small fade to avoid clicks
+            fade = 1.0
+            fade_len = int(0.01 * sample_rate)
+            if i < fade_len:
+                fade = i / fade_len
+            elif n - i <= fade_len:
+                fade = (n - i) / fade_len
+            v = math.sin(2.0 * math.pi * freq_hz * t)
+            s = int(clamp(v * amp * fade, -1.0, 1.0) * 32767)
+            out.append(s)
+        return out
+
+    def _gen_bass_thrust_loop(self, duration_s: float, *, sample_rate: int = 44100) -> list[int]:
+        # Main (bottom) thruster: similar to side thruster character (noise + tone),
+        # but bassier and smoother.
+        rng = random.Random(987)
+        n = max(1, int(duration_s * sample_rate))
+        out: list[int] = []
+        lp = 0.0
+        alpha = 0.035
+        for i in range(n):
+            t = i / sample_rate
+            noise = (rng.random() * 2.0 - 1.0)
+            lp = (1.0 - alpha) * lp + alpha * noise
+
+            # Lower fundamentals than side thruster.
+            tone = 0.70 * math.sin(2.0 * math.pi * 78.0 * t) + 0.30 * math.sin(2.0 * math.pi * 117.0 * t)
+            am = 0.72 + 0.28 * math.sin(2.0 * math.pi * 4.0 * t)
+
+            v = (0.60 * lp + 0.40 * tone) * am
+            s = int(clamp(v * 0.38, -1.0, 1.0) * 32767)
+            out.append(s)
+        return out
+
+    def _gen_side_thrust_loop(self, duration_s: float, *, sample_rate: int = 44100) -> list[int]:
+        # Less "beepy" side thruster: airy noise + low mid tone.
+        rng = random.Random(321)
+        n = max(1, int(duration_s * sample_rate))
+        out: list[int] = []
+        # Simple 1-pole lowpass on noise for a softer hiss.
+        lp = 0.0
+        alpha = 0.06
+        for i in range(n):
+            t = i / sample_rate
+            noise = (rng.random() * 2.0 - 1.0)
+            lp = (1.0 - alpha) * lp + alpha * noise
+            tone = 0.6 * math.sin(2.0 * math.pi * 160.0 * t) + 0.4 * math.sin(2.0 * math.pi * 240.0 * t)
+            am = 0.75 + 0.25 * math.sin(2.0 * math.pi * 10.0 * t)
+            v = (0.55 * lp + 0.45 * tone) * am
+            s = int(clamp(v * 0.30, -1.0, 1.0) * 32767)
+            out.append(s)
+        return out
+
+    def _gen_fail_buzz(self, duration_s: float, *, sample_rate: int = 44100) -> list[int]:
+        # Low "bzz" with a bit of noise.
+        rng = random.Random(123)
+        n = max(1, int(duration_s * sample_rate))
+        out: list[int] = []
+        for i in range(n):
+            t = i / sample_rate
+            v = 0.75 * math.sin(2.0 * math.pi * 95.0 * t) + 0.25 * (rng.random() * 2.0 - 1.0)
+            # fade out
+            fade = 1.0 - (i / max(1, n - 1))
+            s = int(clamp(v * 0.45 * fade, -1.0, 1.0) * 32767)
+            out.append(s)
+        return out
+
+    def _ensure_sound_files(self) -> dict[str, str]:
+        d = self._sound_dir()
+        files = {
+            "thruster_side": f"{d}/thruster_side.wav",
+            "thruster_main": f"{d}/thruster_main.wav",
+            "land_pass": f"{d}/land_pass.wav",
+            "land_fail": f"{d}/land_fail.wav",
+        }
+
+        # Always regenerate this file so code tweaks immediately change the sound.
+        self._write_wav(files["thruster_side"], self._gen_side_thrust_loop(0.12))
+        # Always regenerate this file so code tweaks immediately change the sound.
+        # Slightly longer loop than side thruster.
+        self._write_wav(files["thruster_main"], self._gen_bass_thrust_loop(0.18))
+        if not QtCore.QFileInfo(files["land_pass"]).exists():
+            # short "success" chirp: two quick tones
+            s1 = self._gen_tone(523.25, 0.10, amp=0.35)
+            s2 = self._gen_tone(659.25, 0.14, amp=0.35)
+            self._write_wav(files["land_pass"], s1 + s2)
+        if not QtCore.QFileInfo(files["land_fail"]).exists():
+            self._write_wav(files["land_fail"], self._gen_fail_buzz(0.35))
+
+        return files
+
+    def _mk_sfx(self, file_path: str, *, volume: float) -> object:
+        sfx = QtMultimedia.QSoundEffect(self)
+        sfx.setSource(QtCore.QUrl.fromLocalFile(file_path))
+        # Keep loopCount at 1.
+        # Some Linux multimedia backends log noisy warnings when using infinite loop
+        # (seek() on sequential device). We instead retrigger one-shots while a key is held.
+        sfx.setLoopCount(1)
+        sfx.setVolume(clamp(volume, 0.0, 1.0))
+        return sfx
+
+    def _init_sounds(self) -> None:
+        files = self._ensure_sound_files()
+        # Separate effects for left/right so both can play.
+        self._sfx_left = self._mk_sfx(files["thruster_side"], volume=0.35)
+        self._sfx_right = self._mk_sfx(files["thruster_side"], volume=0.35)
+        self._sfx_main = self._mk_sfx(files["thruster_main"], volume=0.55)
+        self._sfx_land_pass = self._mk_sfx(files["land_pass"], volume=0.65)
+        self._sfx_land_fail = self._mk_sfx(files["land_fail"], volume=0.70)
+
+    def _stop_thruster_sounds(self) -> None:
+        for sfx in [self._sfx_left, self._sfx_right, self._sfx_main]:
+            if sfx is not None:
+                sfx.stop()
+
+    def _update_thruster_sounds(self) -> None:
+        if not self._sound_enabled or self._frozen:
+            self._stop_thruster_sounds()
+            return
+
+        def want(sfx: object | None, play: bool) -> None:
+            if sfx is None:
+                return
+            if play:
+                # Retrigger one-shots while the key is held.
+                if not sfx.isPlaying():
+                    sfx.play()
+            else:
+                if sfx.isPlaying():
+                    sfx.stop()
+
+        want(self._sfx_left, self.key_left)
+        want(self._sfx_right, self.key_right)
+        want(self._sfx_main, self.key_up)
+
+    def _play_landing_sound(self, success: bool) -> None:
+        if not self._sound_enabled:
+            return
+        self._stop_thruster_sounds()
+        sfx = self._sfx_land_pass if success else self._sfx_land_fail
+        if sfx is not None:
+            sfx.stop()
+            sfx.play()
 
     def reset(self) -> None:
         rng = random.Random()
@@ -233,6 +423,7 @@ class LanderWidget(QtWidgets.QWidget):
         self.status_text = None
         self._frozen = False
         self.last_contact = None
+        self._stop_thruster_sounds()
         self.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _spawn_lander(self) -> Lander:
@@ -270,6 +461,8 @@ class LanderWidget(QtWidgets.QWidget):
         else:
             super().keyPressEvent(event)
 
+        self._update_thruster_sounds()
+
     def keyReleaseEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
@@ -283,6 +476,8 @@ class LanderWidget(QtWidgets.QWidget):
         else:
             super().keyReleaseEvent(event)
 
+        self._update_thruster_sounds()
+
     def _tick(self) -> None:
         now = time.perf_counter()
         dt = now - self._t_last
@@ -293,6 +488,9 @@ class LanderWidget(QtWidgets.QWidget):
 
         if not self._frozen:
             self._step_physics(dt)
+
+        # Keep audio state in sync even if keys are held.
+        self._update_thruster_sounds()
 
         self._emit_telemetry()
 
@@ -458,6 +656,7 @@ class LanderWidget(QtWidgets.QWidget):
             lander.angle = 0.0
             self.status_text = "LANDED"
             self._frozen = True
+            self._play_landing_sound(True)
 
             # After snapping angle, resolve any remaining penetration.
             points2 = self._contact_points_world()
@@ -470,6 +669,7 @@ class LanderWidget(QtWidgets.QWidget):
             lander.ang_vel = 0.0
             self.status_text = "CRASHED"
             self._frozen = True
+            self._play_landing_sound(False)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         _ = event
@@ -551,11 +751,11 @@ class LanderWidget(QtWidgets.QWidget):
         painter.rotate(-math.degrees(lander.angle))
 
         body = QtCore.QRectF(-14, -10, 28, 20)
-        painter.setPen(QtGui.QPen(QtGui.QColor(200, 200, 210), 2))
-        painter.setBrush(QtGui.QColor(120, 120, 140))
+        painter.setPen(QtGui.QPen(QtGui.QColor(235, 245, 255), 2))
+        painter.setBrush(QtGui.QColor(80, 140, 210))
         painter.drawRoundedRect(body, 4, 4)
 
-        painter.setPen(QtGui.QPen(QtGui.QColor(180, 180, 190), 2))
+        painter.setPen(QtGui.QPen(QtGui.QColor(225, 235, 245), 2))
         painter.drawLine(QtCore.QPointF(-12, 10), QtCore.QPointF(-20, 18))
         painter.drawLine(QtCore.QPointF(12, 10), QtCore.QPointF(20, 18))
 
@@ -624,6 +824,16 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(QtWidgets.QLabel("Arrow Right: right thruster"))
         v.addWidget(QtWidgets.QLabel("Arrow Up: bottom thruster"))
         v.addSpacing(6)
+
+        self.chk_sound = QtWidgets.QCheckBox("Sound")
+        if not self.sim.sound_available():
+            self.chk_sound.setEnabled(False)
+            self.chk_sound.setToolTip("QtMultimedia not available in this environment")
+        self.chk_sound.toggled.connect(self.sim.set_sound_enabled)
+        v.addWidget(self.chk_sound)
+        if self.sim.sound_available():
+            # Sound on by default.
+            self.chk_sound.setChecked(True)
 
         self.restart_btn = QtWidgets.QPushButton("Restart")
         self.restart_btn.clicked.connect(self._on_restart)
