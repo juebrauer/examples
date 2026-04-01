@@ -17,7 +17,7 @@ import tempfile
 import time
 import wave
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Protocol, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -155,22 +155,125 @@ class Lander:
     inertia: float = 1.0
 
 
-class LanderWidget(QtWidgets.QWidget):
-    telemetryUpdated = QtCore.Signal(dict)
+# -----------------------------
+# RL-friendly API (Env + Agent)
+# -----------------------------
+#
+# We keep the simulation deterministic and independent from rendering.
+# A GUI widget can run a standard RL loop:
+#   obs = env.reset()
+#   while True:
+#       action = agent.take_action(obs, info)
+#       obs, reward, terminated, info = env.step(action, dt)
+#       if terminated: break
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(900, 520)
+ACTION_MAIN = 1 << 0
+ACTION_LEFT = 1 << 1
+ACTION_RIGHT = 1 << 2
+ACTION_SPACE_N = 8  # 3-bit action mask => 0..7
 
-        self._t_last = time.perf_counter()
-        self._timer = QtCore.QTimer(self)
-        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(int(1000 / 60))
 
-        self.world_w = 900.0
-        self.world_h = 520.0
+def _action_to_burns(action: int) -> tuple[float, float, float]:
+    a = int(action) & 0b111
+    burn_main = 1.0 if (a & ACTION_MAIN) else 0.0
+    burn_left = 1.0 if (a & ACTION_LEFT) else 0.0
+    burn_right = 1.0 if (a & ACTION_RIGHT) else 0.0
+    return burn_main, burn_left, burn_right
+
+
+Observation = tuple[float, ...]
+
+
+class Agent(Protocol):
+    def reset(self) -> None: ...
+
+    def take_action(self, observation: Observation, info: dict) -> int: ...
+
+
+class HumanKeyboardAgent:
+    """Keyboard-controlled agent.
+
+    This makes the current "arrow keys" control a special case of the agent interface.
+    """
+
+    def __init__(self) -> None:
+        self._left = False
+        self._right = False
+        self._main = False
+
+    def reset(self) -> None:
+        self._left = False
+        self._right = False
+        self._main = False
+
+    def handle_key_press(self, key: int) -> None:
+        if key == QtCore.Qt.Key.Key_Left:
+            self._left = True
+        elif key == QtCore.Qt.Key.Key_Right:
+            self._right = True
+        elif key == QtCore.Qt.Key.Key_Up:
+            self._main = True
+
+    def handle_key_release(self, key: int) -> None:
+        if key == QtCore.Qt.Key.Key_Left:
+            self._left = False
+        elif key == QtCore.Qt.Key.Key_Right:
+            self._right = False
+        elif key == QtCore.Qt.Key.Key_Up:
+            self._main = False
+
+    def take_action(self, observation: Observation, info: dict) -> int:
+        _ = observation, info
+        action = 0
+        if self._main:
+            action |= ACTION_MAIN
+        if self._left:
+            action |= ACTION_LEFT
+        if self._right:
+            action |= ACTION_RIGHT
+        return action
+
+
+class RandomAgent:
+    """Tiny example RL agent: samples uniformly from the discrete action space."""
+
+    def __init__(self, *, seed: int | None = None) -> None:
+        self._rng = random.Random(seed)
+
+    def reset(self) -> None:
+        return
+
+    def take_action(self, observation: Observation, info: dict) -> int:
+        _ = observation, info
+        return self._rng.randrange(ACTION_SPACE_N)
+
+
+class LunarLanderEnv:
+    """Minimal lunar lander environment.
+
+    - `action` is a 3-bit mask: MAIN/LEFT/RIGHT (0..7)
+    - `observation` is a flat tuple of floats (see `state_names`)
+
+    This is intentionally small and Gym-like (reset/step) so adding a Q-learning
+    agent later is straightforward.
+    """
+
+    action_space_n: int = ACTION_SPACE_N
+    state_names: tuple[str, ...] = (
+        "pos_x",
+        "pos_y",
+        "vel_x",
+        "vel_y",
+        "angle_rad",
+        "ang_vel",
+        "altitude",
+        "pad_center_dx",
+        "in_landing_pad",
+    )
+
+    def __init__(self, *, world_w: float = 900.0, world_h: float = 520.0) -> None:
+        self.world_w = float(world_w)
+        self.world_h = float(world_h)
 
         # Global slow-motion factor for easier manual control.
         # 1.0 = real-time, 0.5 = half-speed.
@@ -189,16 +292,6 @@ class LanderWidget(QtWidgets.QWidget):
         self.max_main_burn = 1.0
         self.max_side_burn = 1.0
 
-        self.key_left = False
-        self.key_right = False
-        self.key_up = False
-
-        self.status_text: str | None = None
-        self._frozen = False
-
-        # Filled on first ground contact (either landing or crash).
-        self.last_contact: dict | None = None
-
         self.success_max_abs_vy = 60.0
         self.success_max_abs_vx = 60.0
         self.success_max_abs_angle = math.radians(15.0)
@@ -206,6 +299,326 @@ class LanderWidget(QtWidgets.QWidget):
         self.terrain = Terrain(points=[], width=self.world_w)
         self.landing_pad = LandingPad(0.0, 0.0, 0.0)
         self.lander = self._spawn_lander()
+
+        self.status_text: str | None = None
+        self.frozen = False
+        self.last_contact: dict | None = None
+
+        self.last_action: int = 0
+        self._just_terminated_success: bool | None = None
+
+        self.reset()
+
+    def reset(self, *, seed: int | None = None) -> Observation:
+        rng = random.Random(seed)
+        if seed is None:
+            seed = rng.randrange(0, 10_000_000)
+            rng = random.Random(seed)
+
+        self.terrain = Terrain.generate(
+            width=self.world_w,
+            base_y=95.0,
+            amplitude=50.0,
+            step=18.0,
+            seed=seed,
+        )
+
+        pad_width = 140.0
+        pad_margin = 40.0
+        pad_x0 = rng.uniform(pad_margin, self.world_w - pad_margin - pad_width)
+        pad_x1 = pad_x0 + pad_width
+
+        pad_y = self.terrain.height_at(0.5 * (pad_x0 + pad_x1))
+
+        flattened: List[Tuple[float, float]] = []
+        for x, y in self.terrain.points:
+            if pad_x0 <= x <= pad_x1:
+                flattened.append((x, pad_y))
+            else:
+                flattened.append((x, y))
+        self.terrain = Terrain(points=flattened, width=self.world_w)
+        self.landing_pad = LandingPad(x0=pad_x0, x1=pad_x1, y=pad_y)
+
+        self.lander = self._spawn_lander()
+        self.status_text = None
+        self.frozen = False
+        self.last_contact = None
+        self.last_action = 0
+        self._just_terminated_success = None
+
+        return self.observation()
+
+    def observation(self) -> Observation:
+        lander = self.lander
+        ground = self.terrain.height_at(lander.pos.x)
+        altitude = max(0.0, lander.pos.y - (ground + lander.radius))
+        ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+        pad_center_dx = lander.pos.x - self.landing_pad.cx
+        in_pad = 1.0 if (self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1) else 0.0
+        return (
+            lander.pos.x,
+            lander.pos.y,
+            lander.vel.x,
+            lander.vel.y,
+            ang,
+            lander.ang_vel,
+            altitude,
+            pad_center_dx,
+            in_pad,
+        )
+
+    def info(self) -> dict:
+        lander = self.lander
+        ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+        ground = self.terrain.height_at(lander.pos.x)
+        altitude = max(0.0, lander.pos.y - (ground + lander.radius))
+        in_pad = self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1
+        payload = {
+            "pos_x": lander.pos.x,
+            "pos_y": lander.pos.y,
+            "vel_x": lander.vel.x,
+            "vel_y": lander.vel.y,
+            "angle_rad": ang,
+            "angle_deg": math.degrees(ang),
+            "ang_vel": lander.ang_vel,
+            "altitude": altitude,
+            "status": self.status_text or "FLYING",
+            "in_landing_pad": in_pad,
+            "action": int(self.last_action) & 0b111,
+            "terminated": bool(self.frozen),
+        }
+        if self.last_contact is not None:
+            payload["last_contact"] = self.last_contact
+        if self._just_terminated_success is not None:
+            payload["terminal_success"] = bool(self._just_terminated_success)
+        return payload
+
+    def step(self, action: int, dt: float) -> tuple[Observation, float, bool, dict]:
+        self._just_terminated_success = None
+        self.last_action = int(action) & 0b111
+
+        if self.frozen:
+            obs = self.observation()
+            info = self.info()
+            return obs, 0.0, True, info
+
+        dt = clamp(float(dt), 0.0, 1.0 / 20.0)
+        dt *= self.time_scale
+
+        was_frozen = self.frozen
+        self._step_physics(dt, self.last_action)
+
+        terminated = bool(self.frozen)
+
+        reward = 0.0
+        terminal_success: bool | None = None
+        # Minimal reward shaping: only terminal events.
+        if (not was_frozen) and terminated:
+            if self.status_text == "LANDED":
+                reward = 1.0
+                terminal_success = True
+            else:
+                reward = -1.0
+                terminal_success = False
+            self._just_terminated_success = terminal_success
+
+        obs = self.observation()
+        info = self.info()
+        if terminal_success is not None:
+            info["terminal_success"] = terminal_success
+
+        return obs, reward, terminated, info
+
+    def _spawn_lander(self) -> Lander:
+        return Lander(
+            pos=Vec2(self.world_w * 0.25, self.world_h * 0.78),
+            vel=Vec2(0.0, 0.0),
+            angle=0.25,
+            ang_vel=0.0,
+            radius=14.0,
+            mass=1.0,
+            inertia=0.9,
+        )
+
+    def _step_physics(self, dt: float, action: int) -> None:
+        lander = self.lander
+
+        force = Vec2(self.gravity.x * lander.mass, self.gravity.y * lander.mass)
+        torque = 0.0
+
+        burn_main, burn_left, burn_right = _action_to_burns(action)
+        burn_main = self.max_main_burn * burn_main
+        burn_left = self.max_side_burn * burn_left
+        burn_right = self.max_side_burn * burn_right
+
+        c = math.cos(lander.angle)
+        s = math.sin(lander.angle)
+        up_dir = Vec2(-s, c)
+        right_dir = Vec2(c, s)
+
+        if burn_main > 0.0:
+            force += up_dir * (self.main_thrust * burn_main)
+
+        if burn_left > 0.0:
+            force += right_dir * (self.side_thrust * burn_left)
+            torque -= self.side_torque * burn_left
+
+        if burn_right > 0.0:
+            force -= right_dir * (self.side_thrust * burn_right)
+            torque += self.side_torque * burn_right
+
+        acc = force / lander.mass
+        ang_acc = torque / lander.inertia
+
+        lander.vel += acc * dt
+        lander.ang_vel += ang_acc * dt
+
+        lander.ang_vel *= math.exp(-self.angular_damping * dt)
+        lander.ang_vel = clamp(lander.ang_vel, -self.max_ang_vel, self.max_ang_vel)
+
+        lander.pos += lander.vel * dt
+        lander.angle += lander.ang_vel * dt
+
+        if lander.pos.x < lander.radius:
+            lander.pos.x = lander.radius
+            lander.vel.x = -0.3 * lander.vel.x
+        elif lander.pos.x > self.world_w - lander.radius:
+            lander.pos.x = self.world_w - lander.radius
+            lander.vel.x = -0.3 * lander.vel.x
+
+        if lander.pos.y > self.world_h - lander.radius:
+            lander.pos.y = self.world_h - lander.radius
+            lander.vel.y = -0.2 * lander.vel.y
+
+        self._handle_ground_contact()
+
+    def _lander_local_point_to_world(self, lx: float, ly_down: float) -> Vec2:
+        """Convert a point from lander-local drawing coords to world coords.
+
+        Local coords:
+        - +x is to the right
+        - +y is down (as used in QPainter drawing)
+
+        World coords:
+        - +x is to the right
+        - +y is up
+        """
+        lander = self.lander
+        c = math.cos(lander.angle)
+        s = math.sin(lander.angle)
+        # offset = right_dir*lx + up_dir*(-ly_down)
+        ox = c * lx + s * ly_down
+        oy = s * lx - c * ly_down
+        return Vec2(lander.pos.x + ox, lander.pos.y + oy)
+
+    def _ground_penetration_for_point(self, p: Vec2) -> float:
+        ground_y = self.terrain.height_at(p.x)
+        return ground_y - p.y
+
+    def _contact_points_world(self) -> list[Vec2]:
+        # Use leg "feet" (line endpoints) and a body-bottom point.
+        # These match the points used in the GUI renderer.
+        return [
+            self._lander_local_point_to_world(-20.0, 18.0),
+            self._lander_local_point_to_world(20.0, 18.0),
+            self._lander_local_point_to_world(0.0, 10.0),
+        ]
+
+    def _handle_ground_contact(self) -> None:
+        lander = self.lander
+        points = self._contact_points_world()
+        penetrations = [self._ground_penetration_for_point(p) for p in points]
+        max_pen = max(penetrations) if penetrations else 0.0
+
+        if max_pen <= 0.0:
+            return
+
+        vx = lander.vel.x
+        vy = lander.vel.y
+        speed_x = abs(vx)
+        speed_y = abs(vy)
+        ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+        angle_ok = abs(ang) < self.success_max_abs_angle
+
+        in_pad = self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1
+        vy_ok = speed_y <= self.success_max_abs_vy
+        vx_ok = speed_x <= self.success_max_abs_vx
+        soft = vy_ok and vx_ok and angle_ok and in_pad
+
+        angle_deg = math.degrees(ang)
+        max_angle_deg = math.degrees(self.success_max_abs_angle)
+
+        def pf(ok: bool) -> str:
+            return "PASS" if ok else "FAIL"
+
+        checks = [
+            f"on landing pad: {pf(in_pad)}",
+            f"|vy| <= {self.success_max_abs_vy:.1f}: {pf(vy_ok)}   (|vy|={speed_y:.1f})",
+            f"|vx| <= {self.success_max_abs_vx:.1f}: {pf(vx_ok)}   (|vx|={speed_x:.1f})",
+            f"|angle| <= {max_angle_deg:.1f}°: {pf(angle_ok)}   (|angle|={abs(angle_deg):.1f}°)",
+        ]
+
+        self.last_contact = {
+            "impact_vx": vx,
+            "impact_vy": vy,
+            "impact_speed_x": speed_x,
+            "impact_speed_y": speed_y,
+            "impact_angle_deg": angle_deg,
+            "impact_in_pad": in_pad,
+            "success": soft,
+            "checks": checks,
+        }
+
+        # Resolve penetration by shifting the lander up in world space.
+        lander.pos.y = lander.pos.y + max_pen
+
+        if soft:
+            lander.vel = Vec2(0.0, 0.0)
+            lander.ang_vel = 0.0
+            lander.angle = 0.0
+            self.status_text = "LANDED"
+            self.frozen = True
+
+            # After snapping angle, resolve any remaining penetration.
+            points2 = self._contact_points_world()
+            pens2 = [self._ground_penetration_for_point(p) for p in points2]
+            max_pen2 = max(pens2) if pens2 else 0.0
+            if max_pen2 > 0.0:
+                lander.pos.y = lander.pos.y + max_pen2
+        else:
+            lander.vel = Vec2(0.0, 0.0)
+            lander.ang_vel = 0.0
+            self.status_text = "CRASHED"
+            self.frozen = True
+
+
+class LanderWidget(QtWidgets.QWidget):
+    telemetryUpdated = QtCore.Signal(dict)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setMinimumSize(900, 520)
+
+        self.env = LunarLanderEnv(world_w=900.0, world_h=520.0)
+        self.agent: Agent = HumanKeyboardAgent()
+
+        # When rendering is disabled, we fast-forward the simulation by stepping
+        # multiple times per UI tick.
+        self.rendering_enabled = True
+        self.fast_forward_steps_per_tick = 250
+
+        self._t_last = time.perf_counter()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(int(1000 / 60))
+
+        self.key_left = False
+        self.key_right = False
+        self.key_up = False
+
+        self.status_text: str | None = None
 
         self._sound_enabled = False
         self._sound_available = QtMultimedia is not None
@@ -218,6 +631,12 @@ class LanderWidget(QtWidgets.QWidget):
             self._init_sounds()
 
         self.reset()
+
+    def set_rendering_enabled(self, enabled: bool) -> None:
+        self.rendering_enabled = bool(enabled)
+        if not self.rendering_enabled:
+            # Avoid wasting cycles on sound when fast-forwarding.
+            self._stop_thruster_sounds()
 
     def set_sound_enabled(self, enabled: bool) -> None:
         if not self._sound_available:
@@ -363,7 +782,7 @@ class LanderWidget(QtWidgets.QWidget):
                 sfx.stop()
 
     def _update_thruster_sounds(self) -> None:
-        if not self._sound_enabled or self._frozen:
+        if not self._sound_enabled or self.env.frozen:
             self._stop_thruster_sounds()
             return
 
@@ -392,50 +811,14 @@ class LanderWidget(QtWidgets.QWidget):
             sfx.play()
 
     def reset(self) -> None:
-        rng = random.Random()
-        seed = rng.randrange(0, 10_000_000)
-
-        self.terrain = Terrain.generate(
-            width=self.world_w,
-            base_y=95.0,
-            amplitude=50.0,
-            step=18.0,
-            seed=seed,
-        )
-
-        pad_width = 140.0
-        pad_margin = 40.0
-        pad_x0 = rng.uniform(pad_margin, self.world_w - pad_margin - pad_width)
-        pad_x1 = pad_x0 + pad_width
-
-        pad_y = self.terrain.height_at(0.5 * (pad_x0 + pad_x1))
-
-        flattened: List[Tuple[float, float]] = []
-        for x, y in self.terrain.points:
-            if pad_x0 <= x <= pad_x1:
-                flattened.append((x, pad_y))
-            else:
-                flattened.append((x, y))
-        self.terrain = Terrain(points=flattened, width=self.world_w)
-        self.landing_pad = LandingPad(x0=pad_x0, x1=pad_x1, y=pad_y)
-
-        self.lander = self._spawn_lander()
+        self.env.reset()
+        self.agent.reset()
         self.status_text = None
-        self._frozen = False
-        self.last_contact = None
         self._stop_thruster_sounds()
+        self.key_left = False
+        self.key_right = False
+        self.key_up = False
         self.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
-
-    def _spawn_lander(self) -> Lander:
-        return Lander(
-            pos=Vec2(self.world_w * 0.25, self.world_h * 0.78),
-            vel=Vec2(0.0, 0.0),
-            angle=0.25,
-            ang_vel=0.0,
-            radius=14.0,
-            mass=1.0,
-            inertia=0.9,
-        )
 
     def _world_to_screen(self, p: Vec2) -> QtCore.QPointF:
         return QtCore.QPointF(p.x, self.height() - p.y)
@@ -450,226 +833,75 @@ class LanderWidget(QtWidgets.QWidget):
         if event.isAutoRepeat():
             return
         k = event.key()
-        if k == QtCore.Qt.Key.Key_Left:
-            self.key_left = True
-        elif k == QtCore.Qt.Key.Key_Right:
-            self.key_right = True
-        elif k == QtCore.Qt.Key.Key_Up:
-            self.key_up = True
-        elif k == QtCore.Qt.Key.Key_Escape:
+        if k == QtCore.Qt.Key.Key_Escape:
             QtWidgets.QApplication.quit()
         else:
+            # Forward to the active agent if it supports keyboard control.
+            if hasattr(self.agent, "handle_key_press"):
+                try:
+                    getattr(self.agent, "handle_key_press")(k)
+                except Exception:
+                    pass
             super().keyPressEvent(event)
-
-        self._update_thruster_sounds()
 
     def keyReleaseEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.isAutoRepeat():
             return
         k = event.key()
-        if k == QtCore.Qt.Key.Key_Left:
-            self.key_left = False
-        elif k == QtCore.Qt.Key.Key_Right:
-            self.key_right = False
-        elif k == QtCore.Qt.Key.Key_Up:
-            self.key_up = False
-        else:
-            super().keyReleaseEvent(event)
-
-        self._update_thruster_sounds()
+        if hasattr(self.agent, "handle_key_release"):
+            try:
+                getattr(self.agent, "handle_key_release")(k)
+            except Exception:
+                pass
+        super().keyReleaseEvent(event)
 
     def _tick(self) -> None:
         now = time.perf_counter()
         dt = now - self._t_last
         self._t_last = now
 
-        dt = clamp(dt, 0.0, 1.0 / 20.0)
-        dt *= self.time_scale
+        # Rendered mode: use wall-clock dt. Headless mode: fixed dt and many steps.
+        if self.rendering_enabled:
+            steps = 1
+            dt_step = dt
+        else:
+            steps = self.fast_forward_steps_per_tick
+            dt_step = 1.0 / 60.0
 
-        if not self._frozen:
-            self._step_physics(dt)
+        info_last: dict | None = None
+        terminated = False
+        for _i in range(steps):
+            obs = self.env.observation()
+            action = int(self.agent.take_action(obs, self.env.info()))
+            # Update GUI-visible thruster state from the agent action.
+            self.key_up = bool(action & ACTION_MAIN)
+            self.key_left = bool(action & ACTION_LEFT)
+            self.key_right = bool(action & ACTION_RIGHT)
+
+            _obs2, _reward, terminated, info_last = self.env.step(action, dt_step)
+            self.status_text = self.env.status_text
+            if terminated:
+                break
 
         # Keep audio state in sync even if keys are held.
-        self._update_thruster_sounds()
-
-        self._emit_telemetry()
-
-        self.update()
-
-    def _emit_telemetry(self) -> None:
-        lander = self.lander
-        ground = self.terrain.height_at(lander.pos.x)
-        altitude = max(0.0, lander.pos.y - (ground + lander.radius))
-        ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
-        in_pad = self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1
-        payload = {
-            "pos_x": lander.pos.x,
-            "pos_y": lander.pos.y,
-            "vel_x": lander.vel.x,
-            "vel_y": lander.vel.y,
-            "angle_rad": ang,
-            "angle_deg": math.degrees(ang),
-            "ang_vel": lander.ang_vel,
-            "altitude": altitude,
-            "status": self.status_text or "FLYING",
-            "in_landing_pad": in_pad,
-        }
-
-        if self.last_contact is not None:
-            payload["last_contact"] = self.last_contact
-        self.telemetryUpdated.emit(payload)
-
-    def _step_physics(self, dt: float) -> None:
-        lander = self.lander
-
-        force = Vec2(self.gravity.x * lander.mass, self.gravity.y * lander.mass)
-        torque = 0.0
-
-        burn_main = self.max_main_burn if self.key_up else 0.0
-        burn_left = self.max_side_burn if self.key_left else 0.0
-        burn_right = self.max_side_burn if self.key_right else 0.0
-
-        c = math.cos(lander.angle)
-        s = math.sin(lander.angle)
-        up_dir = Vec2(-s, c)
-        right_dir = Vec2(c, s)
-
-        if burn_main > 0.0:
-            force += up_dir * (self.main_thrust * burn_main)
-
-        if burn_left > 0.0:
-            force += right_dir * (self.side_thrust * burn_left)
-            torque -= self.side_torque * burn_left
-
-        if burn_right > 0.0:
-            force -= right_dir * (self.side_thrust * burn_right)
-            torque += self.side_torque * burn_right
-
-        acc = force / lander.mass
-        ang_acc = torque / lander.inertia
-
-        lander.vel += acc * dt
-        lander.ang_vel += ang_acc * dt
-
-        lander.ang_vel *= math.exp(-self.angular_damping * dt)
-        lander.ang_vel = clamp(lander.ang_vel, -self.max_ang_vel, self.max_ang_vel)
-
-        lander.pos += lander.vel * dt
-        lander.angle += lander.ang_vel * dt
-
-        if lander.pos.x < lander.radius:
-            lander.pos.x = lander.radius
-            lander.vel.x = -0.3 * lander.vel.x
-        elif lander.pos.x > self.world_w - lander.radius:
-            lander.pos.x = self.world_w - lander.radius
-            lander.vel.x = -0.3 * lander.vel.x
-
-        if lander.pos.y > self.world_h - lander.radius:
-            lander.pos.y = self.world_h - lander.radius
-            lander.vel.y = -0.2 * lander.vel.y
-
-        self._handle_ground_contact()
-
-    def _lander_local_point_to_world(self, lx: float, ly_down: float) -> Vec2:
-        """Convert a point from lander-local drawing coords to world coords.
-
-        Local coords:
-        - +x is to the right
-        - +y is down (as used in QPainter drawing)
-
-        World coords:
-        - +x is to the right
-        - +y is up
-        """
-        lander = self.lander
-        c = math.cos(lander.angle)
-        s = math.sin(lander.angle)
-        # offset = right_dir*lx + up_dir*(-ly_down)
-        ox = c * lx + s * ly_down
-        oy = s * lx - c * ly_down
-        return Vec2(lander.pos.x + ox, lander.pos.y + oy)
-
-    def _ground_penetration_for_point(self, p: Vec2) -> float:
-        ground_y = self.terrain.height_at(p.x)
-        return ground_y - p.y
-
-    def _contact_points_world(self) -> list[Vec2]:
-        # Use leg "feet" (line endpoints) and a body-bottom point.
-        # These match the points used in _draw_lander().
-        return [
-            self._lander_local_point_to_world(-20.0, 18.0),
-            self._lander_local_point_to_world(20.0, 18.0),
-            self._lander_local_point_to_world(0.0, 10.0),
-        ]
-
-    def _handle_ground_contact(self) -> None:
-        lander = self.lander
-        points = self._contact_points_world()
-        penetrations = [self._ground_penetration_for_point(p) for p in points]
-        max_pen = max(penetrations) if penetrations else 0.0
-
-        if max_pen <= 0.0:
-            return
-
-        vx = lander.vel.x
-        vy = lander.vel.y
-        speed_x = abs(vx)
-        speed_y = abs(vy)
-        ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
-        angle_ok = abs(ang) < self.success_max_abs_angle
-
-        in_pad = self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1
-        vy_ok = speed_y <= self.success_max_abs_vy
-        vx_ok = speed_x <= self.success_max_abs_vx
-        soft = vy_ok and vx_ok and angle_ok and in_pad
-
-        angle_deg = math.degrees(ang)
-        max_angle_deg = math.degrees(self.success_max_abs_angle)
-
-        def pf(ok: bool) -> str:
-            return "PASS" if ok else "FAIL"
-
-        checks = [
-            f"on landing pad: {pf(in_pad)}",
-            f"|vy| <= {self.success_max_abs_vy:.1f}: {pf(vy_ok)}   (|vy|={speed_y:.1f})",
-            f"|vx| <= {self.success_max_abs_vx:.1f}: {pf(vx_ok)}   (|vx|={speed_x:.1f})",
-            f"|angle| <= {max_angle_deg:.1f}°: {pf(angle_ok)}   (|angle|={abs(angle_deg):.1f}°)",
-        ]
-
-        self.last_contact = {
-            "impact_vx": vx,
-            "impact_vy": vy,
-            "impact_speed_x": speed_x,
-            "impact_speed_y": speed_y,
-            "impact_angle_deg": angle_deg,
-            "impact_in_pad": in_pad,
-            "success": soft,
-            "checks": checks,
-        }
-
-        # Resolve penetration by shifting the lander up in world space.
-        lander.pos.y = lander.pos.y + max_pen
-
-        if soft:
-            lander.vel = Vec2(0.0, 0.0)
-            lander.ang_vel = 0.0
-            lander.angle = 0.0
-            self.status_text = "LANDED"
-            self._frozen = True
-            self._play_landing_sound(True)
-
-            # After snapping angle, resolve any remaining penetration.
-            points2 = self._contact_points_world()
-            pens2 = [self._ground_penetration_for_point(p) for p in points2]
-            max_pen2 = max(pens2) if pens2 else 0.0
-            if max_pen2 > 0.0:
-                lander.pos.y = lander.pos.y + max_pen2
+        if self.rendering_enabled:
+            self._update_thruster_sounds()
         else:
-            lander.vel = Vec2(0.0, 0.0)
-            lander.ang_vel = 0.0
-            self.status_text = "CRASHED"
-            self._frozen = True
+            self._stop_thruster_sounds()
+
+        if info_last is None:
+            info_last = self.env.info()
+
+        # Play landing/collision sound on the transition to terminal state.
+        if info_last.get("terminal_success") is True:
+            self._play_landing_sound(True)
+        elif info_last.get("terminal_success") is False:
             self._play_landing_sound(False)
+
+        self.telemetryUpdated.emit(info_last)
+
+        if self.rendering_enabled:
+            self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         _ = event
@@ -698,13 +930,13 @@ class LanderWidget(QtWidgets.QWidget):
         painter.save()
         path = QtGui.QPainterPath()
 
-        x0, y0 = self.terrain.points[0]
+        x0, y0 = self.env.terrain.points[0]
         p0 = self._world_to_screen(Vec2(x0, y0))
         path.moveTo(p0)
-        for x, y in self.terrain.points[1:]:
+        for x, y in self.env.terrain.points[1:]:
             path.lineTo(self._world_to_screen(Vec2(x, y)))
 
-        path.lineTo(self._world_to_screen(Vec2(self.world_w, 0.0)))
+        path.lineTo(self._world_to_screen(Vec2(self.env.world_w, 0.0)))
         path.lineTo(self._world_to_screen(Vec2(0.0, 0.0)))
         path.closeSubpath()
 
@@ -712,7 +944,7 @@ class LanderWidget(QtWidgets.QWidget):
         painter.setBrush(QtGui.QColor(135, 135, 150))
         painter.drawPath(path)
 
-        pad = self.landing_pad
+        pad = self.env.landing_pad
         pad_screen_y = self.height() - pad.y
         painter.setPen(QtGui.QPen(QtGui.QColor(240, 220, 60), 3))
         painter.drawLine(QtCore.QPointF(pad.x0, pad_screen_y), QtCore.QPointF(pad.x1, pad_screen_y))
@@ -743,7 +975,7 @@ class LanderWidget(QtWidgets.QWidget):
         painter.restore()
 
     def _draw_lander(self, painter: QtGui.QPainter) -> None:
-        lander = self.lander
+        lander = self.env.lander
         center = self._world_to_screen(lander.pos)
 
         painter.save()
@@ -762,7 +994,7 @@ class LanderWidget(QtWidgets.QWidget):
         painter.setBrush(QtGui.QColor(255, 160, 60))
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
 
-        if self.key_up and not self._frozen:
+        if self.key_up and not self.env.frozen:
             flame = QtGui.QPolygonF(
                 [
                     QtCore.QPointF(-5, 11),
@@ -772,7 +1004,7 @@ class LanderWidget(QtWidgets.QWidget):
             )
             painter.drawPolygon(flame)
 
-        if self.key_left and not self._frozen:
+        if self.key_left and not self.env.frozen:
             flame = QtGui.QPolygonF(
                 [
                     QtCore.QPointF(-16, -4),
@@ -782,7 +1014,7 @@ class LanderWidget(QtWidgets.QWidget):
             )
             painter.drawPolygon(flame)
 
-        if self.key_right and not self._frozen:
+        if self.key_right and not self.env.frozen:
             flame = QtGui.QPolygonF(
                 [
                     QtCore.QPointF(16, -4),
@@ -834,6 +1066,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.sim.sound_available():
             # Sound on by default.
             self.chk_sound.setChecked(True)
+
+        self.chk_render = QtWidgets.QCheckBox("Rendering")
+        self.chk_render.setToolTip("Disable to fast-forward the simulation without drawing")
+        self.chk_render.setChecked(True)
+        self.chk_render.toggled.connect(self.sim.set_rendering_enabled)
+        v.addWidget(self.chk_render)
 
         self.restart_btn = QtWidgets.QPushButton("Restart")
         self.restart_btn.clicked.connect(self._on_restart)
