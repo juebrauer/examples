@@ -16,15 +16,32 @@ import sys
 import tempfile
 import time
 import wave
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import List, Protocol, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+
+try:
     from PySide6 import QtMultimedia
 except Exception:  # pragma: no cover
     QtMultimedia = None
+
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+except Exception:  # pragma: no cover
+    FigureCanvas = None  # type: ignore[assignment]
+    Figure = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -248,6 +265,282 @@ class RandomAgent:
         return self._rng.randrange(ACTION_SPACE_N)
 
 
+@dataclass(frozen=True)
+class BinSpec:
+    lo: float
+    hi: float
+    bins: int
+
+
+def _discretize(value: float, spec: BinSpec) -> int:
+    if spec.bins <= 1:
+        return 0
+    v = clamp(float(value), spec.lo, spec.hi)
+    if spec.hi == spec.lo:
+        return 0
+    t = (v - spec.lo) / (spec.hi - spec.lo)
+    idx = int(t * spec.bins)
+    if idx >= spec.bins:
+        idx = spec.bins - 1
+    return idx
+
+
+class QLearningAgent:
+    """Discretized tabular Q-learning for the discrete (0..7) action space.
+
+    Notes:
+    - This is *not* Deep Q-Learning. It discretizes the continuous observation.
+    - For better learning you typically want reward shaping and/or a function
+      approximator (DQN) when state is continuous.
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 0.10,
+        gamma: float = 0.995,
+        epsilon: float = 0.20,
+        seed: int | None = 0,
+        action_space_n: int = ACTION_SPACE_N,
+    ) -> None:
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.epsilon = float(epsilon)
+        self.action_space_n = int(action_space_n)
+        self._rng = random.Random(seed)
+
+        # These ranges are intentionally broad; tune for faster learning.
+        self.specs: tuple[BinSpec, ...] = (
+            BinSpec(-250.0, 250.0, 15),  # vel_x
+            BinSpec(-250.0, 250.0, 15),  # vel_y
+            BinSpec(-math.pi, math.pi, 13),  # angle_rad
+            BinSpec(-1.3, 1.3, 11),  # ang_vel
+            BinSpec(-450.0, 450.0, 21),  # pad_center_dx
+            BinSpec(-120.0, 520.0, 21),  # pad_center_dy
+            BinSpec(0.0, 520.0, 21),  # altitude
+            BinSpec(0.0, 1.0, 2),  # in_landing_pad
+        )
+
+        self._q: defaultdict[tuple[int, ...], list[float]] = defaultdict(
+            lambda: [0.0 for _ in range(self.action_space_n)]
+        )
+        self._prev_state: tuple[int, ...] | None = None
+        self._prev_action: int | None = None
+
+    def reset(self) -> None:
+        self._prev_state = None
+        self._prev_action = None
+
+    def _state_key(self, observation: Observation) -> tuple[int, ...]:
+        # observation is a flat tuple in the order of LunarLanderEnv.state_names
+        return tuple(_discretize(observation[i], self.specs[i]) for i in range(len(self.specs)))
+
+    def take_action(self, observation: Observation, info: dict) -> int:
+        _ = info
+        state = self._state_key(observation)
+
+        # Epsilon-greedy.
+        if self._rng.random() < self.epsilon:
+            action = self._rng.randrange(self.action_space_n)
+        else:
+            q = self._q[state]
+            best = max(q)
+            # Break ties randomly.
+            best_actions = [i for i, v in enumerate(q) if v == best]
+            action = self._rng.choice(best_actions)
+
+        self._prev_state = state
+        self._prev_action = int(action)
+        return int(action)
+
+    def observe(self, reward: float, terminated: bool, next_observation: Observation, info: dict) -> None:
+        _ = info
+        if self._prev_state is None or self._prev_action is None:
+            return
+
+        s = self._prev_state
+        a = int(self._prev_action)
+        s2 = self._state_key(next_observation)
+
+        q_sa = self._q[s][a]
+        next_best = max(self._q[s2])
+        target = float(reward) + (0.0 if terminated else self.gamma * next_best)
+        self._q[s][a] = q_sa + self.alpha * (target - q_sa)
+
+        if terminated:
+            self._prev_state = None
+            self._prev_action = None
+
+
+class DQNAgent:
+    """Deep Q-Network (DQN) agent for this environment.
+
+    - Discrete action space (0..7)
+    - MLP approximator + replay buffer + target network
+    """
+
+    def __init__(
+        self,
+        *,
+        obs_dim: int,
+        action_space_n: int = ACTION_SPACE_N,
+        hidden_sizes: tuple[int, int] = (128, 128),
+        lr: float = 1e-3,
+        gamma: float = 0.995,
+        batch_size: int = 64,
+        replay_size: int = 50_000,
+        warmup_steps: int = 2_000,
+        train_every: int = 1,
+        target_update_every: int = 1_000,
+        epsilon_start: float = 1.0,
+        epsilon_end: float = 0.05,
+        epsilon_decay_steps: int = 50_000,
+        seed: int | None = 0,
+        device: str | None = None,
+    ) -> None:
+        if torch is None or nn is None:
+            raise RuntimeError("PyTorch is required for DQNAgent. Install torch or use QLearningAgent.")
+
+        self.obs_dim = int(obs_dim)
+        self.action_space_n = int(action_space_n)
+        self.gamma = float(gamma)
+        self.batch_size = int(batch_size)
+        self.warmup_steps = int(warmup_steps)
+        self.train_every = int(train_every)
+        self.target_update_every = int(target_update_every)
+
+        self.epsilon_start = float(epsilon_start)
+        self.epsilon_end = float(epsilon_end)
+        self.epsilon_decay_steps = int(epsilon_decay_steps)
+
+        if seed is not None:
+            random.seed(int(seed))
+            torch.manual_seed(int(seed))
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        h1, h2 = hidden_sizes
+
+        class _MLP(nn.Module):
+            def __init__(self, in_dim: int, out_dim: int) -> None:
+                super().__init__()
+                self.fc1 = nn.Linear(in_dim, int(h1))
+                self.fc2 = nn.Linear(int(h1), int(h2))
+                self.fc3 = nn.Linear(int(h2), out_dim)
+
+            def forward(self, x):
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+                return self.fc3(x)
+
+        self.policy_net = _MLP(self.obs_dim, self.action_space_n).to(self.device)
+        self.target_net = _MLP(self.obs_dim, self.action_space_n).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.optim = torch.optim.Adam(self.policy_net.parameters(), lr=float(lr))
+
+        # (s, a, r, s2, done)
+        self.replay: deque[tuple[Observation, int, float, Observation, bool]] = deque(maxlen=int(replay_size))
+        self._step_count = 0
+
+        self._prev_obs: Observation | None = None
+        self._prev_action: int | None = None
+
+    def reset(self) -> None:
+        self._prev_obs = None
+        self._prev_action = None
+
+    def _epsilon(self) -> float:
+        t = min(1.0, self._step_count / max(1, self.epsilon_decay_steps))
+        return (1.0 - t) * self.epsilon_start + t * self.epsilon_end
+
+    def _normalize_obs(self, obs: Observation) -> list[float]:
+        # Scale features to roughly [-1, 1] ranges.
+        # Order is LunarLanderEnv.state_names.
+        scales = [
+            250.0,  # vel_x
+            250.0,  # vel_y
+            math.pi,  # angle_rad
+            1.5,  # ang_vel
+            450.0,  # pad_center_dx
+            520.0,  # pad_center_dy
+            520.0,  # altitude
+            1.0,  # in_landing_pad
+        ]
+        out: list[float] = []
+        for i, v in enumerate(obs):
+            s = scales[i] if i < len(scales) else 1.0
+            out.append(clamp(float(v) / s, -1.0, 1.0))
+        return out
+
+    def _obs_tensor(self, obs: Observation):
+        x = torch.tensor(self._normalize_obs(obs), dtype=torch.float32, device=self.device)
+        return x
+
+    def take_action(self, observation: Observation, info: dict) -> int:
+        _ = info
+        self._step_count += 1
+        eps = self._epsilon()
+        if random.random() < eps:
+            action = random.randrange(self.action_space_n)
+        else:
+            with torch.no_grad():
+                q = self.policy_net(self._obs_tensor(observation).unsqueeze(0))
+                action = int(torch.argmax(q, dim=1).item())
+
+        self._prev_obs = observation
+        self._prev_action = int(action)
+        return int(action)
+
+    def observe(self, reward: float, terminated: bool, next_observation: Observation, info: dict) -> None:
+        _ = info
+        if self._prev_obs is None or self._prev_action is None:
+            return
+
+        self.replay.append((self._prev_obs, int(self._prev_action), float(reward), next_observation, bool(terminated)))
+
+        if terminated:
+            self._prev_obs = None
+            self._prev_action = None
+
+        if len(self.replay) < max(self.warmup_steps, self.batch_size):
+            return
+        if self.train_every > 1 and (self._step_count % self.train_every) != 0:
+            return
+
+        self._train_step()
+
+        if (self._step_count % max(1, self.target_update_every)) == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def _train_step(self) -> None:
+        if torch is None:
+            return
+
+        batch = random.sample(self.replay, k=self.batch_size)
+
+        states = torch.stack([self._obs_tensor(s) for (s, _a, _r, _s2, _d) in batch], dim=0)
+        actions = torch.tensor([a for (_s, a, _r, _s2, _d) in batch], dtype=torch.int64, device=self.device)
+        rewards = torch.tensor([r for (_s, _a, r, _s2, _d) in batch], dtype=torch.float32, device=self.device)
+        next_states = torch.stack([self._obs_tensor(s2) for (_s, _a, _r, s2, _d) in batch], dim=0)
+        dones = torch.tensor([1.0 if d else 0.0 for (_s, _a, _r, _s2, d) in batch], dtype=torch.float32, device=self.device)
+
+        q_sa = self.policy_net(states).gather(1, actions.view(-1, 1)).squeeze(1)
+        with torch.no_grad():
+            next_q = self.target_net(next_states).max(dim=1).values
+            target = rewards + (1.0 - dones) * (self.gamma * next_q)
+
+        loss = F.smooth_l1_loss(q_sa, target)
+
+        self.optim.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
+        self.optim.step()
+
+
 class LunarLanderEnv:
     """Minimal lunar lander environment.
 
@@ -259,15 +552,16 @@ class LunarLanderEnv:
     """
 
     action_space_n: int = ACTION_SPACE_N
+    # Observation space used by learning agents.
+    # Kept intentionally small and purely relative where possible.
     state_names: tuple[str, ...] = (
-        "pos_x",
-        "pos_y",
         "vel_x",
         "vel_y",
         "angle_rad",
         "ang_vel",
-        "altitude",
         "pad_center_dx",
+        "pad_center_dy",
+        "altitude",
         "in_landing_pad",
     )
 
@@ -307,7 +601,36 @@ class LunarLanderEnv:
         self.last_action: int = 0
         self._just_terminated_success: bool | None = None
 
+        # -----------------
+        # Reward shaping
+        # -----------------
+        # Terminal reward is always applied:
+        #   +1 for LANDED, -1 for CRASHED
+        # Optional shaping rewards can be toggled independently.
+        self.shaping_time_penalty_enabled = True
+        self.shaping_distance_enabled = True
+        self.shaping_stability_enabled = True
+
+        # Weights are multiplied by dt, so they are roughly time-consistent.
+        self.shaping_time_weight = -0.05
+        self.shaping_distance_weight = -0.20
+        self.shaping_stability_weight = -0.15
+
         self.reset()
+
+    def set_reward_shaping(
+        self,
+        *,
+        time_penalty: bool | None = None,
+        distance: bool | None = None,
+        stability: bool | None = None,
+    ) -> None:
+        if time_penalty is not None:
+            self.shaping_time_penalty_enabled = bool(time_penalty)
+        if distance is not None:
+            self.shaping_distance_enabled = bool(distance)
+        if stability is not None:
+            self.shaping_stability_enabled = bool(stability)
 
     def reset(self, *, seed: int | None = None) -> Observation:
         rng = random.Random(seed)
@@ -354,16 +677,17 @@ class LunarLanderEnv:
         altitude = max(0.0, lander.pos.y - (ground + lander.radius))
         ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
         pad_center_dx = lander.pos.x - self.landing_pad.cx
+        # Relative vertical position to the pad surface (0 when touching pad at its y-level).
+        pad_center_dy = lander.pos.y - (self.landing_pad.y + lander.radius)
         in_pad = 1.0 if (self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1) else 0.0
         return (
-            lander.pos.x,
-            lander.pos.y,
             lander.vel.x,
             lander.vel.y,
             ang,
             lander.ang_vel,
-            altitude,
             pad_center_dx,
+            pad_center_dy,
+            altitude,
             in_pad,
         )
 
@@ -372,6 +696,8 @@ class LunarLanderEnv:
         ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
         ground = self.terrain.height_at(lander.pos.x)
         altitude = max(0.0, lander.pos.y - (ground + lander.radius))
+        pad_center_dx = lander.pos.x - self.landing_pad.cx
+        pad_center_dy = lander.pos.y - (self.landing_pad.y + lander.radius)
         in_pad = self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1
         payload = {
             "pos_x": lander.pos.x,
@@ -382,6 +708,8 @@ class LunarLanderEnv:
             "angle_deg": math.degrees(ang),
             "ang_vel": lander.ang_vel,
             "altitude": altitude,
+            "pad_center_dx": pad_center_dx,
+            "pad_center_dy": pad_center_dy,
             "status": self.status_text or "FLYING",
             "in_landing_pad": in_pad,
             "action": int(self.last_action) & 0b111,
@@ -405,12 +733,37 @@ class LunarLanderEnv:
         dt = clamp(float(dt), 0.0, 1.0 / 20.0)
         dt *= self.time_scale
 
+        # Shaping reward is computed *before* the physics update, based on the
+        # current state (s_t). This is common and keeps things simple.
+        reward = 0.0
+        if self.shaping_time_penalty_enabled:
+            reward += self.shaping_time_weight * dt
+
+        if self.shaping_distance_enabled or self.shaping_stability_enabled:
+            # Pull a few features from the current state.
+            lander = self.lander
+            ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+            dx = lander.pos.x - self.landing_pad.cx
+            dy = lander.pos.y - (self.landing_pad.y + lander.radius)
+
+            if self.shaping_distance_enabled:
+                # Normalize distance roughly to [0, 1] and penalize it.
+                ndx = abs(dx) / 450.0
+                ndy = abs(dy) / 520.0
+                reward += self.shaping_distance_weight * dt * clamp(ndx + ndy, 0.0, 4.0)
+
+            if self.shaping_stability_enabled:
+                nvx = abs(lander.vel.x) / 250.0
+                nvy = abs(lander.vel.y) / 250.0
+                nang = abs(ang) / math.pi
+                nw = abs(lander.ang_vel) / 1.5
+                reward += self.shaping_stability_weight * dt * clamp(nvx + nvy + nang + nw, 0.0, 6.0)
+
         was_frozen = self.frozen
         self._step_physics(dt, self.last_action)
 
         terminated = bool(self.frozen)
 
-        reward = 0.0
         terminal_success: bool | None = None
         # Minimal reward shaping: only terminal events.
         if (not was_frozen) and terminated:
@@ -594,6 +947,8 @@ class LunarLanderEnv:
 
 class LanderWidget(QtWidgets.QWidget):
     telemetryUpdated = QtCore.Signal(dict)
+    learningStatsUpdated = QtCore.Signal(dict)
+    runningChanged = QtCore.Signal(bool)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -603,10 +958,25 @@ class LanderWidget(QtWidgets.QWidget):
         self.env = LunarLanderEnv(world_w=900.0, world_h=520.0)
         self.agent: Agent = HumanKeyboardAgent()
 
+        # Simulation is paused until the user presses Start.
+        self.running = False
+
+        # When fast-forwarding learning, avoid spamming UI updates.
+        self._last_ui_emit_learning_step = 0
+        self._ui_emit_every_learning_steps = 250
+
         # When rendering is disabled, we fast-forward the simulation by stepping
         # multiple times per UI tick.
         self.rendering_enabled = True
         self.fast_forward_steps_per_tick = 250
+
+        # Learning stats
+        self.episode_nr = 0
+        self.total_learning_steps = 0
+        self.successful_landings = 0
+        self._reward_window_sum = 0.0
+        self._reward_window_count = 0
+        self.avg_reward_every_1000: list[float] = []
 
         self._t_last = time.perf_counter()
         self._timer = QtCore.QTimer(self)
@@ -631,6 +1001,40 @@ class LanderWidget(QtWidgets.QWidget):
             self._init_sounds()
 
         self.reset()
+
+    def set_agent(self, agent: Agent) -> None:
+        self.agent = agent
+        try:
+            self.agent.reset()
+        except Exception:
+            pass
+        self.reset()
+
+    def set_running(self, running: bool) -> None:
+        self.running = bool(running)
+        if not self.running:
+            self._stop_thruster_sounds()
+        self.runningChanged.emit(self.running)
+
+    def reset_learning_stats(self) -> None:
+        self.episode_nr = 0
+        self.total_learning_steps = 0
+        self.successful_landings = 0
+        self._reward_window_sum = 0.0
+        self._reward_window_count = 0
+        self.avg_reward_every_1000 = []
+        self._emit_learning_stats(latest_avg=None)
+
+    def _emit_learning_stats(self, *, latest_avg: float | None) -> None:
+        self.learningStatsUpdated.emit(
+            {
+                "episode": int(self.episode_nr),
+                "steps": int(self.total_learning_steps),
+                "successes": int(self.successful_landings),
+                "latest_avg_reward_1000": latest_avg,
+                "avg_reward_curve": list(self.avg_reward_every_1000),
+            }
+        )
 
     def set_rendering_enabled(self, enabled: bool) -> None:
         self.rendering_enabled = bool(enabled)
@@ -860,6 +1264,15 @@ class LanderWidget(QtWidgets.QWidget):
         dt = now - self._t_last
         self._t_last = now
 
+        if not self.running:
+            # Keep the UI responsive without advancing the simulation.
+            self.telemetryUpdated.emit(self.env.info())
+            if self.rendering_enabled:
+                self.update()
+            return
+
+        learning_mode = not isinstance(self.agent, HumanKeyboardAgent)
+
         # Rendered mode: use wall-clock dt. Headless mode: fixed dt and many steps.
         if self.rendering_enabled:
             steps = 1
@@ -870,6 +1283,7 @@ class LanderWidget(QtWidgets.QWidget):
 
         info_last: dict | None = None
         terminated = False
+        latest_avg: float | None = None
         for _i in range(steps):
             obs = self.env.observation()
             action = int(self.agent.take_action(obs, self.env.info()))
@@ -878,9 +1292,45 @@ class LanderWidget(QtWidgets.QWidget):
             self.key_left = bool(action & ACTION_LEFT)
             self.key_right = bool(action & ACTION_RIGHT)
 
-            _obs2, _reward, terminated, info_last = self.env.step(action, dt_step)
+            obs2, reward, terminated, info_last = self.env.step(action, dt_step)
             self.status_text = self.env.status_text
+
+            if learning_mode:
+                self.total_learning_steps += 1
+                self._reward_window_sum += float(reward)
+                self._reward_window_count += 1
+                if self._reward_window_count >= 1000:
+                    latest_avg = self._reward_window_sum / max(1, self._reward_window_count)
+                    self.avg_reward_every_1000.append(float(latest_avg))
+                    self._reward_window_sum = 0.0
+                    self._reward_window_count = 0
+
+            if hasattr(self.agent, "observe"):
+                try:
+                    getattr(self.agent, "observe")(reward, terminated, obs2, info_last)
+                except Exception:
+                    pass
+
             if terminated:
+                if learning_mode:
+                    self.episode_nr += 1
+                    if info_last.get("terminal_success") is True:
+                        self.successful_landings += 1
+
+                    # Auto-reset for learning so we get many episodes.
+                    self.env.reset()
+                    try:
+                        self.agent.reset()
+                    except Exception:
+                        pass
+                    self.key_left = False
+                    self.key_right = False
+                    self.key_up = False
+                    terminated = False
+                    continue
+
+                # Human: stop on terminal and wait for restart.
+                self.set_running(False)
                 break
 
         # Keep audio state in sync even if keys are held.
@@ -898,7 +1348,16 @@ class LanderWidget(QtWidgets.QWidget):
         elif info_last.get("terminal_success") is False:
             self._play_landing_sound(False)
 
-        self.telemetryUpdated.emit(info_last)
+        emit_ui = True
+        if learning_mode and (not self.rendering_enabled):
+            steps_since = self.total_learning_steps - self._last_ui_emit_learning_step
+            emit_ui = (latest_avg is not None) or (steps_since >= self._ui_emit_every_learning_steps)
+            if emit_ui:
+                self._last_ui_emit_learning_step = self.total_learning_steps
+
+        if emit_ui:
+            self.telemetryUpdated.emit(info_last)
+            self._emit_learning_stats(latest_avg=latest_avg)
 
         if self.rendering_enabled:
             self.update()
@@ -1043,26 +1502,75 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.sim, 1)
 
         panel = QtWidgets.QWidget(root)
-        panel.setFixedWidth(260)
-        v = QtWidgets.QVBoxLayout(panel)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(8)
+        panel.setFixedWidth(520)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(10, 10, 10, 10)
+        panel_layout.setSpacing(8)
 
-        title = QtWidgets.QLabel("Controls")
-        title.setStyleSheet("font-weight: 600;")
-        v.addWidget(title)
+        top_title = QtWidgets.QLabel("Controls")
+        top_title.setStyleSheet("font-weight: 600;")
+        panel_layout.addWidget(top_title)
 
-        v.addWidget(QtWidgets.QLabel("Arrow Left: left thruster"))
-        v.addWidget(QtWidgets.QLabel("Arrow Right: right thruster"))
-        v.addWidget(QtWidgets.QLabel("Arrow Up: bottom thruster"))
-        v.addSpacing(6)
+        columns = QtWidgets.QWidget(panel)
+        cols = QtWidgets.QHBoxLayout(columns)
+        cols.setContentsMargins(0, 0, 0, 0)
+        cols.setSpacing(12)
+
+        left_col = QtWidgets.QWidget(columns)
+        left_v = QtWidgets.QVBoxLayout(left_col)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(8)
+
+        right_col = QtWidgets.QWidget(columns)
+        right_v = QtWidgets.QVBoxLayout(right_col)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(8)
+
+        cols.addWidget(left_col, 0)
+        cols.addWidget(right_col, 0)
+        panel_layout.addWidget(columns, 1)
+
+        # --------
+        # Left column: input + switches
+        # --------
+        left_v.addWidget(QtWidgets.QLabel("Arrow Left: left thruster"))
+        left_v.addWidget(QtWidgets.QLabel("Arrow Right: right thruster"))
+        left_v.addWidget(QtWidgets.QLabel("Arrow Up: bottom thruster"))
+        left_v.addSpacing(6)
+
+        controller_title = QtWidgets.QLabel("Controller")
+        controller_title.setStyleSheet("font-weight: 600;")
+        left_v.addWidget(controller_title)
+
+        self.cmb_controller = QtWidgets.QComboBox()
+        self.cmb_controller.addItem("Human (keyboard)")
+        self.cmb_controller.addItem("DQN (learning)")
+        self.cmb_controller.currentIndexChanged.connect(self._on_controller_changed)
+        left_v.addWidget(self.cmb_controller)
+
+        left_v.addSpacing(6)
+        shaping_title = QtWidgets.QLabel("Reward shaping")
+        shaping_title.setStyleSheet("font-weight: 600;")
+        left_v.addWidget(shaping_title)
+
+        self.chk_shape_time = QtWidgets.QCheckBox("Time penalty")
+        self.chk_shape_dist = QtWidgets.QCheckBox("Distance to pad")
+        self.chk_shape_stab = QtWidgets.QCheckBox("Stability (vel/angle)")
+
+        self.chk_shape_time.toggled.connect(lambda on: self.sim.env.set_reward_shaping(time_penalty=on))
+        self.chk_shape_dist.toggled.connect(lambda on: self.sim.env.set_reward_shaping(distance=on))
+        self.chk_shape_stab.toggled.connect(lambda on: self.sim.env.set_reward_shaping(stability=on))
+
+        left_v.addWidget(self.chk_shape_time)
+        left_v.addWidget(self.chk_shape_dist)
+        left_v.addWidget(self.chk_shape_stab)
 
         self.chk_sound = QtWidgets.QCheckBox("Sound")
         if not self.sim.sound_available():
             self.chk_sound.setEnabled(False)
             self.chk_sound.setToolTip("QtMultimedia not available in this environment")
         self.chk_sound.toggled.connect(self.sim.set_sound_enabled)
-        v.addWidget(self.chk_sound)
+        left_v.addWidget(self.chk_sound)
         if self.sim.sound_available():
             # Sound on by default.
             self.chk_sound.setChecked(True)
@@ -1071,16 +1579,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_render.setToolTip("Disable to fast-forward the simulation without drawing")
         self.chk_render.setChecked(True)
         self.chk_render.toggled.connect(self.sim.set_rendering_enabled)
-        v.addWidget(self.chk_render)
+        left_v.addWidget(self.chk_render)
+
+        self.btn_start = QtWidgets.QPushButton("Start")
+        self.btn_start.clicked.connect(self._on_start_stop)
+        left_v.addWidget(self.btn_start)
 
         self.restart_btn = QtWidgets.QPushButton("Restart")
         self.restart_btn.clicked.connect(self._on_restart)
-        v.addWidget(self.restart_btn)
+        left_v.addWidget(self.restart_btn)
 
-        v.addSpacing(10)
+        left_v.addStretch(1)
+
+        # --------
+        # Right column: telemetry + learning
+        # --------
         stats_title = QtWidgets.QLabel("Telemetry")
         stats_title.setStyleSheet("font-weight: 600;")
-        v.addWidget(stats_title)
+        right_v.addWidget(stats_title)
 
         self.lbl_status = QtWidgets.QLabel("status: FLYING")
         self.lbl_pos = QtWidgets.QLabel("pos: (0.0, 0.0)")
@@ -1093,8 +1609,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.txt_contact = QtWidgets.QPlainTextEdit()
         self.txt_contact.setReadOnly(True)
-        self.txt_contact.setMinimumHeight(110)
-        self.txt_contact.setMaximumHeight(170)
+        self.txt_contact.setMinimumHeight(90)
+        self.txt_contact.setMaximumHeight(130)
 
         for lbl in [
             self.lbl_status,
@@ -1105,20 +1621,79 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_pad,
         ]:
             lbl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-            v.addWidget(lbl)
+            right_v.addWidget(lbl)
 
-        v.addSpacing(6)
-        v.addWidget(contact_title)
-        v.addWidget(self.txt_contact)
+        right_v.addSpacing(6)
+        right_v.addWidget(contact_title)
+        right_v.addWidget(self.txt_contact)
 
-        v.addStretch(1)
+        right_v.addSpacing(8)
+        learn_title = QtWidgets.QLabel("Learning")
+        learn_title.setStyleSheet("font-weight: 600;")
+        right_v.addWidget(learn_title)
+
+        self.txt_learning = QtWidgets.QPlainTextEdit()
+        self.txt_learning.setReadOnly(True)
+        self.txt_learning.setMinimumHeight(60)
+        self.txt_learning.setMaximumHeight(95)
+        right_v.addWidget(self.txt_learning)
+
+        plot_title = QtWidgets.QLabel("Avg reward / 1000 steps")
+        plot_title.setStyleSheet("font-weight: 600;")
+        right_v.addWidget(plot_title)
+
+        self._fig = None
+        self._ax = None
+        self._canvas = None
+        if FigureCanvas is not None and Figure is not None:
+            self._fig = Figure(figsize=(2.2, 1.4), dpi=100)
+            self._ax = self._fig.add_subplot(111)
+            self._ax.grid(True, alpha=0.25)
+            self._canvas = FigureCanvas(self._fig)
+            self._canvas.setMinimumHeight(120)
+            self._canvas.setMaximumHeight(150)
+            right_v.addWidget(self._canvas)
+        else:
+            right_v.addWidget(QtWidgets.QLabel("Matplotlib not available"))
+
+        right_v.addStretch(1)
 
         layout.addWidget(panel, 0)
         self.setCentralWidget(root)
 
         self.sim.telemetryUpdated.connect(self._on_telemetry)
+        self.sim.learningStatsUpdated.connect(self._on_learning_stats)
+        self.sim.runningChanged.connect(self._on_running_changed)
+
+        # Shaping rewards enabled by default.
+        self.chk_shape_time.setChecked(True)
+        self.chk_shape_dist.setChecked(True)
+        self.chk_shape_stab.setChecked(True)
+
+        # No automatic start.
+        self.sim.set_running(False)
+        self.sim.reset_learning_stats()
+
+    def _on_controller_changed(self, idx: int) -> None:
+        # 0 = Human, 1 = DQN
+        self.sim.set_running(False)
+        self.btn_start.setText("Start")
+        if idx == 0:
+            self.sim.set_agent(HumanKeyboardAgent())
+            return
+
+        # DQN agent learns online while controlling.
+        obs_dim = len(self.sim.env.observation())
+        self.sim.set_agent(DQNAgent(obs_dim=obs_dim, seed=0))
+
+        # Disable UI-heavy stuff by default for learning speed.
+        self.chk_render.setChecked(False)
+        if self.sim.sound_available():
+            self.chk_sound.setChecked(False)
 
     def _on_restart(self) -> None:
+        self.sim.set_running(False)
+        self.btn_start.setText("Start")
         self.sim.reset()
 
     def _on_telemetry(self, t: dict) -> None:
@@ -1154,11 +1729,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._contact_text_last = text
                 self.txt_contact.setPlainText(text)
 
+    def _on_learning_stats(self, s: dict) -> None:
+        ep = int(s.get("episode", 0))
+        steps = int(s.get("steps", 0))
+        succ = int(s.get("successes", 0))
+        latest = s.get("latest_avg_reward_1000")
+
+        lines = [
+            f"episode: {ep}",
+            f"learning steps: {steps}",
+            f"successful landings: {succ}",
+        ]
+        if latest is not None:
+            lines.append(f"avg reward (last 1000): {float(latest):.4f}")
+        self.txt_learning.setPlainText("\n".join(lines))
+
+        curve = s.get("avg_reward_curve")
+        if self._ax is not None and self._fig is not None and self._canvas is not None and isinstance(curve, list):
+            self._ax.clear()
+            self._ax.grid(True, alpha=0.25)
+            if curve:
+                xs = list(range(1, len(curve) + 1))
+                self._ax.plot(xs, curve)
+            self._ax.set_xlabel("chunk (1000 steps)")
+            self._ax.set_ylabel("avg reward")
+            self._fig.tight_layout()
+            self._canvas.draw_idle()
+
+    def _on_start_stop(self) -> None:
+        if not self.sim.running:
+            self.sim.reset()
+            self.sim.reset_learning_stats()
+            self.sim.set_running(True)
+        else:
+            self.sim.set_running(False)
+
+    def _on_running_changed(self, running: bool) -> None:
+        self.btn_start.setText("Stop" if running else "Start")
+
 
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
-    w.resize(900, 520)
+    w.resize(1200, 700)
     w.show()
     return app.exec()
 
