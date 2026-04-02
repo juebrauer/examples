@@ -161,6 +161,71 @@ class GridWorld:
         return next_state, reward, done
 
 
+def _bellman_optimality_sweep(
+    world: GridWorld,
+    V: Dict[Cell, float],
+    *,
+    gamma: float,
+) -> Tuple[Dict[Cell, float], float]:
+    """Run one Bellman optimality sweep over all states.
+
+    Returns (V_new, delta) where delta is the max absolute change.
+    """
+    V_new = dict(V)
+    delta = 0.0
+
+    for s in world.states():
+        if world.is_terminal(s):
+            V_new[s] = float(world.terminals[s])
+            continue
+
+        _, best_q = _optimal_action_and_q(world, V, s, gamma=gamma)
+        V_new[s] = best_q
+        delta = max(delta, abs(V_new[s] - V[s]))
+
+    return V_new, delta
+
+
+def _optimal_action_and_q(
+    world: GridWorld,
+    V: Dict[Cell, float],
+    state: Cell,
+    *,
+    gamma: float,
+) -> Tuple[str, float]:
+    """Return (best_action, best_q) for a given state under greedy control.
+
+    Uses the same reward/terminal semantics as the value iteration sweep.
+    """
+    best_action = ACTIONS[0]
+    best_q = -math.inf
+
+    for action in ACTIONS:
+        s2, r, done = world.step(state, action)
+        q = float(r) + (0.0 if done else gamma * float(V[s2]))
+        if q > best_q:
+            best_q = q
+            best_action = action
+
+    return best_action, best_q
+
+
+def greedy_policy_from_values(
+    world: GridWorld,
+    values: Dict[Cell, float],
+    *,
+    gamma: float,
+) -> Dict[Cell, str]:
+    """Compute a greedy deterministic policy π(s) from state values V(s)."""
+    policy: Dict[Cell, str] = {}
+    for s in world.states():
+        if world.is_terminal(s):
+            continue
+        a, _ = _optimal_action_and_q(world, values, s, gamma=gamma)
+        policy[s] = a
+    return policy
+
+
 def value_iteration(
     world: GridWorld,
     *,
@@ -173,29 +238,13 @@ def value_iteration(
 
     V: Dict[Cell, float] = {s: 0.0 for s in world.states()}
     for t, r in world.terminals.items():
-        V[t] = float(r)
+        # Note: initializing terminal values to 0 is fine; the sweep will clamp
+        # terminal states to their terminal reward anyway.
+        V[t] = 0.0
 
     last_delta = 0.0
     for i in range(max_iterations):
-        delta = 0.0
-        V_new = dict(V)
-
-        for s in world.states():
-            if world.is_terminal(s):
-                V_new[s] = float(world.terminals[s])
-                continue
-
-            best_q = -math.inf
-            for a in ACTIONS:
-                s2, r, done = world.step(s, a)
-                q = float(r) + (0.0 if done else gamma * float(V[s2]))
-                if q > best_q:
-                    best_q = q
-
-            V_new[s] = best_q
-            delta = max(delta, abs(V_new[s] - V[s]))
-
-        V = V_new
+        V, delta = _bellman_optimality_sweep(world, V, gamma=gamma)
         last_delta = delta
         if delta < theta:
             return V, i + 1, last_delta
@@ -230,25 +279,7 @@ class ValueIterationSession:
 
     def step(self) -> Tuple[Dict[Cell, float], float, int]:
         """Perform one sweep and return (V, delta, iteration_count)."""
-        V_new = dict(self.V)
-        delta = 0.0
-
-        for s in self.world.states():
-            if self.world.is_terminal(s):
-                V_new[s] = float(self.world.terminals[s])
-                continue
-
-            best_q = -math.inf
-            for a in ACTIONS:
-                s2, r, done = self.world.step(s, a)
-                q = float(r) + (0.0 if done else self.gamma * float(self.V[s2]))
-                if q > best_q:
-                    best_q = q
-
-            V_new[s] = best_q
-            delta = max(delta, abs(V_new[s] - self.V[s]))
-
-        self.V = V_new
+        self.V, delta = _bellman_optimality_sweep(self.world, self.V, gamma=self.gamma)
         self.iteration += 1
         self.last_delta = delta
         return dict(self.V), delta, self.iteration
@@ -268,6 +299,9 @@ class GridWorldWidget(QWidget):
         self._values: Dict[Cell, float] = {}
         self._show_values = False
 
+        self._policy: Dict[Cell, str] = {}
+        self._show_policy = False
+
         self.setMinimumSize(520, 520)
         self.setMouseTracking(True)
 
@@ -275,6 +309,8 @@ class GridWorldWidget(QWidget):
         self._world = world
         self._values = {}
         self._show_values = False
+        self._policy = {}
+        self._show_policy = False
         self.update()
 
     def set_mode(self, mode: str) -> None:
@@ -294,10 +330,56 @@ class GridWorldWidget(QWidget):
         self._show_values = True
         self.update()
 
+    def set_policy(self, policy: Dict[Cell, str]) -> None:
+        self._policy = dict(policy)
+        self._show_policy = True
+        self.update()
+
     def clear_values(self) -> None:
         self._values = {}
         self._show_values = False
+        self._policy = {}
+        self._show_policy = False
         self.update()
+
+    def _draw_action_arrow(self, painter: QPainter, rect: QRectF, action: str) -> None:
+        cx = rect.center().x()
+        cy = rect.center().y()
+
+        if action == "U":
+            dx, dy = 0.0, -1.0
+        elif action == "D":
+            dx, dy = 0.0, 1.0
+        elif action == "L":
+            dx, dy = -1.0, 0.0
+        elif action == "R":
+            dx, dy = 1.0, 0.0
+        else:
+            return
+
+        length = min(rect.width(), rect.height()) * 0.66
+        start_x = cx - dx * (length * 0.5)
+        start_y = cy - dy * (length * 0.5)
+        end_x = cx + dx * (length * 0.5)
+        end_y = cy + dy * (length * 0.5)
+
+        painter.drawLine(start_x, start_y, end_x, end_y)
+
+        # Arrow head
+        head_len = length * 0.36
+        angle = math.radians(28.0)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+
+        # Rotate (-dx, -dy) by ±angle
+        bx, by = -dx, -dy
+        lx = bx * cos_a - by * sin_a
+        ly = bx * sin_a + by * cos_a
+        rx = bx * cos_a + by * sin_a
+        ry = -bx * sin_a + by * cos_a
+
+        painter.drawLine(end_x, end_y, end_x + lx * head_len, end_y + ly * head_len)
+        painter.drawLine(end_x, end_y, end_x + rx * head_len, end_y + ry * head_len)
 
     def _grid_geometry(self) -> Tuple[QRectF, float, float]:
         margin = 12.0
@@ -409,6 +491,28 @@ class GridWorldWidget(QWidget):
                         font.setBold(True)
                         painter.setFont(font)
                         painter.drawText(rect, Qt.AlignCenter, f"{value:.2f}")
+
+                    # Greedy action arrow (only when we have values/policy)
+                    if (
+                        self._show_values
+                        and self._show_policy
+                        and (not self._world.is_terminal(cell))
+                    ):
+                        action = self._policy.get(cell)
+                        if action is not None:
+                            pen_arrow = QPen(QColor(20, 20, 20))
+                            # Reuse the same green as the positive terminal.
+                            pen_arrow = QPen(QColor(60, 160, 60))
+                            pen_arrow.setWidth(max(2, int(cell_size * 0.05)))
+                            painter.setPen(pen_arrow)
+                            # Draw the arrow away from the centered V(s) text.
+                            arrow_rect = rect.adjusted(
+                                rect.width() * 0.15,
+                                rect.height() * 0.64,
+                                -rect.width() * 0.15,
+                                -rect.height() * 0.04,
+                            )
+                            self._draw_action_arrow(painter, arrow_rect, action)
 
         # Draw grid lines
         pen = QPen(QColor(30, 30, 30))
@@ -648,6 +752,7 @@ class MainWindow(QMainWindow):
             return
 
         self.grid.set_values(values)
+        self.grid.set_policy(greedy_policy_from_values(self.world, values, gamma=gamma))
         self.controls.status.setText(
             f"Done: {iterations} iterations, last Δ={delta:.6g}"
         )
@@ -679,6 +784,7 @@ class MainWindow(QMainWindow):
 
         values, delta, k = self._vi_session.step()
         self.grid.set_values(values)
+        self.grid.set_policy(greedy_policy_from_values(self.world, values, gamma=gamma))
         self.controls.status.setText(f"Step: iteration {k}, Δ={delta:.6g}")
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
