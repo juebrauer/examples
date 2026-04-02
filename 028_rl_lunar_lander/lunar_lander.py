@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import wave
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Protocol, Tuple
 
@@ -265,113 +265,6 @@ class RandomAgent:
         return self._rng.randrange(ACTION_SPACE_N)
 
 
-@dataclass(frozen=True)
-class BinSpec:
-    lo: float
-    hi: float
-    bins: int
-
-
-def _discretize(value: float, spec: BinSpec) -> int:
-    if spec.bins <= 1:
-        return 0
-    v = clamp(float(value), spec.lo, spec.hi)
-    if spec.hi == spec.lo:
-        return 0
-    t = (v - spec.lo) / (spec.hi - spec.lo)
-    idx = int(t * spec.bins)
-    if idx >= spec.bins:
-        idx = spec.bins - 1
-    return idx
-
-
-class QLearningAgent:
-    """Discretized tabular Q-learning for the discrete (0..7) action space.
-
-    Notes:
-    - This is *not* Deep Q-Learning. It discretizes the continuous observation.
-    - For better learning you typically want reward shaping and/or a function
-      approximator (DQN) when state is continuous.
-    """
-
-    def __init__(
-        self,
-        *,
-        alpha: float = 0.10,
-        gamma: float = 0.995,
-        epsilon: float = 0.20,
-        seed: int | None = 0,
-        action_space_n: int = ACTION_SPACE_N,
-    ) -> None:
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
-        self.epsilon = float(epsilon)
-        self.action_space_n = int(action_space_n)
-        self._rng = random.Random(seed)
-
-        # These ranges are intentionally broad; tune for faster learning.
-        self.specs: tuple[BinSpec, ...] = (
-            BinSpec(-250.0, 250.0, 15),  # vel_x
-            BinSpec(-250.0, 250.0, 15),  # vel_y
-            BinSpec(-math.pi, math.pi, 13),  # angle_rad
-            BinSpec(-1.3, 1.3, 11),  # ang_vel
-            BinSpec(-450.0, 450.0, 21),  # pad_center_dx
-            BinSpec(-120.0, 520.0, 21),  # pad_center_dy
-            BinSpec(0.0, 520.0, 21),  # altitude
-            BinSpec(0.0, 1.0, 2),  # in_landing_pad
-        )
-
-        self._q: defaultdict[tuple[int, ...], list[float]] = defaultdict(
-            lambda: [0.0 for _ in range(self.action_space_n)]
-        )
-        self._prev_state: tuple[int, ...] | None = None
-        self._prev_action: int | None = None
-
-    def reset(self) -> None:
-        self._prev_state = None
-        self._prev_action = None
-
-    def _state_key(self, observation: Observation) -> tuple[int, ...]:
-        # observation is a flat tuple in the order of LunarLanderEnv.state_names
-        return tuple(_discretize(observation[i], self.specs[i]) for i in range(len(self.specs)))
-
-    def take_action(self, observation: Observation, info: dict) -> int:
-        _ = info
-        state = self._state_key(observation)
-
-        # Epsilon-greedy.
-        if self._rng.random() < self.epsilon:
-            action = self._rng.randrange(self.action_space_n)
-        else:
-            q = self._q[state]
-            best = max(q)
-            # Break ties randomly.
-            best_actions = [i for i, v in enumerate(q) if v == best]
-            action = self._rng.choice(best_actions)
-
-        self._prev_state = state
-        self._prev_action = int(action)
-        return int(action)
-
-    def observe(self, reward: float, terminated: bool, next_observation: Observation, info: dict) -> None:
-        _ = info
-        if self._prev_state is None or self._prev_action is None:
-            return
-
-        s = self._prev_state
-        a = int(self._prev_action)
-        s2 = self._state_key(next_observation)
-
-        q_sa = self._q[s][a]
-        next_best = max(self._q[s2])
-        target = float(reward) + (0.0 if terminated else self.gamma * next_best)
-        self._q[s][a] = q_sa + self.alpha * (target - q_sa)
-
-        if terminated:
-            self._prev_state = None
-            self._prev_action = None
-
-
 class DQNAgent:
     """Deep Q-Network (DQN) agent for this environment.
 
@@ -399,7 +292,7 @@ class DQNAgent:
         device: str | None = None,
     ) -> None:
         if torch is None or nn is None:
-            raise RuntimeError("PyTorch is required for DQNAgent. Install torch or use QLearningAgent.")
+            raise RuntimeError("PyTorch is required for DQNAgent. Install torch or use the Random agent.")
 
         self.obs_dim = int(obs_dim)
         self.action_space_n = int(action_space_n)
@@ -601,6 +494,15 @@ class LunarLanderEnv:
         self.last_action: int = 0
         self._just_terminated_success: bool | None = None
 
+        # Latest reward breakdown for visualization/debugging.
+        self.last_reward_total = 0.0
+        self.last_reward_time = 0.0
+        self.last_reward_distance = 0.0
+        self.last_reward_stability = 0.0
+        self.last_reward_terminal = 0.0
+        self.last_distance_metric = 0.0
+        self.last_stability_metric = 0.0
+
         # -----------------
         # Reward shaping
         # -----------------
@@ -613,8 +515,17 @@ class LunarLanderEnv:
 
         # Weights are multiplied by dt, so they are roughly time-consistent.
         self.shaping_time_weight = -0.05
+        # Potential-based shaping uses the absolute value of these coefficients.
+        # (Sign is ignored; potentials are defined so that progress yields +reward.)
         self.shaping_distance_weight = -0.20
         self.shaping_stability_weight = -0.15
+
+        # Potential-based shaping discount. Keep in sync with the agent discount.
+        self.shaping_gamma = 0.995
+
+        # Terminal reward magnitude (large to accelerate learning).
+        self.terminal_reward_success = 10.0
+        self.terminal_reward_failure = -10.0
 
         self.reset()
 
@@ -669,6 +580,14 @@ class LunarLanderEnv:
         self.last_action = 0
         self._just_terminated_success = None
 
+        self.last_reward_total = 0.0
+        self.last_reward_time = 0.0
+        self.last_reward_distance = 0.0
+        self.last_reward_stability = 0.0
+        self.last_reward_terminal = 0.0
+        self.last_distance_metric = 0.0
+        self.last_stability_metric = 0.0
+
         return self.observation()
 
     def observation(self) -> Observation:
@@ -714,6 +633,13 @@ class LunarLanderEnv:
             "in_landing_pad": in_pad,
             "action": int(self.last_action) & 0b111,
             "terminated": bool(self.frozen),
+            "reward_total": float(self.last_reward_total),
+            "reward_time": float(self.last_reward_time),
+            "reward_distance": float(self.last_reward_distance),
+            "reward_stability": float(self.last_reward_stability),
+            "reward_terminal": float(self.last_reward_terminal),
+            "distance_metric": float(self.last_distance_metric),
+            "stability_metric": float(self.last_stability_metric),
         }
         if self.last_contact is not None:
             payload["last_contact"] = self.last_contact
@@ -725,6 +651,15 @@ class LunarLanderEnv:
         self._just_terminated_success = None
         self.last_action = int(action) & 0b111
 
+        # Default reward breakdown (overwritten below).
+        self.last_reward_total = 0.0
+        self.last_reward_time = 0.0
+        self.last_reward_distance = 0.0
+        self.last_reward_stability = 0.0
+        self.last_reward_terminal = 0.0
+        self.last_distance_metric = 0.0
+        self.last_stability_metric = 0.0
+
         if self.frozen:
             obs = self.observation()
             info = self.info()
@@ -733,47 +668,89 @@ class LunarLanderEnv:
         dt = clamp(float(dt), 0.0, 1.0 / 20.0)
         dt *= self.time_scale
 
-        # Shaping reward is computed *before* the physics update, based on the
-        # current state (s_t). This is common and keeps things simple.
-        reward = 0.0
-        if self.shaping_time_penalty_enabled:
-            reward += self.shaping_time_weight * dt
+        # Shaping reward is computed as:
+        # - time penalty (dense): w_time * dt
+        # - potential-based shaping for distance/stability:
+        #     r = gamma * Phi(s_{t+1}) - Phi(s_t)
+        #   with potentials defined so that moving toward the goal yields +reward.
+        reward_time = 0.0
+        reward_distance = 0.0
+        reward_stability = 0.0
+        distance_metric_curr = 0.0
+        stability_metric_curr = 0.0
+        distance_metric_next = 0.0
+        stability_metric_next = 0.0
 
-        if self.shaping_distance_enabled or self.shaping_stability_enabled:
-            # Pull a few features from the current state.
-            lander = self.lander
-            ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+        if self.shaping_time_penalty_enabled:
+            reward_time = self.shaping_time_weight * dt
+
+        def distance_metric_for(lander: Lander) -> float:
             dx = lander.pos.x - self.landing_pad.cx
             dy = lander.pos.y - (self.landing_pad.y + lander.radius)
+            ndx = abs(dx) / 450.0
+            ndy = abs(dy) / 520.0
+            return clamp(ndx + ndy, 0.0, 4.0)
 
-            if self.shaping_distance_enabled:
-                # Normalize distance roughly to [0, 1] and penalize it.
-                ndx = abs(dx) / 450.0
-                ndy = abs(dy) / 520.0
-                reward += self.shaping_distance_weight * dt * clamp(ndx + ndy, 0.0, 4.0)
+        def stability_metric_for(lander: Lander) -> float:
+            ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
+            nvx = abs(lander.vel.x) / 250.0
+            nvy = abs(lander.vel.y) / 250.0
+            nang = abs(ang) / math.pi
+            nw = abs(lander.ang_vel) / 1.5
+            return clamp(nvx + nvy + nang + nw, 0.0, 6.0)
 
-            if self.shaping_stability_enabled:
-                nvx = abs(lander.vel.x) / 250.0
-                nvy = abs(lander.vel.y) / 250.0
-                nang = abs(ang) / math.pi
-                nw = abs(lander.ang_vel) / 1.5
-                reward += self.shaping_stability_weight * dt * clamp(nvx + nvy + nang + nw, 0.0, 6.0)
+        lander = self.lander
+        if self.shaping_distance_enabled:
+            distance_metric_curr = distance_metric_for(lander)
+        if self.shaping_stability_enabled:
+            stability_metric_curr = stability_metric_for(lander)
 
         was_frozen = self.frozen
         self._step_physics(dt, self.last_action)
 
         terminated = bool(self.frozen)
 
+        # Potential-based shaping uses the post-step state.
+        lander2 = self.lander
+        if self.shaping_distance_enabled:
+            distance_metric_next = distance_metric_for(lander2)
+            phi_curr = -distance_metric_curr
+            phi_next = -distance_metric_next
+            coef = abs(float(self.shaping_distance_weight))
+            reward_distance = coef * (self.shaping_gamma * phi_next - phi_curr)
+
+        if self.shaping_stability_enabled:
+            stability_metric_next = stability_metric_for(lander2)
+            phi_curr = -stability_metric_curr
+            phi_next = -stability_metric_next
+            coef = abs(float(self.shaping_stability_weight))
+            reward_stability = coef * (self.shaping_gamma * phi_next - phi_curr)
+
+        reward = reward_time + reward_distance + reward_stability
+
         terminal_success: bool | None = None
-        # Minimal reward shaping: only terminal events.
+        terminal_reward = 0.0
+        # Terminal reward overrides shaping reward.
         if (not was_frozen) and terminated:
             if self.status_text == "LANDED":
-                reward = 1.0
+                terminal_reward = float(self.terminal_reward_success)
                 terminal_success = True
             else:
-                reward = -1.0
+                terminal_reward = float(self.terminal_reward_failure)
                 terminal_success = False
             self._just_terminated_success = terminal_success
+
+        if terminal_reward != 0.0:
+            reward = terminal_reward
+
+        self.last_reward_total = float(reward)
+        self.last_reward_time = float(reward_time)
+        self.last_reward_distance = float(reward_distance)
+        self.last_reward_stability = float(reward_stability)
+        self.last_reward_terminal = float(terminal_reward)
+        # Expose current (post-step) metrics for UI overlays.
+        self.last_distance_metric = float(distance_metric_next if self.shaping_distance_enabled else 0.0)
+        self.last_stability_metric = float(stability_metric_next if self.shaping_stability_enabled else 0.0)
 
         obs = self.observation()
         info = self.info()
@@ -976,7 +953,7 @@ class LanderWidget(QtWidgets.QWidget):
         self.successful_landings = 0
         self._reward_window_sum = 0.0
         self._reward_window_count = 0
-        self.avg_reward_every_1000: list[float] = []
+        self.avg_reward_every_100: list[float] = []
 
         self._t_last = time.perf_counter()
         self._timer = QtCore.QTimer(self)
@@ -1026,7 +1003,7 @@ class LanderWidget(QtWidgets.QWidget):
         self.successful_landings = 0
         self._reward_window_sum = 0.0
         self._reward_window_count = 0
-        self.avg_reward_every_1000 = []
+        self.avg_reward_every_100 = []
         self._emit_learning_stats(latest_avg=None)
 
     def _emit_learning_stats(self, *, latest_avg: float | None) -> None:
@@ -1035,8 +1012,8 @@ class LanderWidget(QtWidgets.QWidget):
                 "episode": int(self.episode_nr),
                 "steps": int(self.total_learning_steps),
                 "successes": int(self.successful_landings),
-                "latest_avg_reward_1000": latest_avg,
-                "avg_reward_curve": list(self.avg_reward_every_1000),
+                "latest_avg_reward_100": latest_avg,
+                "avg_reward_curve": list(self.avg_reward_every_100),
             }
         )
 
@@ -1303,9 +1280,9 @@ class LanderWidget(QtWidgets.QWidget):
                 self.total_learning_steps += 1
                 self._reward_window_sum += float(reward)
                 self._reward_window_count += 1
-                if self._reward_window_count >= 1000:
+                if self._reward_window_count >= 100:
                     latest_avg = self._reward_window_sum / max(1, self._reward_window_count)
-                    self.avg_reward_every_1000.append(float(latest_avg))
+                    self.avg_reward_every_100.append(float(latest_avg))
                     self._reward_window_sum = 0.0
                     self._reward_window_count = 0
 
@@ -1376,6 +1353,45 @@ class LanderWidget(QtWidgets.QWidget):
         self._draw_stars(painter)
         self._draw_terrain(painter)
         self._draw_lander(painter)
+        self._draw_shaping_overlay(painter)
+
+    def _draw_shaping_overlay(self, painter: QtGui.QPainter) -> None:
+        if not self.rendering_enabled:
+            return
+        if isinstance(self.agent, HumanKeyboardAgent):
+            return
+
+        info = self.env.info()
+        lander = self.env.lander
+        pad = self.env.landing_pad
+
+        p_lander = self._world_to_screen(lander.pos)
+        p_pad = self._world_to_screen(Vec2(pad.cx, pad.y + lander.radius))
+
+        painter.save()
+        pen = QtGui.QPen(QtGui.QColor(255, 255, 255))
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+
+        # Distance shaping: line from lander to pad center.
+        painter.drawLine(p_lander, p_pad)
+        mid = QtCore.QPointF(0.5 * (p_lander.x() + p_pad.x()), 0.5 * (p_lander.y() + p_pad.y()))
+        dist_r = float(info.get("reward_distance", 0.0))
+        dist_m = float(info.get("distance_metric", 0.0))
+        painter.drawText(mid + QtCore.QPointF(6.0, -6.0), f"dist: {dist_r:+.3f} (m={dist_m:.2f})")
+
+        # Stability shaping beside the lander.
+        vx = float(info.get("vel_x", 0.0))
+        vy = float(info.get("vel_y", 0.0))
+        ang_deg = float(info.get("angle_deg", 0.0))
+        stab_r = float(info.get("reward_stability", 0.0))
+        stab_m = float(info.get("stability_metric", 0.0))
+        painter.drawText(
+            p_lander + QtCore.QPointF(18.0, -18.0),
+            f"stab: {stab_r:+.3f} (m={stab_m:.2f}) |v|=({abs(vx):.1f},{abs(vy):.1f}) |a|={abs(ang_deg):.1f}°",
+        )
+
+        painter.restore()
 
     def _draw_stars(self, painter: QtGui.QPainter) -> None:
         painter.save()
@@ -1548,6 +1564,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cmb_controller = QtWidgets.QComboBox()
         self.cmb_controller.addItem("Human (keyboard)")
+        self.cmb_controller.addItem("Random")
         self.cmb_controller.addItem("DQN (learning)")
         self.cmb_controller.currentIndexChanged.connect(self._on_controller_changed)
         left_v.addWidget(self.cmb_controller)
@@ -1638,7 +1655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.txt_learning.setMaximumHeight(95)
         right_v.addWidget(self.txt_learning)
 
-        plot_title = QtWidgets.QLabel("Avg reward / 1000 steps")
+        plot_title = QtWidgets.QLabel("Avg reward / 100 steps")
         plot_title.setStyleSheet("font-weight: 600;")
         right_v.addWidget(plot_title)
 
@@ -1675,11 +1692,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sim.reset_learning_stats()
 
     def _on_controller_changed(self, idx: int) -> None:
-        # 0 = Human, 1 = DQN
+        # 0 = Human, 1 = Random, 2 = DQN
         self.sim.set_running(False)
         self.btn_start.setText("Start")
         if idx == 0:
             self.sim.set_agent(HumanKeyboardAgent())
+            return
+
+        if idx == 1:
+            self.sim.set_agent(RandomAgent(seed=0))
             return
 
         # DQN agent learns online while controlling.
@@ -1731,7 +1752,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ep = int(s.get("episode", 0))
         steps = int(s.get("steps", 0))
         succ = int(s.get("successes", 0))
-        latest = s.get("latest_avg_reward_1000")
+        latest = s.get("latest_avg_reward_100")
 
         lines = [
             f"episode: {ep}",
@@ -1739,7 +1760,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f"successful landings: {succ}",
         ]
         if latest is not None:
-            lines.append(f"avg reward (last 1000): {float(latest):.4f}")
+            lines.append(f"avg reward (last 100): {float(latest):.4f}")
         self.txt_learning.setPlainText("\n".join(lines))
 
         curve = s.get("avg_reward_curve")
@@ -1749,7 +1770,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if curve:
                 xs = list(range(1, len(curve) + 1))
                 self._ax.plot(xs, curve)
-            self._ax.set_xlabel("chunk (1000 steps)")
+            self._ax.set_xlabel("chunk (100 steps)")
             self._ax.set_ylabel("avg reward")
             self._fig.tight_layout()
             self._canvas.draw_idle()
