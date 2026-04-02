@@ -1014,6 +1014,10 @@ class LanderWidget(QtWidgets.QWidget):
         self.running = bool(running)
         if not self.running:
             self._stop_thruster_sounds()
+            # While paused, show thrusters as off.
+            self.key_left = False
+            self.key_right = False
+            self.key_up = False
         self.runningChanged.emit(self.running)
 
     def reset_learning_stats(self) -> None:
@@ -1329,7 +1333,7 @@ class LanderWidget(QtWidgets.QWidget):
                     terminated = False
                     continue
 
-                # Human: stop on terminal and wait for restart.
+                # Human: stop on terminal and wait for Start.
                 self.set_running(False)
                 break
 
@@ -1585,10 +1589,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.clicked.connect(self._on_start_stop)
         left_v.addWidget(self.btn_start)
 
-        self.restart_btn = QtWidgets.QPushButton("Restart")
-        self.restart_btn.clicked.connect(self._on_restart)
-        left_v.addWidget(self.restart_btn)
-
         left_v.addStretch(1)
 
         # --------
@@ -1686,15 +1686,13 @@ class MainWindow(QtWidgets.QMainWindow):
         obs_dim = len(self.sim.env.observation())
         self.sim.set_agent(DQNAgent(obs_dim=obs_dim, seed=0))
 
+        # New learning session for this agent.
+        self.sim.reset_learning_stats()
+
         # Disable UI-heavy stuff by default for learning speed.
         self.chk_render.setChecked(False)
         if self.sim.sound_available():
             self.chk_sound.setChecked(False)
-
-    def _on_restart(self) -> None:
-        self.sim.set_running(False)
-        self.btn_start.setText("Start")
-        self.sim.reset()
 
     def _on_telemetry(self, t: dict) -> None:
         self.lbl_status.setText(f"status: {t['status']}")
@@ -1757,12 +1755,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._canvas.draw_idle()
 
     def _on_start_stop(self) -> None:
-        if not self.sim.running:
-            self.sim.reset()
-            self.sim.reset_learning_stats()
-            self.sim.set_running(True)
-        else:
+        if self.sim.running:
             self.sim.set_running(False)
+            return
+
+        # Starting/resuming.
+        is_human = isinstance(self.sim.agent, HumanKeyboardAgent)
+        if is_human and self.sim.env.frozen:
+            # After crash/landing in human mode, Start begins a fresh episode.
+            self.sim.reset()
+        self.sim.set_running(True)
 
     def _on_running_changed(self, running: bool) -> None:
         self.btn_start.setText("Stop" if running else "Start")
