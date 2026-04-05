@@ -30,6 +30,7 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 026      | DeepEval, notebook shows how to use the deepeval python lib to test LLMs |
 | 027      | Python script, shows how to plan a path from a start to goal cell in a grid world using breadth-first-search |
 | 029      | Python script demo for kd-Trees |
-| 030      | Notebook, compares sensor data fusion using average estimator vs. IVW estimator |
+| 030      | Notebooks, showing different aspects of sensor fusion (IVW, ISM, ML for sensor data fusion) |
 | 031      | Python script, Value Iteration demo (model-based RL algorithm) to estimate how good states are |
+| 032      | Notebook, visualizes that a decision tree for regression approximates a function stepwise |
 | 0xx      |  |
