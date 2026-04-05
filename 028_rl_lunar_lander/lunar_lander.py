@@ -13,12 +13,13 @@ from __future__ import annotations
 import math
 import random
 import sys
+from pathlib import Path
 import tempfile
 import time
 import wave
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Protocol, Tuple
+from typing import Any, List, Protocol, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -296,8 +297,11 @@ class DQNAgent:
 
         self.obs_dim = int(obs_dim)
         self.action_space_n = int(action_space_n)
+        self.hidden_sizes = (int(hidden_sizes[0]), int(hidden_sizes[1]))
+        self.lr = float(lr)
         self.gamma = float(gamma)
         self.batch_size = int(batch_size)
+        self.replay_size = int(replay_size)
         self.warmup_steps = int(warmup_steps)
         self.train_every = int(train_every)
         self.target_update_every = int(target_update_every)
@@ -314,7 +318,7 @@ class DQNAgent:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        h1, h2 = hidden_sizes
+        h1, h2 = self.hidden_sizes
 
         class _MLP(nn.Module):
             def __init__(self, in_dim: int, out_dim: int) -> None:
@@ -333,10 +337,10 @@ class DQNAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
-        self.optim = torch.optim.Adam(self.policy_net.parameters(), lr=float(lr))
+        self.optim = torch.optim.Adam(self.policy_net.parameters(), lr=float(self.lr))
 
         # (s, a, r, s2, done)
-        self.replay: deque[tuple[Observation, int, float, Observation, bool]] = deque(maxlen=int(replay_size))
+        self.replay: deque[tuple[Observation, int, float, Observation, bool]] = deque(maxlen=int(self.replay_size))
         self._step_count = 0
 
         self._prev_obs: Observation | None = None
@@ -433,6 +437,117 @@ class DQNAgent:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optim.step()
 
+    # -----------------
+    # Checkpointing
+    # -----------------
+    # The UI uses these helpers to save/restore a learned agent.
+    # We intentionally keep checkpoints small by default (no replay buffer).
+
+    def get_checkpoint(self, *, include_replay: bool = False) -> dict[str, Any]:
+        if torch is None:
+            raise RuntimeError("PyTorch is required for DQNAgent checkpointing")
+
+        ckpt: dict[str, Any] = {
+            "version": 1,
+            "agent": "DQNAgent",
+            "obs_dim": int(self.obs_dim),
+            "action_space_n": int(self.action_space_n),
+            "hidden_sizes": tuple(int(x) for x in self.hidden_sizes),
+            "lr": float(self.lr),
+            "gamma": float(self.gamma),
+            "batch_size": int(self.batch_size),
+            "replay_size": int(self.replay_size),
+            "warmup_steps": int(self.warmup_steps),
+            "train_every": int(self.train_every),
+            "target_update_every": int(self.target_update_every),
+            "epsilon_start": float(self.epsilon_start),
+            "epsilon_end": float(self.epsilon_end),
+            "epsilon_decay_steps": int(self.epsilon_decay_steps),
+            "step_count": int(self._step_count),
+            "device": str(self.device),
+            "policy_state_dict": self.policy_net.state_dict(),
+            "target_state_dict": self.target_net.state_dict(),
+            "optim_state_dict": self.optim.state_dict(),
+        }
+
+        if include_replay:
+            ckpt["replay"] = list(self.replay)
+
+        return ckpt
+
+    @staticmethod
+    def _validate_checkpoint(ckpt: dict[str, Any]) -> None:
+        if ckpt.get("agent") != "DQNAgent":
+            raise ValueError("Checkpoint is not a DQNAgent")
+        if int(ckpt.get("version", 0)) != 1:
+            raise ValueError("Unsupported checkpoint version")
+
+    def save(self, path: str | Path, *, include_replay: bool = False) -> None:
+        if torch is None:
+            raise RuntimeError("PyTorch is required for DQNAgent checkpointing")
+
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.get_checkpoint(include_replay=include_replay), str(p))
+
+    @classmethod
+    def from_checkpoint(cls, ckpt: dict[str, Any], *, device: str | None = None) -> "DQNAgent":
+        if torch is None:
+            raise RuntimeError("PyTorch is required for DQNAgent checkpointing")
+
+        cls._validate_checkpoint(ckpt)
+
+        if device is None:
+            # Prefer checkpoint's saved device, but fall back to auto.
+            device = ckpt.get("device")
+
+        agent = cls(
+            obs_dim=int(ckpt["obs_dim"]),
+            action_space_n=int(ckpt["action_space_n"]),
+            hidden_sizes=tuple(ckpt["hidden_sizes"]),
+            lr=float(ckpt["lr"]),
+            gamma=float(ckpt["gamma"]),
+            batch_size=int(ckpt["batch_size"]),
+            replay_size=int(ckpt.get("replay_size", 50_000)),
+            warmup_steps=int(ckpt.get("warmup_steps", 2_000)),
+            train_every=int(ckpt.get("train_every", 1)),
+            target_update_every=int(ckpt.get("target_update_every", 1_000)),
+            epsilon_start=float(ckpt.get("epsilon_start", 1.0)),
+            epsilon_end=float(ckpt.get("epsilon_end", 0.05)),
+            epsilon_decay_steps=int(ckpt.get("epsilon_decay_steps", 50_000)),
+            seed=None,
+            device=device,
+        )
+
+        agent.policy_net.load_state_dict(ckpt["policy_state_dict"])
+        agent.target_net.load_state_dict(ckpt.get("target_state_dict", ckpt["policy_state_dict"]))
+        agent.optim.load_state_dict(ckpt["optim_state_dict"])
+        agent._step_count = int(ckpt.get("step_count", 0))
+
+        replay = ckpt.get("replay")
+        if isinstance(replay, list):
+            agent.replay.clear()
+            for item in replay:
+                if isinstance(item, tuple) and len(item) == 5:
+                    agent.replay.append(item)  # type: ignore[arg-type]
+
+        # Ensure everything is on the agent device.
+        agent.policy_net.to(agent.device)
+        agent.target_net.to(agent.device)
+        agent.target_net.eval()
+
+        return agent
+
+    @classmethod
+    def load(cls, path: str | Path, *, device: str | None = None) -> "DQNAgent":
+        if torch is None:
+            raise RuntimeError("PyTorch is required for DQNAgent checkpointing")
+
+        ckpt = torch.load(str(path), map_location="cpu")
+        if not isinstance(ckpt, dict):
+            raise ValueError("Invalid checkpoint format")
+        return cls.from_checkpoint(ckpt, device=device)
+
 
 class LunarLanderEnv:
     """Minimal lunar lander environment.
@@ -479,7 +594,7 @@ class LunarLanderEnv:
         self.max_main_burn = 1.0
         self.max_side_burn = 1.0
 
-        self.success_max_abs_vy = 60.0
+        self.success_max_abs_vy = 70.0
         self.success_max_abs_vx = 60.0
         self.success_max_abs_angle = math.radians(15.0)
 
@@ -1006,6 +1121,53 @@ class LanderWidget(QtWidgets.QWidget):
         self.avg_reward_every_100 = []
         self._emit_learning_stats(latest_avg=None)
 
+    def get_learning_state(self) -> dict[str, Any]:
+        return {
+            "episode_nr": int(self.episode_nr),
+            "total_learning_steps": int(self.total_learning_steps),
+            "successful_landings": int(self.successful_landings),
+            "reward_window_sum": float(self._reward_window_sum),
+            "reward_window_count": int(self._reward_window_count),
+            "avg_reward_every_100": list(self.avg_reward_every_100),
+            "last_ui_emit_learning_step": int(self._last_ui_emit_learning_step),
+        }
+
+    def set_learning_state(self, state: dict[str, Any]) -> None:
+        def geti(key: str, default: int) -> int:
+            try:
+                return int(state.get(key, default))
+            except Exception:
+                return int(default)
+
+        def getf(key: str, default: float) -> float:
+            try:
+                return float(state.get(key, default))
+            except Exception:
+                return float(default)
+
+        self.episode_nr = max(0, geti("episode_nr", 0))
+        self.total_learning_steps = max(0, geti("total_learning_steps", 0))
+        self.successful_landings = max(0, geti("successful_landings", 0))
+        self._reward_window_sum = getf("reward_window_sum", 0.0)
+        self._reward_window_count = max(0, geti("reward_window_count", 0))
+
+        curve = state.get("avg_reward_every_100")
+        if isinstance(curve, list):
+            out: list[float] = []
+            for x in curve:
+                try:
+                    out.append(float(x))
+                except Exception:
+                    continue
+            self.avg_reward_every_100 = out
+        else:
+            self.avg_reward_every_100 = []
+
+        self._last_ui_emit_learning_step = max(0, geti("last_ui_emit_learning_step", 0))
+
+        latest_avg = self.avg_reward_every_100[-1] if self.avg_reward_every_100 else None
+        self._emit_learning_stats(latest_avg=latest_avg)
+
     def _emit_learning_stats(self, *, latest_avg: float | None) -> None:
         self.learningStatsUpdated.emit(
             {
@@ -1345,15 +1507,19 @@ class LanderWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         _ = event
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter = QtGui.QPainter()
+        painter.begin(self)
+        try:
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
-        painter.fillRect(self.rect(), QtGui.QColor(10, 10, 14))
+            painter.fillRect(self.rect(), QtGui.QColor(10, 10, 14))
 
-        self._draw_stars(painter)
-        self._draw_terrain(painter)
-        self._draw_lander(painter)
-        self._draw_shaping_overlay(painter)
+            self._draw_stars(painter)
+            self._draw_terrain(painter)
+            self._draw_lander(painter)
+            self._draw_shaping_overlay(painter)
+        finally:
+            painter.end()
 
     def _draw_shaping_overlay(self, painter: QtGui.QPainter) -> None:
         if not self.rendering_enabled:
@@ -1569,6 +1735,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_controller.currentIndexChanged.connect(self._on_controller_changed)
         left_v.addWidget(self.cmb_controller)
 
+        dqn_buttons = QtWidgets.QWidget()
+        dqn_h = QtWidgets.QHBoxLayout(dqn_buttons)
+        dqn_h.setContentsMargins(0, 0, 0, 0)
+        dqn_h.setSpacing(8)
+
+        self.btn_save_agent = QtWidgets.QPushButton("Save DQN")
+        self.btn_save_agent.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_save_agent.setFixedHeight(26)
+        self.btn_save_agent.clicked.connect(self._on_save_dqn)
+
+        self.btn_load_agent = QtWidgets.QPushButton("Load DQN")
+        self.btn_load_agent.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_load_agent.setFixedHeight(26)
+        self.btn_load_agent.clicked.connect(self._on_load_dqn)
+
+        dqn_h.addWidget(self.btn_save_agent, 1)
+        dqn_h.addWidget(self.btn_load_agent, 1)
+        left_v.addWidget(dqn_buttons)
+
         left_v.addSpacing(6)
         shaping_title = QtWidgets.QLabel("Reward shaping")
         shaping_title.setStyleSheet("font-weight: 600;")
@@ -1603,6 +1788,8 @@ class MainWindow(QtWidgets.QMainWindow):
         left_v.addWidget(self.chk_render)
 
         self.btn_start = QtWidgets.QPushButton("Start")
+        # Don't steal keyboard focus from the simulation widget.
+        self.btn_start.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.btn_start.clicked.connect(self._on_start_stop)
         left_v.addWidget(self.btn_start)
 
@@ -1691,21 +1878,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sim.set_running(False)
         self.sim.reset_learning_stats()
 
+        self._update_agent_io_buttons()
+
+    def _update_agent_io_buttons(self) -> None:
+        is_dqn_active = isinstance(self.sim.agent, DQNAgent)
+        torch_available = torch is not None
+        self.btn_save_agent.setEnabled(torch_available and is_dqn_active)
+        self.btn_load_agent.setEnabled(torch_available)
+        if not torch_available:
+            tip = "PyTorch not available; DQN save/load disabled"
+            self.btn_save_agent.setToolTip(tip)
+            self.btn_load_agent.setToolTip(tip)
+        else:
+            self.btn_save_agent.setToolTip("Save the current DQN agent checkpoint")
+            self.btn_load_agent.setToolTip("Load a previously saved DQN agent checkpoint")
+
     def _on_controller_changed(self, idx: int) -> None:
         # 0 = Human, 1 = Random, 2 = DQN
         self.sim.set_running(False)
         self.btn_start.setText("Start")
         if idx == 0:
             self.sim.set_agent(HumanKeyboardAgent())
+            self._update_agent_io_buttons()
             return
 
         if idx == 1:
             self.sim.set_agent(RandomAgent(seed=0))
+            self._update_agent_io_buttons()
             return
 
         # DQN agent learns online while controlling.
         obs_dim = len(self.sim.env.observation())
         self.sim.set_agent(DQNAgent(obs_dim=obs_dim, seed=0))
+
+        self._update_agent_io_buttons()
 
         # New learning session for this agent.
         self.sim.reset_learning_stats()
@@ -1714,6 +1920,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_render.setChecked(False)
         if self.sim.sound_available():
             self.chk_sound.setChecked(False)
+
+    def _on_save_dqn(self) -> None:
+        if not isinstance(self.sim.agent, DQNAgent):
+            QtWidgets.QMessageBox.information(self, "Save DQN", "Switch the controller to 'DQN (learning)' first.")
+            self._update_agent_io_buttons()
+            return
+
+        default_name = "dqn_lunar_lander.pt"
+        path, _flt = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save DQN agent",
+            str(Path.home() / default_name),
+            "PyTorch checkpoint (*.pt *.pth);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            # Store both agent weights and the UI learning stats so a specific
+            # checkpoint restores the plotted curve and counters.
+            ckpt = self.sim.agent.get_checkpoint(include_replay=False)
+            ckpt["ui_learning_state"] = self.sim.get_learning_state()
+            torch.save(ckpt, path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save DQN", f"Failed to save checkpoint:\n{e}")
+            return
+
+        QtWidgets.QMessageBox.information(self, "Save DQN", f"Saved checkpoint to:\n{path}")
+
+    def _on_load_dqn(self) -> None:
+        path, _flt = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load DQN agent",
+            str(Path.home()),
+            "PyTorch checkpoint (*.pt *.pth);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+            if not isinstance(ckpt, dict):
+                raise ValueError("Invalid checkpoint format")
+            agent = DQNAgent.from_checkpoint(ckpt)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load DQN", f"Failed to load checkpoint:\n{e}")
+            return
+
+        # Activate DQN controller without overwriting the loaded agent.
+        self.sim.set_running(False)
+        self.btn_start.setText("Start")
+        self.cmb_controller.blockSignals(True)
+        self.cmb_controller.setCurrentIndex(2)
+        self.cmb_controller.blockSignals(False)
+
+        self.sim.set_agent(agent)
+        st = ckpt.get("ui_learning_state") if isinstance(ckpt, dict) else None
+        if isinstance(st, dict):
+            self.sim.set_learning_state(st)
+        else:
+            self.sim.reset_learning_stats()
+        self._update_agent_io_buttons()
+
+        QtWidgets.QMessageBox.information(self, "Load DQN", f"Loaded DQN checkpoint from:\n{path}")
 
     def _on_telemetry(self, t: dict) -> None:
         self.lbl_status.setText(f"status: {t['status']}")
@@ -1786,6 +2056,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # After crash/landing in human mode, Start begins a fresh episode.
             self.sim.reset()
         self.sim.set_running(True)
+        if is_human:
+            # Ensure cursor keys work immediately (Start button would otherwise keep focus).
+            self.sim.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def _on_running_changed(self, running: bool) -> None:
         self.btn_start.setText("Stop" if running else "Start")
