@@ -762,7 +762,7 @@ class LunarLanderEnv:
             payload["terminal_success"] = bool(self._just_terminated_success)
         return payload
 
-    def step(self, action: int, dt: float) -> tuple[Observation, float, bool, dict]:
+    def step(self, action: int, dt: float, *, include_info: bool = True) -> tuple[Observation, float, bool, dict]:
         self._just_terminated_success = None
         self.last_action = int(action) & 0b111
 
@@ -777,7 +777,7 @@ class LunarLanderEnv:
 
         if self.frozen:
             obs = self.observation()
-            info = self.info()
+            info = self.info() if include_info else {}
             return obs, 0.0, True, info
 
         dt = clamp(float(dt), 0.0, 1.0 / 20.0)
@@ -868,9 +868,12 @@ class LunarLanderEnv:
         self.last_stability_metric = float(stability_metric_next if self.shaping_stability_enabled else 0.0)
 
         obs = self.observation()
-        info = self.info()
-        if terminal_success is not None:
-            info["terminal_success"] = terminal_success
+        if include_info:
+            info = self.info()
+            if terminal_success is not None:
+                info["terminal_success"] = terminal_success
+        else:
+            info = {}
 
         return obs, reward, terminated, info
 
@@ -1427,15 +1430,21 @@ class LanderWidget(QtWidgets.QWidget):
         info_last: dict | None = None
         terminated = False
         latest_avg: float | None = None
+        # In headless learning mode, avoid constructing large info dicts every step.
+        fast_learning = learning_mode and (not self.rendering_enabled)
         for _i in range(steps):
             obs = self.env.observation()
-            action = int(self.agent.take_action(obs, self.env.info()))
+            info_for_action = {} if fast_learning else self.env.info()
+            action = int(self.agent.take_action(obs, info_for_action))
             # Update GUI-visible thruster state from the agent action.
             self.key_up = bool(action & ACTION_MAIN)
             self.key_left = bool(action & ACTION_LEFT)
             self.key_right = bool(action & ACTION_RIGHT)
 
-            obs2, reward, terminated, info_last = self.env.step(action, dt_step)
+            obs2, reward, terminated, info_last = self.env.step(action, dt_step, include_info=not fast_learning)
+            if fast_learning:
+                # Avoid carrying around empty dicts; build info only when emitting UI.
+                info_last = None
             self.status_text = self.env.status_text
 
             if learning_mode:
@@ -1450,14 +1459,14 @@ class LanderWidget(QtWidgets.QWidget):
 
             if hasattr(self.agent, "observe"):
                 try:
-                    getattr(self.agent, "observe")(reward, terminated, obs2, info_last)
+                    getattr(self.agent, "observe")(reward, terminated, obs2, (info_last or {}))
                 except Exception:
                     pass
 
             if terminated:
                 if learning_mode:
                     self.episode_nr += 1
-                    if info_last.get("terminal_success") is True:
+                    if self.env.status_text == "LANDED":
                         self.successful_landings += 1
 
                     # Auto-reset for learning so we get many episodes.
@@ -1482,14 +1491,17 @@ class LanderWidget(QtWidgets.QWidget):
         else:
             self._stop_thruster_sounds()
 
-        if info_last is None:
+        # Only build telemetry dict when it will actually be used.
+        if info_last is None and (self.rendering_enabled or (not fast_learning)):
             info_last = self.env.info()
 
         # Play landing/collision sound on the transition to terminal state.
-        if info_last.get("terminal_success") is True:
-            self._play_landing_sound(True)
-        elif info_last.get("terminal_success") is False:
-            self._play_landing_sound(False)
+        # In fast headless learning mode, info_last may be None by design.
+        if isinstance(info_last, dict):
+            if info_last.get("terminal_success") is True:
+                self._play_landing_sound(True)
+            elif info_last.get("terminal_success") is False:
+                self._play_landing_sound(False)
 
         emit_ui = True
         if learning_mode and (not self.rendering_enabled):
@@ -1499,6 +1511,8 @@ class LanderWidget(QtWidgets.QWidget):
                 self._last_ui_emit_learning_step = self.total_learning_steps
 
         if emit_ui:
+            if info_last is None:
+                info_last = self.env.info()
             self.telemetryUpdated.emit(info_last)
             self._emit_learning_stats(latest_avg=latest_avg)
 
@@ -1986,6 +2000,10 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Load DQN", f"Loaded DQN checkpoint from:\n{path}")
 
     def _on_telemetry(self, t: dict) -> None:
+        # Defensive: during headless learning we may intentionally skip info creation
+        # for most steps; ensure we always render a full info dict.
+        if "status" not in t:
+            t = self.sim.env.info()
         self.lbl_status.setText(f"status: {t['status']}")
         self.lbl_pos.setText(f"pos: ({t['pos_x']:.1f}, {t['pos_y']:.1f})")
         self.lbl_vel.setText(f"vel: ({t['vel_x']:.1f}, {t['vel_y']:.1f})")
