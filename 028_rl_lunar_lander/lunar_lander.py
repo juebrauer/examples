@@ -614,49 +614,39 @@ class LunarLanderEnv:
         self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
+        self.last_reward_tube = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
 
         # -----------------
-        # Reward shaping
+        # Rewards (simplified for teaching)
         # -----------------
-        # Terminal reward is always applied:
-        #   +1 for LANDED, -1 for CRASHED
-        # Optional shaping rewards can be toggled independently.
-        self.shaping_time_penalty_enabled = True
-        self.shaping_distance_enabled = True
-        self.shaping_stability_enabled = True
+        # - Only terminal success yields a positive reward.
+        # - Crash yields 0 (no negative terminal reward).
+        # Optional shaping: a small positive reward when the lander is inside a
+        # vertical "tube" above the landing pad (x between pad edges).
+        self.tube_shaping_enabled = False
+        # Potential-based shaping parameters (kept in sync with the agent discount).
+        # We clamp to non-negative so shaping never introduces negative rewards.
+        self.tube_shaping_gamma = 0.995
+        self.tube_shaping_weight = 0.25
 
-        # Weights are multiplied by dt, so they are roughly time-consistent.
-        self.shaping_time_weight = -0.05
-        # Potential-based shaping uses the absolute value of these coefficients.
-        # (Sign is ignored; potentials are defined so that progress yields +reward.)
-        self.shaping_distance_weight = -0.20
-        self.shaping_stability_weight = -0.15
+        # Optional potential-based distance shaping to the pad center.
+        self.distance_shaping_enabled = False
+        self.distance_shaping_gamma = 0.995
+        self.distance_shaping_weight = 0.35
 
-        # Potential-based shaping discount. Keep in sync with the agent discount.
-        self.shaping_gamma = 0.995
-
-        # Terminal reward magnitude (large to accelerate learning).
-        self.terminal_reward_success = 10.0
-        self.terminal_reward_failure = -10.0
+        # Terminal reward magnitude.
+        self.terminal_reward_success = 5.0
 
         self.reset()
 
-    def set_reward_shaping(
-        self,
-        *,
-        time_penalty: bool | None = None,
-        distance: bool | None = None,
-        stability: bool | None = None,
-    ) -> None:
-        if time_penalty is not None:
-            self.shaping_time_penalty_enabled = bool(time_penalty)
-        if distance is not None:
-            self.shaping_distance_enabled = bool(distance)
-        if stability is not None:
-            self.shaping_stability_enabled = bool(stability)
+    def set_tube_shaping(self, enabled: bool) -> None:
+        self.tube_shaping_enabled = bool(enabled)
+
+    def set_distance_shaping(self, enabled: bool) -> None:
+        self.distance_shaping_enabled = bool(enabled)
 
     def reset(self, *, seed: int | None = None) -> Observation:
         rng = random.Random(seed)
@@ -699,6 +689,7 @@ class LunarLanderEnv:
         self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
+        self.last_reward_tube = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -752,9 +743,13 @@ class LunarLanderEnv:
             "reward_time": float(self.last_reward_time),
             "reward_distance": float(self.last_reward_distance),
             "reward_stability": float(self.last_reward_stability),
+            "reward_tube": float(self.last_reward_tube),
             "reward_terminal": float(self.last_reward_terminal),
             "distance_metric": float(self.last_distance_metric),
             "stability_metric": float(self.last_stability_metric),
+            "tube_shaping_enabled": bool(self.tube_shaping_enabled),
+            "distance_shaping_enabled": bool(self.distance_shaping_enabled),
+            "in_reward_tube": bool(self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1),
         }
         if self.last_contact is not None:
             payload["last_contact"] = self.last_contact
@@ -771,6 +766,7 @@ class LunarLanderEnv:
         self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
+        self.last_reward_tube = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -783,89 +779,83 @@ class LunarLanderEnv:
         dt = clamp(float(dt), 0.0, 1.0 / 20.0)
         dt *= self.time_scale
 
-        # Shaping reward is computed as:
-        # - time penalty (dense): w_time * dt
-        # - potential-based shaping for distance/stability:
-        #     r = gamma * Phi(s_{t+1}) - Phi(s_t)
-        #   with potentials defined so that moving toward the goal yields +reward.
         reward_time = 0.0
         reward_distance = 0.0
         reward_stability = 0.0
-        distance_metric_curr = 0.0
-        stability_metric_curr = 0.0
-        distance_metric_next = 0.0
-        stability_metric_next = 0.0
+        reward_tube = 0.0
 
-        if self.shaping_time_penalty_enabled:
-            reward_time = self.shaping_time_weight * dt
+        tube_phi_curr = 0.0
+        if self.tube_shaping_enabled:
+            lander0 = self.lander
+            in_tube0 = self.landing_pad.x0 <= lander0.pos.x <= self.landing_pad.x1
+            # Simple alignment potential: 1 inside tube, 0 outside.
+            tube_phi_curr = 1.0 if in_tube0 else 0.0
 
-        def distance_metric_for(lander: Lander) -> float:
-            dx = lander.pos.x - self.landing_pad.cx
-            dy = lander.pos.y - (self.landing_pad.y + lander.radius)
-            ndx = abs(dx) / 450.0
-            ndy = abs(dy) / 520.0
-            return clamp(ndx + ndy, 0.0, 4.0)
-
-        def stability_metric_for(lander: Lander) -> float:
-            ang = ((lander.angle + math.pi) % (2.0 * math.pi)) - math.pi
-            nvx = abs(lander.vel.x) / 250.0
-            nvy = abs(lander.vel.y) / 250.0
-            nang = abs(ang) / math.pi
-            nw = abs(lander.ang_vel) / 1.5
-            return clamp(nvx + nvy + nang + nw, 0.0, 6.0)
-
-        lander = self.lander
-        if self.shaping_distance_enabled:
-            distance_metric_curr = distance_metric_for(lander)
-        if self.shaping_stability_enabled:
-            stability_metric_curr = stability_metric_for(lander)
+        dist_phi_curr = 0.0
+        if self.distance_shaping_enabled:
+            lander0 = self.lander
+            pad = self.landing_pad
+            # Distance to pad center point (on pad surface).
+            dx0 = lander0.pos.x - pad.cx
+            dy0 = lander0.pos.y - (pad.y + lander0.radius)
+            d0 = math.hypot(dx0, dy0)
+            d0n = clamp(d0 / max(1.0, max(self.world_w, self.world_h)), 0.0, 2.0)
+            dist_phi_curr = -d0n
 
         was_frozen = self.frozen
         self._step_physics(dt, self.last_action)
 
         terminated = bool(self.frozen)
 
-        # Potential-based shaping uses the post-step state.
-        lander2 = self.lander
-        if self.shaping_distance_enabled:
-            distance_metric_next = distance_metric_for(lander2)
-            phi_curr = -distance_metric_curr
-            phi_next = -distance_metric_next
-            coef = abs(float(self.shaping_distance_weight))
-            reward_distance = coef * (self.shaping_gamma * phi_next - phi_curr)
+        # Optional (clipped) potential-based shaping inside the landing tube.
+        # r = max(0, w * (gamma * Phi(s') - Phi(s)))
+        if (not terminated) and self.tube_shaping_enabled:
+            lander1 = self.lander
+            in_tube1 = self.landing_pad.x0 <= lander1.pos.x <= self.landing_pad.x1
+            tube_phi_next = 1.0 if in_tube1 else 0.0
+            delta = float(self.tube_shaping_gamma) * tube_phi_next - tube_phi_curr
+            reward_tube = max(0.0, float(self.tube_shaping_weight) * float(delta))
 
-        if self.shaping_stability_enabled:
-            stability_metric_next = stability_metric_for(lander2)
-            phi_curr = -stability_metric_curr
-            phi_next = -stability_metric_next
-            coef = abs(float(self.shaping_stability_weight))
-            reward_stability = coef * (self.shaping_gamma * phi_next - phi_curr)
+        # Optional (clipped) potential-based distance shaping.
+        # Phi(s) = -normalized_distance_to_pad_center
+        # r = max(0, w * (gamma * Phi(s') - Phi(s)))
+        if (not terminated) and self.distance_shaping_enabled:
+            lander1 = self.lander
+            pad = self.landing_pad
+            dx1 = lander1.pos.x - pad.cx
+            dy1 = lander1.pos.y - (pad.y + lander1.radius)
+            d1 = math.hypot(dx1, dy1)
+            d1n = clamp(d1 / max(1.0, max(self.world_w, self.world_h)), 0.0, 2.0)
+            dist_phi_next = -d1n
+            delta = float(self.distance_shaping_gamma) * dist_phi_next - dist_phi_curr
+            reward_distance = max(0.0, float(self.distance_shaping_weight) * float(delta))
 
-        reward = reward_time + reward_distance + reward_stability
+        reward = reward_time + reward_distance + reward_stability + reward_tube
 
         terminal_success: bool | None = None
         terminal_reward = 0.0
-        # Terminal reward overrides shaping reward.
+        # Terminal reward: +5 if LANDED, otherwise 0 (no crash penalty).
         if (not was_frozen) and terminated:
             if self.status_text == "LANDED":
                 terminal_reward = float(self.terminal_reward_success)
                 terminal_success = True
             else:
-                terminal_reward = float(self.terminal_reward_failure)
+                terminal_reward = 0.0
                 terminal_success = False
             self._just_terminated_success = terminal_success
 
-        if terminal_reward != 0.0:
+            # Terminal reward overrides shaping reward.
             reward = terminal_reward
 
         self.last_reward_total = float(reward)
         self.last_reward_time = float(reward_time)
         self.last_reward_distance = float(reward_distance)
         self.last_reward_stability = float(reward_stability)
+        self.last_reward_tube = float(reward_tube)
         self.last_reward_terminal = float(terminal_reward)
         # Expose current (post-step) metrics for UI overlays.
-        self.last_distance_metric = float(distance_metric_next if self.shaping_distance_enabled else 0.0)
-        self.last_stability_metric = float(stability_metric_next if self.shaping_stability_enabled else 0.0)
+        self.last_distance_metric = 0.0
+        self.last_stability_metric = 0.0
 
         obs = self.observation()
         if include_info:
@@ -1541,35 +1531,58 @@ class LanderWidget(QtWidgets.QWidget):
         if isinstance(self.agent, HumanKeyboardAgent):
             return
 
+        if not (self.env.tube_shaping_enabled or self.env.distance_shaping_enabled):
+            return
+
         info = self.env.info()
         lander = self.env.lander
         pad = self.env.landing_pad
-
         p_lander = self._world_to_screen(lander.pos)
-        p_pad = self._world_to_screen(Vec2(pad.cx, pad.y + lander.radius))
+        p_pad_center = self._world_to_screen(Vec2(pad.cx, pad.y + lander.radius))
 
         painter.save()
-        pen = QtGui.QPen(QtGui.QColor(255, 255, 255))
-        pen.setWidthF(1.0)
-        painter.setPen(pen)
 
-        # Distance shaping: line from lander to pad center.
-        painter.drawLine(p_lander, p_pad)
-        mid = QtCore.QPointF(0.5 * (p_lander.x() + p_pad.x()), 0.5 * (p_lander.y() + p_pad.y()))
-        dist_r = float(info.get("reward_distance", 0.0))
-        dist_m = float(info.get("distance_metric", 0.0))
-        painter.drawText(mid + QtCore.QPointF(6.0, -6.0), f"dist: {dist_r:+.3f} (m={dist_m:.2f})")
+        # Landing tube visualization.
+        if self.env.tube_shaping_enabled:
+            top_y_world = self._screen_to_world_y(0.0)
+            y0_screen = self.height() - top_y_world
+            y1_screen = self.height() - pad.y
+            tube_rect = QtCore.QRectF(pad.x0, y0_screen, pad.x1 - pad.x0, y1_screen - y0_screen)
 
-        # Stability shaping beside the lander.
-        vx = float(info.get("vel_x", 0.0))
-        vy = float(info.get("vel_y", 0.0))
-        ang_deg = float(info.get("angle_deg", 0.0))
-        stab_r = float(info.get("reward_stability", 0.0))
-        stab_m = float(info.get("stability_metric", 0.0))
-        painter.drawText(
-            p_lander + QtCore.QPointF(18.0, -18.0),
-            f"stab: {stab_r:+.3f} (m={stab_m:.2f}) |v|=({abs(vx):.1f},{abs(vy):.1f}) |a|={abs(ang_deg):.1f}°",
-        )
+            fill = QtGui.QColor(240, 220, 60, 40)
+            outline = QtGui.QColor(240, 220, 60, 160)
+            painter.setPen(QtGui.QPen(outline, 2))
+            painter.setBrush(fill)
+            painter.drawRect(tube_rect)
+
+            painter.setPen(QtGui.QPen(QtGui.QColor(240, 240, 245), 1))
+            p_text = QtCore.QPointF(pad.x0 + 6.0, y0_screen + 18.0)
+            painter.drawText(p_text, "landing tube")
+
+            in_tube = pad.x0 <= lander.pos.x <= pad.x1
+            if in_tube:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 200), 2))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                painter.drawRect(tube_rect.adjusted(2, 2, -2, -2))
+
+        # Distance-to-pad visualization and reward label.
+        if self.env.distance_shaping_enabled:
+            pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 200))
+            pen.setWidthF(1.5)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawLine(p_lander, p_pad_center)
+
+            mid = QtCore.QPointF(0.5 * (p_lander.x() + p_pad_center.x()), 0.5 * (p_lander.y() + p_pad_center.y()))
+            r_dist = float(info.get("reward_distance", 0.0))
+            painter.setPen(QtGui.QPen(QtGui.QColor(240, 240, 245), 1))
+            painter.drawText(mid + QtCore.QPointF(6.0, -6.0), f"dist r: {r_dist:+.4f}")
+
+        # When inside the tube, also show the tube shaping reward.
+        if self.env.tube_shaping_enabled and (pad.x0 <= lander.pos.x <= pad.x1):
+            r_tube = float(info.get("reward_tube", 0.0))
+            painter.setPen(QtGui.QPen(QtGui.QColor(240, 220, 60), 1))
+            painter.drawText(p_lander + QtCore.QPointF(18.0, -22.0), f"tube r: {r_tube:+.4f}")
 
         painter.restore()
 
@@ -1773,17 +1786,19 @@ class MainWindow(QtWidgets.QMainWindow):
         shaping_title.setStyleSheet("font-weight: 600;")
         left_v.addWidget(shaping_title)
 
-        self.chk_shape_time = QtWidgets.QCheckBox("Time penalty")
-        self.chk_shape_dist = QtWidgets.QCheckBox("Distance to pad")
-        self.chk_shape_stab = QtWidgets.QCheckBox("Stability (vel/angle)")
+        self.chk_shape_tube = QtWidgets.QCheckBox("Landing tube")
+        self.chk_shape_tube.setToolTip(
+            "Potential-based shaping: small positive reward for progress downward while within the pad's left/right edges"
+        )
+        self.chk_shape_tube.toggled.connect(self.sim.env.set_tube_shaping)
+        left_v.addWidget(self.chk_shape_tube)
 
-        self.chk_shape_time.toggled.connect(lambda on: self.sim.env.set_reward_shaping(time_penalty=on))
-        self.chk_shape_dist.toggled.connect(lambda on: self.sim.env.set_reward_shaping(distance=on))
-        self.chk_shape_stab.toggled.connect(lambda on: self.sim.env.set_reward_shaping(stability=on))
-
-        left_v.addWidget(self.chk_shape_time)
-        left_v.addWidget(self.chk_shape_dist)
-        left_v.addWidget(self.chk_shape_stab)
+        self.chk_shape_distance = QtWidgets.QCheckBox("Distance reward")
+        self.chk_shape_distance.setToolTip(
+            "Potential-based shaping: small positive reward when reducing distance to the pad center"
+        )
+        self.chk_shape_distance.toggled.connect(self.sim.env.set_distance_shaping)
+        left_v.addWidget(self.chk_shape_distance)
 
         self.chk_sound = QtWidgets.QCheckBox("Sound")
         if not self.sim.sound_available():
@@ -1883,10 +1898,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sim.learningStatsUpdated.connect(self._on_learning_stats)
         self.sim.runningChanged.connect(self._on_running_changed)
 
-        # Shaping rewards enabled by default.
-        self.chk_shape_time.setChecked(True)
-        self.chk_shape_dist.setChecked(True)
-        self.chk_shape_stab.setChecked(True)
+        # Tube shaping off by default.
+        self.chk_shape_tube.setChecked(False)
+        self.chk_shape_distance.setChecked(False)
 
         # No automatic start.
         self.sim.set_running(False)
