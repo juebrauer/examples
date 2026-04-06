@@ -611,11 +611,9 @@ class LunarLanderEnv:
 
         # Latest reward breakdown for visualization/debugging.
         self.last_reward_total = 0.0
-        self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
-        self.last_reward_proximity = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -631,16 +629,12 @@ class LunarLanderEnv:
         # +1 if the lander reduced its distance to the pad center this step.
         self.distance_shaping_enabled = False
 
-        # +1 if the lander is NOT close to the terrain while NOT over the landing pad.
-        # (This discourages early descent onto uneven terrain.)
-        self.proximity_reward_enabled = False
-        self.proximity_reward_height = 90.0
-
         # +1 if the lander is in a "stable" configuration (slow + level + not ascending).
         self.stability_shaping_enabled = False
 
         # Terminal reward magnitude.
         self.terminal_reward_success = 100.0
+        self.terminal_reward_crash = -50.0
 
         self.reset()
 
@@ -652,9 +646,6 @@ class LunarLanderEnv:
 
     def set_stability_shaping(self, enabled: bool) -> None:
         self.stability_shaping_enabled = bool(enabled)
-
-    def set_proximity_reward(self, enabled: bool) -> None:
-        self.proximity_reward_enabled = bool(enabled)
 
     def _is_stable_state(self) -> bool:
         """Return True when the lander is slow + level (and not ascending).
@@ -716,11 +707,9 @@ class LunarLanderEnv:
         self._just_terminated_success = None
 
         self.last_reward_total = 0.0
-        self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
-        self.last_reward_proximity = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -773,20 +762,15 @@ class LunarLanderEnv:
             "action": int(self.last_action) & 0b111,
             "terminated": bool(self.frozen),
             "reward_total": float(self.last_reward_total),
-            "reward_time": float(self.last_reward_time),
             "reward_distance": float(self.last_reward_distance),
             "reward_stability": float(self.last_reward_stability),
             "reward_tube": float(self.last_reward_tube),
-            "reward_proximity": float(self.last_reward_proximity),
             "reward_terminal": float(self.last_reward_terminal),
             "distance_metric": float(self.last_distance_metric),
             "stability_metric": float(self.last_stability_metric),
             "tube_shaping_enabled": bool(self.tube_shaping_enabled),
             "distance_shaping_enabled": bool(self.distance_shaping_enabled),
             "stability_shaping_enabled": bool(self.stability_shaping_enabled),
-            # Backward-compatible key (older UI / saved logs).
-            "proximity_penalty_enabled": bool(self.proximity_reward_enabled),
-            "proximity_reward_enabled": bool(self.proximity_reward_enabled),
             "in_reward_tube": bool(self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1),
             "stable_state": bool(stable_state),
             "stable_for_landing": bool(stable_for_landing),
@@ -803,11 +787,9 @@ class LunarLanderEnv:
 
         # Default reward breakdown (overwritten below).
         self.last_reward_total = 0.0
-        self.last_reward_time = 0.0
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
-        self.last_reward_proximity = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -820,11 +802,9 @@ class LunarLanderEnv:
         dt = clamp(float(dt), 0.0, 1.0 / 20.0)
         dt *= self.time_scale
 
-        reward_time = 0.0
         reward_distance = 0.0
         reward_stability = 0.0
         reward_tube = 0.0
-        reward_proximity = 0.0
 
         distance_metric = 0.0
         stability_metric = 0.0
@@ -866,27 +846,17 @@ class LunarLanderEnv:
             stability_metric = 1.0 if stable else 0.0
             reward_stability = 1.0 if stable else 0.0
 
-        # Not too near surface: +1 when not close to terrain while NOT over pad.
-        if (not terminated) and self.proximity_reward_enabled:
-            lander1 = self.lander
-            in_pad1 = self.landing_pad.x0 <= lander1.pos.x <= self.landing_pad.x1
-            if not in_pad1:
-                ground1 = self.terrain.height_at(lander1.pos.x)
-                altitude1 = max(0.0, lander1.pos.y - (ground1 + lander1.radius))
-                h = max(1.0, float(self.proximity_reward_height))
-                reward_proximity = 1.0 if altitude1 >= h else 0.0
-
-        reward = reward_time + reward_distance + reward_stability + reward_tube + reward_proximity
+        reward = reward_distance + reward_stability + reward_tube
 
         terminal_success: bool | None = None
         terminal_reward = 0.0
-        # Terminal reward: +100 if LANDED, otherwise 0 (no crash penalty).
+        # Terminal reward: +100 if LANDED, otherwise -50.
         if (not was_frozen) and terminated:
             if self.status_text == "LANDED":
                 terminal_reward = float(self.terminal_reward_success)
                 terminal_success = True
             else:
-                terminal_reward = 0.0
+                terminal_reward = float(self.terminal_reward_crash)
                 terminal_success = False
             self._just_terminated_success = terminal_success
 
@@ -894,11 +864,9 @@ class LunarLanderEnv:
             reward = terminal_reward
 
         self.last_reward_total = float(reward)
-        self.last_reward_time = float(reward_time)
         self.last_reward_distance = float(reward_distance)
         self.last_reward_stability = float(reward_stability)
         self.last_reward_tube = float(reward_tube)
-        self.last_reward_proximity = float(reward_proximity)
         self.last_reward_terminal = float(terminal_reward)
         # Expose current (post-step) metrics for UI overlays.
         self.last_distance_metric = float(distance_metric)
@@ -1106,6 +1074,9 @@ class LanderWidget(QtWidgets.QWidget):
         self.episode_nr = 0
         self.total_learning_steps = 0
         self.successful_landings = 0
+        # Wallclock time spent inside the learning loop while a DQNAgent is active.
+        # Measured in seconds using perf_counter().
+        self.learning_wallclock_s = 0.0
         self._reward_window_sum = 0.0
         self._reward_window_count = 0
         self.avg_reward_every_100: list[float] = []
@@ -1156,6 +1127,7 @@ class LanderWidget(QtWidgets.QWidget):
         self.episode_nr = 0
         self.total_learning_steps = 0
         self.successful_landings = 0
+        self.learning_wallclock_s = 0.0
         self._reward_window_sum = 0.0
         self._reward_window_count = 0
         self.avg_reward_every_100 = []
@@ -1166,6 +1138,7 @@ class LanderWidget(QtWidgets.QWidget):
             "episode_nr": int(self.episode_nr),
             "total_learning_steps": int(self.total_learning_steps),
             "successful_landings": int(self.successful_landings),
+            "learning_wallclock_s": float(self.learning_wallclock_s),
             "reward_window_sum": float(self._reward_window_sum),
             "reward_window_count": int(self._reward_window_count),
             "avg_reward_every_100": list(self.avg_reward_every_100),
@@ -1188,6 +1161,7 @@ class LanderWidget(QtWidgets.QWidget):
         self.episode_nr = max(0, geti("episode_nr", 0))
         self.total_learning_steps = max(0, geti("total_learning_steps", 0))
         self.successful_landings = max(0, geti("successful_landings", 0))
+        self.learning_wallclock_s = max(0.0, getf("learning_wallclock_s", 0.0))
         self._reward_window_sum = getf("reward_window_sum", 0.0)
         self._reward_window_count = max(0, geti("reward_window_count", 0))
 
@@ -1214,6 +1188,7 @@ class LanderWidget(QtWidgets.QWidget):
                 "episode": int(self.episode_nr),
                 "steps": int(self.total_learning_steps),
                 "successes": int(self.successful_landings),
+                "learning_wallclock_s": float(self.learning_wallclock_s),
                 "latest_avg_reward_100": latest_avg,
                 "avg_reward_curve": list(self.avg_reward_every_100),
             }
@@ -1455,6 +1430,7 @@ class LanderWidget(QtWidgets.QWidget):
             return
 
         learning_mode = not isinstance(self.agent, HumanKeyboardAgent)
+        dqn_learning = isinstance(self.agent, DQNAgent)
 
         # Rendered mode: use wall-clock dt. Headless mode: fixed dt and many steps.
         if self.rendering_enabled:
@@ -1469,6 +1445,8 @@ class LanderWidget(QtWidgets.QWidget):
         latest_avg: float | None = None
         # In headless learning mode, avoid constructing large info dicts every step.
         fast_learning = learning_mode and (not self.rendering_enabled)
+
+        t0_learning = time.perf_counter() if dqn_learning else 0.0
         for _i in range(steps):
             obs = self.env.observation()
             info_for_action = {} if fast_learning else self.env.info()
@@ -1521,6 +1499,9 @@ class LanderWidget(QtWidgets.QWidget):
                 # Human: stop on terminal and wait for Start.
                 self.set_running(False)
                 break
+
+        if dqn_learning:
+            self.learning_wallclock_s += max(0.0, time.perf_counter() - t0_learning)
 
         # Keep audio state in sync even if keys are held.
         if self.rendering_enabled:
@@ -1580,7 +1561,6 @@ class LanderWidget(QtWidgets.QWidget):
             self.env.tube_shaping_enabled
             or self.env.distance_shaping_enabled
             or self.env.stability_shaping_enabled
-            or self.env.proximity_reward_enabled
         ):
             return
 
@@ -1626,27 +1606,20 @@ class LanderWidget(QtWidgets.QWidget):
             mid = QtCore.QPointF(0.5 * (p_lander.x() + p_pad_center.x()), 0.5 * (p_lander.y() + p_pad_center.y()))
             r_dist = float(info.get("reward_distance", 0.0))
             painter.setPen(QtGui.QPen(QtGui.QColor(240, 240, 245), 1))
-            painter.drawText(mid + QtCore.QPointF(6.0, -6.0), f"dist r: {r_dist:+.4f}")
+            painter.drawText(mid + QtCore.QPointF(6.0, -6.0), f"dist r: {r_dist:+.1f}")
 
         # When inside the tube, also show the tube shaping reward.
         if self.env.tube_shaping_enabled and (pad.x0 <= lander.pos.x <= pad.x1):
             r_tube = float(info.get("reward_tube", 0.0))
             painter.setPen(QtGui.QPen(QtGui.QColor(240, 220, 60), 1))
-            painter.drawText(p_lander + QtCore.QPointF(18.0, -22.0), f"tube r: {r_tube:+.4f}")
+            painter.drawText(p_lander + QtCore.QPointF(18.0, -22.0), f"tube r: {r_tube:+.1f}")
 
         # If stability shaping is enabled, show its reward near the lander.
         if self.env.stability_shaping_enabled:
             r_stab = float(info.get("reward_stability", 0.0))
             if abs(r_stab) > 1e-12:
                 painter.setPen(QtGui.QPen(QtGui.QColor(180, 220, 255), 1))
-                painter.drawText(p_lander + QtCore.QPointF(18.0, -36.0), f"stab r: {r_stab:+.4f}")
-
-        # If proximity reward is enabled, show it near the lander when active.
-        if self.env.proximity_reward_enabled:
-            r_prox = float(info.get("reward_proximity", 0.0))
-            if abs(r_prox) > 1e-12:
-                painter.setPen(QtGui.QPen(QtGui.QColor(240, 240, 245), 1))
-                painter.drawText(p_lander + QtCore.QPointF(18.0, -50.0), f"prox r: {r_prox:+.4f}")
+                painter.drawText(p_lander + QtCore.QPointF(18.0, -36.0), f"stab r: {r_stab:+.1f}")
 
         painter.restore()
 
@@ -1871,13 +1844,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_shape_stability.toggled.connect(self.sim.env.set_stability_shaping)
         left_v.addWidget(self.chk_shape_stability)
 
-        self.chk_shape_proximity = QtWidgets.QCheckBox("Too near surface")
-        self.chk_shape_proximity.setToolTip(
-            "Per-step reward: +1 when NOT close to terrain while NOT over the landing pad"
-        )
-        self.chk_shape_proximity.toggled.connect(self.sim.env.set_proximity_reward)
-        left_v.addWidget(self.chk_shape_proximity)
-
         self.chk_sound = QtWidgets.QCheckBox("Sound")
         if not self.sim.sound_available():
             self.chk_sound.setEnabled(False)
@@ -1980,7 +1946,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_shape_tube.setChecked(False)
         self.chk_shape_distance.setChecked(False)
         self.chk_shape_stability.setChecked(False)
-        self.chk_shape_proximity.setChecked(False)
 
         # No automatic start.
         self.sim.set_running(False)
@@ -2023,7 +1988,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_shape_tube.setChecked(True)
         self.chk_shape_distance.setChecked(True)
         self.chk_shape_stability.setChecked(True)
-        self.chk_shape_proximity.setChecked(True)
 
         self._update_agent_io_buttons()
 
@@ -2141,14 +2105,27 @@ class MainWindow(QtWidgets.QMainWindow):
         steps = int(s.get("steps", 0))
         succ = int(s.get("successes", 0))
         latest = s.get("latest_avg_reward_100")
+        wall_s = 0.0
+        try:
+            wall_s = float(s.get("learning_wallclock_s", 0.0))
+        except Exception:
+            wall_s = 0.0
+
+        # Format as "xxh yym zzsec".
+        total = max(0, int(wall_s))
+        hh = total // 3600
+        mm = (total % 3600) // 60
+        ss = total % 60
+        wall_str = f"{hh:02d}h {mm:02d}m {ss:02d}sec"
 
         lines = [
             f"episode: {ep}",
             f"learning steps: {steps}",
             f"successful landings: {succ}",
+            f"learning wallclock: {wall_str}",
         ]
         if latest is not None:
-            lines.append(f"avg reward (last 100): {float(latest):.4f}")
+            lines.append(f"avg reward (last 100): {float(latest):.1f}")
         self.txt_learning.setPlainText("\n".join(lines))
 
         curve = s.get("avg_reward_curve")
