@@ -614,6 +614,7 @@ class LunarLanderEnv:
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
+        self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -622,15 +623,27 @@ class LunarLanderEnv:
         # Rewards (simplified for teaching)
         # -----------------
         # Reward signals can be toggled from the UI. When enabled, each signal
-        # contributes a fixed +1 per step while its condition is satisfied.
+        # contributes its configured magnitude while its condition is satisfied.
         # Terminal reward: +100 if LANDED, otherwise 0.
         self.tube_shaping_enabled = False
+
+        # Shaping reward magnitudes (editable from UI).
+        self.tube_shaping_reward = 1.0
 
         # +1 if the lander reduced its distance to the pad center this step.
         self.distance_shaping_enabled = False
 
+        self.distance_shaping_reward = 1.0
+
         # +1 if the lander is in a "stable" configuration (slow + level + not ascending).
         self.stability_shaping_enabled = False
+
+        self.stability_shaping_reward = 1.0
+
+        # Energy usage shaping: per-thruster penalty/reward applied each step.
+        # Default: -1 for each thruster used (main/left/right).
+        self.energy_usage_shaping_enabled = False
+        self.energy_usage_reward_per_throttle = -1.0
 
         # Terminal reward magnitude.
         self.terminal_reward_success = 100.0
@@ -641,11 +654,50 @@ class LunarLanderEnv:
     def set_tube_shaping(self, enabled: bool) -> None:
         self.tube_shaping_enabled = bool(enabled)
 
+    def set_tube_shaping_reward(self, reward: float) -> None:
+        try:
+            self.tube_shaping_reward = float(reward)
+        except Exception:
+            return
+
     def set_distance_shaping(self, enabled: bool) -> None:
         self.distance_shaping_enabled = bool(enabled)
 
+    def set_distance_shaping_reward(self, reward: float) -> None:
+        try:
+            self.distance_shaping_reward = float(reward)
+        except Exception:
+            return
+
     def set_stability_shaping(self, enabled: bool) -> None:
         self.stability_shaping_enabled = bool(enabled)
+
+    def set_stability_shaping_reward(self, reward: float) -> None:
+        try:
+            self.stability_shaping_reward = float(reward)
+        except Exception:
+            return
+
+    def set_energy_usage_shaping(self, enabled: bool) -> None:
+        self.energy_usage_shaping_enabled = bool(enabled)
+
+    def set_energy_usage_reward_per_throttle(self, reward: float) -> None:
+        try:
+            self.energy_usage_reward_per_throttle = float(reward)
+        except Exception:
+            return
+
+    def set_terminal_reward_success(self, reward: float) -> None:
+        try:
+            self.terminal_reward_success = float(reward)
+        except Exception:
+            return
+
+    def set_terminal_reward_crash(self, reward: float) -> None:
+        try:
+            self.terminal_reward_crash = float(reward)
+        except Exception:
+            return
 
     def _is_stable_state(self) -> bool:
         """Return True when the lander is slow + level (and not ascending).
@@ -710,6 +762,7 @@ class LunarLanderEnv:
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
+        self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -765,12 +818,14 @@ class LunarLanderEnv:
             "reward_distance": float(self.last_reward_distance),
             "reward_stability": float(self.last_reward_stability),
             "reward_tube": float(self.last_reward_tube),
+            "reward_energy": float(self.last_reward_energy),
             "reward_terminal": float(self.last_reward_terminal),
             "distance_metric": float(self.last_distance_metric),
             "stability_metric": float(self.last_stability_metric),
             "tube_shaping_enabled": bool(self.tube_shaping_enabled),
             "distance_shaping_enabled": bool(self.distance_shaping_enabled),
             "stability_shaping_enabled": bool(self.stability_shaping_enabled),
+            "energy_usage_shaping_enabled": bool(self.energy_usage_shaping_enabled),
             "in_reward_tube": bool(self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1),
             "stable_state": bool(stable_state),
             "stable_for_landing": bool(stable_for_landing),
@@ -790,6 +845,7 @@ class LunarLanderEnv:
         self.last_reward_distance = 0.0
         self.last_reward_stability = 0.0
         self.last_reward_tube = 0.0
+        self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
@@ -805,6 +861,7 @@ class LunarLanderEnv:
         reward_distance = 0.0
         reward_stability = 0.0
         reward_tube = 0.0
+        reward_energy = 0.0
 
         distance_metric = 0.0
         stability_metric = 0.0
@@ -824,13 +881,13 @@ class LunarLanderEnv:
 
         terminated = bool(self.frozen)
 
-        # Landing tube: +1 per step while within the pad edges.
+        # Landing tube: configured reward per step while within the pad edges.
         if (not terminated) and self.tube_shaping_enabled:
             lander1 = self.lander
             in_tube1 = self.landing_pad.x0 <= lander1.pos.x <= self.landing_pad.x1
-            reward_tube = 1.0 if in_tube1 else 0.0
+            reward_tube = float(self.tube_shaping_reward) if in_tube1 else 0.0
 
-        # Distance reduction: +1 if the distance to the pad center decreased.
+        # Distance reduction: configured reward if the distance to the pad center decreased.
         if (not terminated) and self.distance_shaping_enabled:
             lander1 = self.lander
             pad1 = self.landing_pad
@@ -838,15 +895,21 @@ class LunarLanderEnv:
             dy1 = lander1.pos.y - (pad1.y + lander1.radius)
             d1 = math.hypot(dx1, dy1)
             distance_metric = float(d1)
-            reward_distance = 1.0 if (d1 + 1e-9) < float(d0) else 0.0
+            reward_distance = float(self.distance_shaping_reward) if (d1 + 1e-9) < float(d0) else 0.0
 
-        # Stability: +1 when slow + level + not ascending (anywhere).
+        # Stability: configured reward when slow + level + not ascending (anywhere).
         if (not terminated) and self.stability_shaping_enabled:
             stable = self._is_stable_state()
             stability_metric = 1.0 if stable else 0.0
-            reward_stability = 1.0 if stable else 0.0
+            reward_stability = float(self.stability_shaping_reward) if stable else 0.0
 
-        reward = reward_distance + reward_stability + reward_tube
+        # Energy usage: per-throttle penalty/reward for firing thrusters this step.
+        if (not terminated) and self.energy_usage_shaping_enabled:
+            burn_main, burn_left, burn_right = _action_to_burns(self.last_action)
+            throttles_used = int(burn_main > 0.0) + int(burn_left > 0.0) + int(burn_right > 0.0)
+            reward_energy = float(self.energy_usage_reward_per_throttle) * float(throttles_used)
+
+        reward = reward_distance + reward_stability + reward_tube + reward_energy
 
         terminal_success: bool | None = None
         terminal_reward = 0.0
@@ -867,6 +930,7 @@ class LunarLanderEnv:
         self.last_reward_distance = float(reward_distance)
         self.last_reward_stability = float(reward_stability)
         self.last_reward_tube = float(reward_tube)
+        self.last_reward_energy = float(reward_energy)
         self.last_reward_terminal = float(terminal_reward)
         # Expose current (post-step) metrics for UI overlays.
         self.last_distance_metric = float(distance_metric)
@@ -1823,26 +1887,118 @@ class MainWindow(QtWidgets.QMainWindow):
         shaping_title.setStyleSheet("font-weight: 600;")
         left_v.addWidget(shaping_title)
 
-        self.chk_shape_tube = QtWidgets.QCheckBox("Landing tube")
-        self.chk_shape_tube.setToolTip(
-            "Per-step reward: +1 while x is within the pad's left/right edges"
-        )
-        self.chk_shape_tube.toggled.connect(self.sim.env.set_tube_shaping)
-        left_v.addWidget(self.chk_shape_tube)
+        def add_shaping_row(
+            label: str,
+            tooltip: str,
+            *,
+            on_toggle,
+            on_value,
+            initial_value: float,
+        ) -> tuple[QtWidgets.QCheckBox, QtWidgets.QDoubleSpinBox]:
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
 
-        self.chk_shape_distance = QtWidgets.QCheckBox("Distance reward")
-        self.chk_shape_distance.setToolTip(
-            "Per-step reward: +1 if the distance to the pad center decreased this step"
-        )
-        self.chk_shape_distance.toggled.connect(self.sim.env.set_distance_shaping)
-        left_v.addWidget(self.chk_shape_distance)
+            chk = QtWidgets.QCheckBox(label)
+            chk.setToolTip(tooltip)
+            chk.toggled.connect(on_toggle)
 
-        self.chk_shape_stability = QtWidgets.QCheckBox("Stability reward")
-        self.chk_shape_stability.setToolTip(
-            "Per-step reward: +1 when vy<=0 AND |angle|, |vx|, |vy| are within the landing success thresholds (anywhere, not only over pad)"
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-1000.0, 1000.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.25)
+            spin.setKeyboardTracking(False)
+            spin.setFixedWidth(90)
+            spin.setValue(float(initial_value))
+            spin.setToolTip("Reward magnitude (edit me)")
+            spin.valueChanged.connect(on_value)
+
+            h.addWidget(chk, 1)
+            h.addWidget(spin, 0)
+            left_v.addWidget(row)
+            return chk, spin
+
+        self.chk_shape_tube, self.spin_shape_tube = add_shaping_row(
+            "Landing tube",
+            "Per-step reward while x is within the pad's left/right edges",
+            on_toggle=self.sim.env.set_tube_shaping,
+            on_value=self.sim.env.set_tube_shaping_reward,
+            initial_value=float(self.sim.env.tube_shaping_reward),
         )
-        self.chk_shape_stability.toggled.connect(self.sim.env.set_stability_shaping)
-        left_v.addWidget(self.chk_shape_stability)
+
+        self.chk_shape_distance, self.spin_shape_distance = add_shaping_row(
+            "Distance reward",
+            "Per-step reward if the distance to the pad center decreased this step",
+            on_toggle=self.sim.env.set_distance_shaping,
+            on_value=self.sim.env.set_distance_shaping_reward,
+            initial_value=float(self.sim.env.distance_shaping_reward),
+        )
+
+        self.chk_shape_stability, self.spin_shape_stability = add_shaping_row(
+            "Stability reward",
+            "Per-step reward when vy<=0 AND |angle|, |vx|, |vy| are within the landing success thresholds (anywhere, not only over pad)",
+            on_toggle=self.sim.env.set_stability_shaping,
+            on_value=self.sim.env.set_stability_shaping_reward,
+            initial_value=float(self.sim.env.stability_shaping_reward),
+        )
+
+        self.chk_shape_energy, self.spin_shape_energy = add_shaping_row(
+            "Energy usage",
+            "Per-step reward: (value) × (number of thrusters fired this step: main/left/right)",
+            on_toggle=self.sim.env.set_energy_usage_shaping,
+            on_value=self.sim.env.set_energy_usage_reward_per_throttle,
+            initial_value=float(self.sim.env.energy_usage_reward_per_throttle),
+        )
+
+        left_v.addSpacing(6)
+        terminal_title = QtWidgets.QLabel("Terminal rewards")
+        terminal_title.setStyleSheet("font-weight: 600;")
+        left_v.addWidget(terminal_title)
+
+        def add_terminal_row(
+            label: str,
+            tooltip: str,
+            *,
+            on_value,
+            initial_value: float,
+        ) -> QtWidgets.QDoubleSpinBox:
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+
+            lbl = QtWidgets.QLabel(label)
+            lbl.setToolTip(tooltip)
+
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setRange(-10000.0, 10000.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(5.0)
+            spin.setKeyboardTracking(False)
+            spin.setFixedWidth(90)
+            spin.setValue(float(initial_value))
+            spin.setToolTip("Reward magnitude (edit me)")
+            spin.valueChanged.connect(on_value)
+
+            h.addWidget(lbl, 1)
+            h.addWidget(spin, 0)
+            left_v.addWidget(row)
+            return spin
+
+        self.spin_terminal_success = add_terminal_row(
+            "Landing success",
+            "Terminal reward applied when status becomes LANDED (overrides shaping rewards)",
+            on_value=self.sim.env.set_terminal_reward_success,
+            initial_value=float(self.sim.env.terminal_reward_success),
+        )
+
+        self.spin_terminal_crash = add_terminal_row(
+            "Crash",
+            "Terminal reward applied when status becomes CRASHED (overrides shaping rewards)",
+            on_value=self.sim.env.set_terminal_reward_crash,
+            initial_value=float(self.sim.env.terminal_reward_crash),
+        )
 
         self.chk_sound = QtWidgets.QCheckBox("Sound")
         if not self.sim.sound_available():
@@ -1946,6 +2102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_shape_tube.setChecked(False)
         self.chk_shape_distance.setChecked(False)
         self.chk_shape_stability.setChecked(False)
+        self.chk_shape_energy.setChecked(False)
 
         # No automatic start.
         self.sim.set_running(False)
@@ -1999,6 +2156,91 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.sim.sound_available():
             self.chk_sound.setChecked(False)
 
+    def _get_reward_config(self) -> dict[str, float | bool]:
+        return {
+            "tube_enabled": bool(self.chk_shape_tube.isChecked()),
+            "tube_reward": float(self.spin_shape_tube.value()),
+            "distance_enabled": bool(self.chk_shape_distance.isChecked()),
+            "distance_reward": float(self.spin_shape_distance.value()),
+            "stability_enabled": bool(self.chk_shape_stability.isChecked()),
+            "stability_reward": float(self.spin_shape_stability.value()),
+            "energy_enabled": bool(self.chk_shape_energy.isChecked()),
+            "energy_reward_per_throttle": float(self.spin_shape_energy.value()),
+            "terminal_reward_success": float(self.spin_terminal_success.value()),
+            "terminal_reward_crash": float(self.spin_terminal_crash.value()),
+        }
+
+    def _apply_reward_config(self, cfg: dict[str, object]) -> None:
+        env = self.sim.env
+
+        def getb(key: str, default: bool) -> bool:
+            v = cfg.get(key, default)
+            return bool(v)
+
+        def getf(key: str, default: float) -> float:
+            v = cfg.get(key, default)
+            try:
+                return float(v)  # type: ignore[arg-type]
+            except Exception:
+                return float(default)
+
+        tube_enabled = getb("tube_enabled", bool(env.tube_shaping_enabled))
+        distance_enabled = getb("distance_enabled", bool(env.distance_shaping_enabled))
+        stability_enabled = getb("stability_enabled", bool(env.stability_shaping_enabled))
+        energy_enabled = getb("energy_enabled", bool(getattr(env, "energy_usage_shaping_enabled", False)))
+
+        tube_reward = getf("tube_reward", float(env.tube_shaping_reward))
+        distance_reward = getf("distance_reward", float(env.distance_shaping_reward))
+        stability_reward = getf("stability_reward", float(env.stability_shaping_reward))
+        energy_reward = getf("energy_reward_per_throttle", float(env.energy_usage_reward_per_throttle))
+
+        term_succ = getf("terminal_reward_success", float(env.terminal_reward_success))
+        term_crash = getf("terminal_reward_crash", float(env.terminal_reward_crash))
+
+        # Apply to the environment first.
+        env.set_tube_shaping_reward(tube_reward)
+        env.set_distance_shaping_reward(distance_reward)
+        env.set_stability_shaping_reward(stability_reward)
+        env.set_energy_usage_reward_per_throttle(energy_reward)
+        env.set_terminal_reward_success(term_succ)
+        env.set_terminal_reward_crash(term_crash)
+
+        env.set_tube_shaping(tube_enabled)
+        env.set_distance_shaping(distance_enabled)
+        env.set_stability_shaping(stability_enabled)
+        env.set_energy_usage_shaping(energy_enabled)
+
+        # Reflect in UI without re-triggering callbacks.
+        widgets: list[QtCore.QObject] = [
+            self.spin_shape_tube,
+            self.spin_shape_distance,
+            self.spin_shape_stability,
+            self.spin_shape_energy,
+            self.spin_terminal_success,
+            self.spin_terminal_crash,
+            self.chk_shape_tube,
+            self.chk_shape_distance,
+            self.chk_shape_stability,
+            self.chk_shape_energy,
+        ]
+
+        old = [w.blockSignals(True) for w in widgets]
+        try:
+            self.spin_shape_tube.setValue(tube_reward)
+            self.spin_shape_distance.setValue(distance_reward)
+            self.spin_shape_stability.setValue(stability_reward)
+            self.spin_shape_energy.setValue(energy_reward)
+            self.spin_terminal_success.setValue(term_succ)
+            self.spin_terminal_crash.setValue(term_crash)
+
+            self.chk_shape_tube.setChecked(tube_enabled)
+            self.chk_shape_distance.setChecked(distance_enabled)
+            self.chk_shape_stability.setChecked(stability_enabled)
+            self.chk_shape_energy.setChecked(energy_enabled)
+        finally:
+            for w, prev in zip(widgets, old):
+                w.blockSignals(prev)
+
     def _on_save_dqn(self) -> None:
         if not isinstance(self.sim.agent, DQNAgent):
             QtWidgets.QMessageBox.information(self, "Save DQN", "Switch the controller to 'DQN (learning)' first.")
@@ -2020,6 +2262,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # checkpoint restores the plotted curve and counters.
             ckpt = self.sim.agent.get_checkpoint(include_replay=False)
             ckpt["ui_learning_state"] = self.sim.get_learning_state()
+            ckpt["reward_config"] = self._get_reward_config()
             torch.save(ckpt, path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save DQN", f"Failed to save checkpoint:\n{e}")
@@ -2059,6 +2302,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sim.set_learning_state(st)
         else:
             self.sim.reset_learning_stats()
+
+        rcfg = ckpt.get("reward_config") if isinstance(ckpt, dict) else None
+        if isinstance(rcfg, dict):
+            self._apply_reward_config(rcfg)
         self._update_agent_io_buttons()
 
         QtWidgets.QMessageBox.information(self, "Load DQN", f"Loaded DQN checkpoint from:\n{path}")
