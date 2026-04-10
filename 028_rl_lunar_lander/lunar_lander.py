@@ -289,6 +289,8 @@ class DQNAgent:
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.05,
         epsilon_decay_steps: int = 50_000,
+        use_target_network: bool = True,
+        use_replay_buffer: bool = True,
         seed: int | None = 0,
         device: str | None = None,
     ) -> None:
@@ -305,6 +307,9 @@ class DQNAgent:
         self.warmup_steps = int(warmup_steps)
         self.train_every = int(train_every)
         self.target_update_every = int(target_update_every)
+
+        self.use_target_network = bool(use_target_network)
+        self.use_replay_buffer = bool(use_replay_buffer)
 
         self.epsilon_start = float(epsilon_start)
         self.epsilon_end = float(epsilon_end)
@@ -349,6 +354,17 @@ class DQNAgent:
     def reset(self) -> None:
         self._prev_obs = None
         self._prev_action = None
+
+    def set_use_target_network(self, enabled: bool) -> None:
+        self.use_target_network = bool(enabled)
+        if self.use_target_network:
+            # Make the target network sane when (re-)enabled.
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def set_use_replay_buffer(self, enabled: bool) -> None:
+        self.use_replay_buffer = bool(enabled)
+        if not self.use_replay_buffer:
+            self.replay.clear()
 
     def _epsilon(self) -> float:
         t = min(1.0, self._step_count / max(1, self.epsilon_decay_steps))
@@ -397,27 +413,40 @@ class DQNAgent:
         if self._prev_obs is None or self._prev_action is None:
             return
 
-        self.replay.append((self._prev_obs, int(self._prev_action), float(reward), next_observation, bool(terminated)))
+        transition = (self._prev_obs, int(self._prev_action), float(reward), next_observation, bool(terminated))
 
+        if self.use_replay_buffer:
+            self.replay.append(transition)
+        
         if terminated:
             self._prev_obs = None
             self._prev_action = None
 
-        if len(self.replay) < max(self.warmup_steps, self.batch_size):
-            return
         if self.train_every > 1 and (self._step_count % self.train_every) != 0:
             return
 
-        self._train_step()
+        if self.use_replay_buffer:
+            if len(self.replay) < max(self.warmup_steps, self.batch_size):
+                return
+            self._train_step_from_replay()
+        else:
+            # Online update (no replay buffer): learn from the most recent transition.
+            self._train_step_on_batch([transition])
 
-        if (self._step_count % max(1, self.target_update_every)) == 0:
+        if self.use_target_network and (self._step_count % max(1, self.target_update_every)) == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    def _train_step(self) -> None:
+    def _train_step_from_replay(self) -> None:
         if torch is None:
             return
 
         batch = random.sample(self.replay, k=self.batch_size)
+
+        self._train_step_on_batch(batch)
+
+    def _train_step_on_batch(self, batch: list[tuple[Observation, int, float, Observation, bool]]) -> None:
+        if torch is None:
+            return
 
         states = torch.stack([self._obs_tensor(s) for (s, _a, _r, _s2, _d) in batch], dim=0)
         actions = torch.tensor([a for (_s, a, _r, _s2, _d) in batch], dtype=torch.int64, device=self.device)
@@ -427,7 +456,8 @@ class DQNAgent:
 
         q_sa = self.policy_net(states).gather(1, actions.view(-1, 1)).squeeze(1)
         with torch.no_grad():
-            next_q = self.target_net(next_states).max(dim=1).values
+            next_net = self.target_net if self.use_target_network else self.policy_net
+            next_q = next_net(next_states).max(dim=1).values
             target = rewards + (1.0 - dones) * (self.gamma * next_q)
 
         loss = F.smooth_l1_loss(q_sa, target)
@@ -460,6 +490,8 @@ class DQNAgent:
             "warmup_steps": int(self.warmup_steps),
             "train_every": int(self.train_every),
             "target_update_every": int(self.target_update_every),
+            "use_target_network": bool(self.use_target_network),
+            "use_replay_buffer": bool(self.use_replay_buffer),
             "epsilon_start": float(self.epsilon_start),
             "epsilon_end": float(self.epsilon_end),
             "epsilon_decay_steps": int(self.epsilon_decay_steps),
@@ -512,6 +544,8 @@ class DQNAgent:
             warmup_steps=int(ckpt.get("warmup_steps", 2_000)),
             train_every=int(ckpt.get("train_every", 1)),
             target_update_every=int(ckpt.get("target_update_every", 1_000)),
+            use_target_network=bool(ckpt.get("use_target_network", True)),
+            use_replay_buffer=bool(ckpt.get("use_replay_buffer", True)),
             epsilon_start=float(ckpt.get("epsilon_start", 1.0)),
             epsilon_end=float(ckpt.get("epsilon_end", 0.05)),
             epsilon_decay_steps=int(ckpt.get("epsilon_decay_steps", 50_000)),
@@ -649,6 +683,10 @@ class LunarLanderEnv:
         self.terminal_reward_success = 100.0
         self.terminal_reward_crash = -50.0
 
+        # Terminal reward toggles (editable from UI).
+        self.terminal_reward_success_enabled = True
+        self.terminal_reward_crash_enabled = True
+
         self.reset()
 
     def set_tube_shaping(self, enabled: bool) -> None:
@@ -693,11 +731,17 @@ class LunarLanderEnv:
         except Exception:
             return
 
+    def set_terminal_reward_success_enabled(self, enabled: bool) -> None:
+        self.terminal_reward_success_enabled = bool(enabled)
+
     def set_terminal_reward_crash(self, reward: float) -> None:
         try:
             self.terminal_reward_crash = float(reward)
         except Exception:
             return
+
+    def set_terminal_reward_crash_enabled(self, enabled: bool) -> None:
+        self.terminal_reward_crash_enabled = bool(enabled)
 
     def _is_stable_state(self) -> bool:
         """Return True when the lander is slow + level (and not ascending).
@@ -916,15 +960,16 @@ class LunarLanderEnv:
         # Terminal reward: +100 if LANDED, otherwise -50.
         if (not was_frozen) and terminated:
             if self.status_text == "LANDED":
-                terminal_reward = float(self.terminal_reward_success)
+                terminal_reward = float(self.terminal_reward_success) if self.terminal_reward_success_enabled else 0.0
                 terminal_success = True
             else:
-                terminal_reward = float(self.terminal_reward_crash)
+                terminal_reward = float(self.terminal_reward_crash) if self.terminal_reward_crash_enabled else 0.0
                 terminal_success = False
             self._just_terminated_success = terminal_success
 
-            # Terminal reward overrides shaping reward.
-            reward = terminal_reward
+            # Terminal reward overrides shaping reward only if enabled.
+            if abs(terminal_reward) > 1e-12:
+                reward = terminal_reward
 
         self.last_reward_total = float(reward)
         self.last_reward_distance = float(reward_distance)
@@ -1621,6 +1666,10 @@ class LanderWidget(QtWidgets.QWidget):
         if not self.rendering_enabled:
             return
 
+        # Option A: only visualize rewards while a learning agent is active.
+        if not isinstance(self.agent, DQNAgent):
+            return
+
         if not (
             self.env.tube_shaping_enabled
             or self.env.distance_shaping_enabled
@@ -1863,6 +1912,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_controller.currentIndexChanged.connect(self._on_controller_changed)
         left_v.addWidget(self.cmb_controller)
 
+        left_v.addSpacing(6)
+        tricks_title = QtWidgets.QLabel("DQN learning tricks")
+        tricks_title.setStyleSheet("font-weight: 600;")
+        left_v.addWidget(tricks_title)
+
+        self.chk_dqn_target = QtWidgets.QCheckBox("Target network")
+        self.chk_dqn_target.setToolTip("Use a separate target network for the bootstrap term")
+        self.chk_dqn_target.setChecked(True)
+        left_v.addWidget(self.chk_dqn_target)
+
+        self.chk_dqn_replay = QtWidgets.QCheckBox("Replay buffer")
+        self.chk_dqn_replay.setToolTip("Train from a replay buffer instead of online single-step updates")
+        self.chk_dqn_replay.setChecked(True)
+        left_v.addWidget(self.chk_dqn_replay)
+
         dqn_buttons = QtWidgets.QWidget()
         dqn_h = QtWidgets.QHBoxLayout(dqn_buttons)
         dqn_h.setContentsMargins(0, 0, 0, 0)
@@ -1960,16 +2024,20 @@ class MainWindow(QtWidgets.QMainWindow):
             label: str,
             tooltip: str,
             *,
+            on_toggle,
             on_value,
             initial_value: float,
-        ) -> QtWidgets.QDoubleSpinBox:
+            initial_enabled: bool,
+        ) -> tuple[QtWidgets.QCheckBox, QtWidgets.QDoubleSpinBox]:
             row = QtWidgets.QWidget()
             h = QtWidgets.QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(8)
 
-            lbl = QtWidgets.QLabel(label)
-            lbl.setToolTip(tooltip)
+            chk = QtWidgets.QCheckBox(label)
+            chk.setToolTip(tooltip)
+            chk.setChecked(bool(initial_enabled))
+            chk.toggled.connect(on_toggle)
 
             spin = QtWidgets.QDoubleSpinBox()
             spin.setRange(-10000.0, 10000.0)
@@ -1981,23 +2049,27 @@ class MainWindow(QtWidgets.QMainWindow):
             spin.setToolTip("Reward magnitude (edit me)")
             spin.valueChanged.connect(on_value)
 
-            h.addWidget(lbl, 1)
+            h.addWidget(chk, 1)
             h.addWidget(spin, 0)
             left_v.addWidget(row)
-            return spin
+            return chk, spin
 
-        self.spin_terminal_success = add_terminal_row(
+        self.chk_terminal_success, self.spin_terminal_success = add_terminal_row(
             "Landing success",
             "Terminal reward applied when status becomes LANDED (overrides shaping rewards)",
+            on_toggle=self.sim.env.set_terminal_reward_success_enabled,
             on_value=self.sim.env.set_terminal_reward_success,
             initial_value=float(self.sim.env.terminal_reward_success),
+            initial_enabled=bool(self.sim.env.terminal_reward_success_enabled),
         )
 
-        self.spin_terminal_crash = add_terminal_row(
+        self.chk_terminal_crash, self.spin_terminal_crash = add_terminal_row(
             "Crash",
             "Terminal reward applied when status becomes CRASHED (overrides shaping rewards)",
+            on_toggle=self.sim.env.set_terminal_reward_crash_enabled,
             on_value=self.sim.env.set_terminal_reward_crash,
             initial_value=float(self.sim.env.terminal_reward_crash),
+            initial_enabled=bool(self.sim.env.terminal_reward_crash_enabled),
         )
 
         self.chk_sound = QtWidgets.QCheckBox("Sound")
@@ -2110,6 +2182,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._update_agent_io_buttons()
 
+        def apply_tricks() -> None:
+            if isinstance(self.sim.agent, DQNAgent):
+                try:
+                    self.sim.agent.set_use_target_network(self.chk_dqn_target.isChecked())
+                    self.sim.agent.set_use_replay_buffer(self.chk_dqn_replay.isChecked())
+                except Exception:
+                    pass
+
+        self.chk_dqn_target.toggled.connect(lambda _v: apply_tricks())
+        self.chk_dqn_replay.toggled.connect(lambda _v: apply_tricks())
+
     def _update_agent_io_buttons(self) -> None:
         is_dqn_active = isinstance(self.sim.agent, DQNAgent)
         torch_available = torch is not None
@@ -2139,7 +2222,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # DQN agent learns online while controlling.
         obs_dim = len(self.sim.env.observation())
-        self.sim.set_agent(DQNAgent(obs_dim=obs_dim, seed=0))
+        self.sim.set_agent(
+            DQNAgent(
+                obs_dim=obs_dim,
+                seed=0,
+                use_target_network=self.chk_dqn_target.isChecked(),
+                use_replay_buffer=self.chk_dqn_replay.isChecked(),
+            )
+        )
 
         # Default shaping setup for DQN learning.
         self.chk_shape_tube.setChecked(True)
@@ -2166,7 +2256,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "stability_reward": float(self.spin_shape_stability.value()),
             "energy_enabled": bool(self.chk_shape_energy.isChecked()),
             "energy_reward_per_throttle": float(self.spin_shape_energy.value()),
+            "terminal_success_enabled": bool(self.chk_terminal_success.isChecked()),
             "terminal_reward_success": float(self.spin_terminal_success.value()),
+            "terminal_crash_enabled": bool(self.chk_terminal_crash.isChecked()),
             "terminal_reward_crash": float(self.spin_terminal_crash.value()),
         }
 
@@ -2194,7 +2286,15 @@ class MainWindow(QtWidgets.QMainWindow):
         stability_reward = getf("stability_reward", float(env.stability_shaping_reward))
         energy_reward = getf("energy_reward_per_throttle", float(env.energy_usage_reward_per_throttle))
 
+        term_succ_enabled = getb(
+            "terminal_success_enabled",
+            bool(getattr(env, "terminal_reward_success_enabled", True)),
+        )
         term_succ = getf("terminal_reward_success", float(env.terminal_reward_success))
+        term_crash_enabled = getb(
+            "terminal_crash_enabled",
+            bool(getattr(env, "terminal_reward_crash_enabled", True)),
+        )
         term_crash = getf("terminal_reward_crash", float(env.terminal_reward_crash))
 
         # Apply to the environment first.
@@ -2204,6 +2304,9 @@ class MainWindow(QtWidgets.QMainWindow):
         env.set_energy_usage_reward_per_throttle(energy_reward)
         env.set_terminal_reward_success(term_succ)
         env.set_terminal_reward_crash(term_crash)
+
+        env.set_terminal_reward_success_enabled(term_succ_enabled)
+        env.set_terminal_reward_crash_enabled(term_crash_enabled)
 
         env.set_tube_shaping(tube_enabled)
         env.set_distance_shaping(distance_enabled)
@@ -2222,6 +2325,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_shape_distance,
             self.chk_shape_stability,
             self.chk_shape_energy,
+            self.chk_terminal_success,
+            self.chk_terminal_crash,
         ]
 
         old = [w.blockSignals(True) for w in widgets]
@@ -2237,6 +2342,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_shape_distance.setChecked(distance_enabled)
             self.chk_shape_stability.setChecked(stability_enabled)
             self.chk_shape_energy.setChecked(energy_enabled)
+
+            self.chk_terminal_success.setChecked(term_succ_enabled)
+            self.chk_terminal_crash.setChecked(term_crash_enabled)
         finally:
             for w, prev in zip(widgets, old):
                 w.blockSignals(prev)
@@ -2263,6 +2371,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ckpt = self.sim.agent.get_checkpoint(include_replay=False)
             ckpt["ui_learning_state"] = self.sim.get_learning_state()
             ckpt["reward_config"] = self._get_reward_config()
+            ckpt["dqn_tricks"] = {
+                "use_target_network": bool(self.chk_dqn_target.isChecked()),
+                "use_replay_buffer": bool(self.chk_dqn_replay.isChecked()),
+            }
             torch.save(ckpt, path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save DQN", f"Failed to save checkpoint:\n{e}")
@@ -2297,6 +2409,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_controller.blockSignals(False)
 
         self.sim.set_agent(agent)
+
+        # Restore DQN learning tricks (if present) and reflect in UI.
+        dqn_tricks = ckpt.get("dqn_tricks") if isinstance(ckpt, dict) else None
+        if isinstance(dqn_tricks, dict):
+            use_target = bool(dqn_tricks.get("use_target_network", getattr(agent, "use_target_network", True)))
+            use_replay = bool(dqn_tricks.get("use_replay_buffer", getattr(agent, "use_replay_buffer", True)))
+        else:
+            use_target = bool(getattr(agent, "use_target_network", True))
+            use_replay = bool(getattr(agent, "use_replay_buffer", True))
+
+        self.chk_dqn_target.blockSignals(True)
+        self.chk_dqn_replay.blockSignals(True)
+        try:
+            self.chk_dqn_target.setChecked(use_target)
+            self.chk_dqn_replay.setChecked(use_replay)
+        finally:
+            self.chk_dqn_target.blockSignals(False)
+            self.chk_dqn_replay.blockSignals(False)
+
+        try:
+            agent.set_use_target_network(use_target)
+            agent.set_use_replay_buffer(use_replay)
+        except Exception:
+            pass
+
         st = ckpt.get("ui_learning_state") if isinstance(ckpt, dict) else None
         if isinstance(st, dict):
             self.sim.set_learning_state(st)
