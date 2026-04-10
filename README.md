@@ -33,4 +33,5 @@ Code examples: Machine Learning, Deep Learning, Computer Vision, Robotics, Progr
 | 030      | Notebooks, showing different aspects of sensor fusion (IVW, ISM, ML for sensor data fusion) |
 | 031      | Python script, Value Iteration demo (model-based RL algorithm) to estimate how good states are |
 | 032      | Notebook, visualizes that a decision tree for regression approximates a function stepwise |
+| 033      | Python script, demo that shows how easily we can get the old Atari 2600 games for RL training using the ALE environment |
 | 0xx      |  |
