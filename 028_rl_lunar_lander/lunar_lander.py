@@ -1169,6 +1169,7 @@ class LanderWidget(QtWidgets.QWidget):
 
         # Simulation is paused until the user presses Start.
         self.running = False
+        self.stop_at_learning_step: int | None = None
 
         # When fast-forwarding learning, avoid spamming UI updates.
         self._last_ui_emit_learning_step = 0
@@ -1231,6 +1232,17 @@ class LanderWidget(QtWidgets.QWidget):
             self.key_right = False
             self.key_up = False
         self.runningChanged.emit(self.running)
+
+    def set_stop_at_learning_step(self, step_limit: int | None) -> None:
+        if step_limit is None:
+            self.stop_at_learning_step = None
+            return
+        try:
+            v = int(step_limit)
+        except Exception:
+            self.stop_at_learning_step = None
+            return
+        self.stop_at_learning_step = v if v > 0 else None
 
     def reset_learning_stats(self) -> None:
         self.episode_nr = 0
@@ -1552,11 +1564,18 @@ class LanderWidget(QtWidgets.QWidget):
         info_last: dict | None = None
         terminated = False
         latest_avg: float | None = None
+        stopped_by_step_limit = False
         # In headless learning mode, avoid constructing large info dicts every step.
         fast_learning = learning_mode and (not self.rendering_enabled)
 
         t0_learning = time.perf_counter() if dqn_learning else 0.0
         for _i in range(steps):
+            if learning_mode and self.stop_at_learning_step is not None:
+                if self.total_learning_steps >= int(self.stop_at_learning_step):
+                    self.set_running(False)
+                    stopped_by_step_limit = True
+                    break
+
             obs = self.env.observation()
             info_for_action = {} if fast_learning else self.env.info()
             action = int(self.agent.take_action(obs, info_for_action))
@@ -1634,6 +1653,8 @@ class LanderWidget(QtWidgets.QWidget):
         if learning_mode and (not self.rendering_enabled):
             steps_since = self.total_learning_steps - self._last_ui_emit_learning_step
             emit_ui = (latest_avg is not None) or (steps_since >= self._ui_emit_every_learning_steps)
+            if stopped_by_step_limit:
+                emit_ui = True
             if emit_ui:
                 self._last_ui_emit_learning_step = self.total_learning_steps
 
@@ -1946,6 +1967,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dqn_h.addWidget(self.btn_load_agent, 1)
         left_v.addWidget(dqn_buttons)
 
+        self.btn_reset_agent = QtWidgets.QPushButton("Reset DQN Agent")
+        self.btn_reset_agent.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_reset_agent.setFixedHeight(26)
+        self.btn_reset_agent.clicked.connect(self._on_reset_dqn)
+        left_v.addWidget(self.btn_reset_agent)
+
         left_v.addSpacing(6)
         shaping_title = QtWidgets.QLabel("Reward shaping")
         shaping_title.setStyleSheet("font-weight: 600;")
@@ -2088,11 +2115,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_render.toggled.connect(self.sim.set_rendering_enabled)
         left_v.addWidget(self.chk_render)
 
+        stop_row = QtWidgets.QWidget()
+        stop_h = QtWidgets.QHBoxLayout(stop_row)
+        stop_h.setContentsMargins(0, 0, 0, 0)
+        stop_h.setSpacing(8)
+
+        self.chk_stop_at_step = QtWidgets.QCheckBox("Stop at step:")
+        self.chk_stop_at_step.setToolTip("Auto-stop DQN training after the configured number of learning steps")
+        self.chk_stop_at_step.setChecked(True)
+
+        self.edit_stop_at_step = QtWidgets.QLineEdit("100000")
+        self.edit_stop_at_step.setFixedWidth(110)
+        self.edit_stop_at_step.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        self.edit_stop_at_step.setValidator(QtGui.QIntValidator(1, 1_000_000_000, self.edit_stop_at_step))
+        self.edit_stop_at_step.setToolTip("Maximum number of learning steps for DQN runs")
+
+        stop_h.addWidget(self.chk_stop_at_step, 1)
+        stop_h.addWidget(self.edit_stop_at_step, 0)
+        left_v.addWidget(stop_row)
+
         self.btn_start = QtWidgets.QPushButton("Start")
         # Don't steal keyboard focus from the simulation widget.
         self.btn_start.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.btn_start.clicked.connect(self._on_start_stop)
         left_v.addWidget(self.btn_start)
+
+        self.btn_run_experiments = QtWidgets.QPushButton("Run experiments")
+        self.btn_run_experiments.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.btn_run_experiments.setToolTip(
+            "Run all 20 DQN experiment combinations and write results.md + saved agent checkpoints"
+        )
+        self.btn_run_experiments.clicked.connect(self._on_run_experiments)
+        left_v.addWidget(self.btn_run_experiments)
 
         left_v.addStretch(1)
 
@@ -2198,13 +2252,142 @@ class MainWindow(QtWidgets.QMainWindow):
         torch_available = torch is not None
         self.btn_save_agent.setEnabled(torch_available and is_dqn_active)
         self.btn_load_agent.setEnabled(torch_available)
+        self.btn_reset_agent.setEnabled(torch_available and is_dqn_active)
         if not torch_available:
             tip = "PyTorch not available; DQN save/load disabled"
             self.btn_save_agent.setToolTip(tip)
             self.btn_load_agent.setToolTip(tip)
+            self.btn_reset_agent.setToolTip(tip)
         else:
             self.btn_save_agent.setToolTip("Save the current DQN agent checkpoint")
             self.btn_load_agent.setToolTip("Load a previously saved DQN agent checkpoint")
+            self.btn_reset_agent.setToolTip("Re-initialize the DQN with fresh random network weights")
+
+    def _get_stop_at_step(self) -> int | None:
+        text = self.edit_stop_at_step.text().strip()
+        if not text:
+            return None
+        try:
+            value = int(text)
+        except Exception:
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    def _build_dqn_agent(self, *, seed: int | None = 0) -> DQNAgent:
+        obs_dim = len(self.sim.env.observation())
+        return DQNAgent(
+            obs_dim=obs_dim,
+            seed=seed,
+            use_target_network=self.chk_dqn_target.isChecked(),
+            use_replay_buffer=self.chk_dqn_replay.isChecked(),
+        )
+
+    def _run_fixed_step_dqn_training(self, *, steps: int, process_events: bool = False) -> dict[str, Any]:
+        if not isinstance(self.sim.agent, DQNAgent):
+            raise RuntimeError("Active agent is not DQN")
+
+        agent = self.sim.agent
+        env = self.sim.env
+
+        self.sim.reset_learning_stats()
+        env.reset()
+        agent.reset()
+
+        total_steps = 0
+        episode_nr = 0
+        successful_landings = 0
+        reward_window_sum = 0.0
+        reward_window_count = 0
+        avg_reward_every_100: list[float] = []
+
+        t0 = time.perf_counter()
+        dt_step = 1.0 / 60.0
+        ui_chunk = 2000
+
+        while total_steps < int(steps):
+            obs = env.observation()
+            action = int(agent.take_action(obs, {}))
+            obs2, reward, terminated, _info = env.step(action, dt_step, include_info=False)
+            agent.observe(reward, terminated, obs2, {})
+
+            total_steps += 1
+            reward_window_sum += float(reward)
+            reward_window_count += 1
+
+            if reward_window_count >= 100:
+                avg_reward_every_100.append(reward_window_sum / float(reward_window_count))
+                reward_window_sum = 0.0
+                reward_window_count = 0
+
+            if terminated:
+                episode_nr += 1
+                if env.status_text == "LANDED":
+                    successful_landings += 1
+                env.reset()
+                agent.reset()
+
+            if process_events and (total_steps % ui_chunk) == 0:
+                QtWidgets.QApplication.processEvents()
+
+        wallclock_s = max(0.0, time.perf_counter() - t0)
+
+        self.sim.episode_nr = int(episode_nr)
+        self.sim.total_learning_steps = int(total_steps)
+        self.sim.successful_landings = int(successful_landings)
+        self.sim.learning_wallclock_s = float(wallclock_s)
+        self.sim._reward_window_sum = float(reward_window_sum)
+        self.sim._reward_window_count = int(reward_window_count)
+        self.sim.avg_reward_every_100 = list(avg_reward_every_100)
+        self.sim._last_ui_emit_learning_step = int(total_steps)
+
+        latest_avg = avg_reward_every_100[-1] if avg_reward_every_100 else None
+        self.sim.telemetryUpdated.emit(self.sim.env.info())
+        self.sim._emit_learning_stats(latest_avg=latest_avg)
+
+        return {
+            "steps": int(total_steps),
+            "episodes": int(episode_nr),
+            "successes": int(successful_landings),
+            "learning_wallclock_s": float(wallclock_s),
+        }
+
+    def _set_experiment_controls_enabled(self, enabled: bool) -> None:
+        widgets = [
+            self.btn_start,
+            self.btn_run_experiments,
+            self.btn_reset_agent,
+            self.cmb_controller,
+            self.chk_dqn_target,
+            self.chk_dqn_replay,
+            self.chk_stop_at_step,
+            self.edit_stop_at_step,
+        ]
+        for w in widgets:
+            w.setEnabled(bool(enabled))
+
+    def _apply_reward_profile(self, name: str) -> None:
+        # Profiles for automated experiment sweeps.
+        profiles: dict[str, tuple[bool, bool, bool]] = {
+            "landing_tube_only": (True, False, False),
+            "distance_only": (False, True, False),
+            "stability_only": (False, False, True),
+            "tube_plus_distance": (True, True, False),
+            "tube_plus_distance_plus_stability": (True, True, True),
+        }
+        tube, distance, stability = profiles[name]
+        self.chk_shape_tube.setChecked(tube)
+        self.chk_shape_distance.setChecked(distance)
+        self.chk_shape_stability.setChecked(stability)
+        self.chk_shape_energy.setChecked(False)
+
+    def _format_duration(self, seconds: float) -> str:
+        total = max(0, int(seconds))
+        hh = total // 3600
+        mm = (total % 3600) // 60
+        ss = total % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
     def _on_controller_changed(self, idx: int) -> None:
         # 0 = Human, 1 = Random, 2 = DQN
@@ -2212,6 +2395,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setText("Start")
         if idx == 0:
             self.sim.set_agent(HumanKeyboardAgent())
+            # Human play should be visual by default.
+            self.chk_render.setChecked(True)
             self._update_agent_io_buttons()
             return
 
@@ -2221,15 +2406,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # DQN agent learns online while controlling.
-        obs_dim = len(self.sim.env.observation())
-        self.sim.set_agent(
-            DQNAgent(
-                obs_dim=obs_dim,
-                seed=0,
-                use_target_network=self.chk_dqn_target.isChecked(),
-                use_replay_buffer=self.chk_dqn_replay.isChecked(),
+        try:
+            self.sim.set_agent(self._build_dqn_agent())
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "DQN initialization failed",
+                f"Could not create DQN agent:\n{e}",
             )
-        )
+            # Revert to human control to avoid mismatch between UI and active agent.
+            self.cmb_controller.blockSignals(True)
+            self.cmb_controller.setCurrentIndex(0)
+            self.cmb_controller.blockSignals(False)
+            self.sim.set_agent(HumanKeyboardAgent())
+            self._update_agent_io_buttons()
+            return
 
         # Default shaping setup for DQN learning.
         self.chk_shape_tube.setChecked(True)
@@ -2447,6 +2638,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         QtWidgets.QMessageBox.information(self, "Load DQN", f"Loaded DQN checkpoint from:\n{path}")
 
+    def _on_reset_dqn(self) -> None:
+        if torch is None:
+            QtWidgets.QMessageBox.warning(self, "Reset DQN", "PyTorch is not available.")
+            return
+
+        if not isinstance(self.sim.agent, DQNAgent):
+            QtWidgets.QMessageBox.information(self, "Reset DQN", "Switch the controller to 'DQN (learning)' first.")
+            return
+
+        ans = QtWidgets.QMessageBox.question(
+            self,
+            "Reset DQN",
+            "Reset DQN agent to freshly randomized network weights?\n"
+            "This clears current learning progress.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        self.sim.set_running(False)
+        self.sim.set_stop_at_learning_step(None)
+        self.sim.set_agent(self._build_dqn_agent(seed=None))
+        self.sim.reset_learning_stats()
+        self._update_agent_io_buttons()
+        self.statusBar().showMessage("DQN agent reset with fresh random initialization.", 5000)
+
     def _on_telemetry(self, t: dict) -> None:
         # Defensive: during headless learning we may intentionally skip info creation
         # for most steps; ensure we always render a full info dict.
@@ -2524,20 +2742,261 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fig.tight_layout()
             self._canvas.draw_idle()
 
+        # Optional fixed-length DQN experiment stop.
+        if self.sim.running and isinstance(self.sim.agent, DQNAgent) and self.chk_stop_at_step.isChecked():
+            stop_at = self._get_stop_at_step()
+            if stop_at is not None and steps >= int(stop_at):
+                self.sim.set_running(False)
+
     def _on_start_stop(self) -> None:
         if self.sim.running:
             self.sim.set_running(False)
+            self.sim.set_stop_at_learning_step(None)
             return
+
+        # Ensure active agent matches the selected controller.
+        selected_idx = int(self.cmb_controller.currentIndex())
+        try:
+            if selected_idx == 0 and not isinstance(self.sim.agent, HumanKeyboardAgent):
+                self.sim.set_agent(HumanKeyboardAgent())
+            elif selected_idx == 1 and not isinstance(self.sim.agent, RandomAgent):
+                self.sim.set_agent(RandomAgent(seed=0))
+            elif selected_idx == 2 and not isinstance(self.sim.agent, DQNAgent):
+                self.sim.set_agent(self._build_dqn_agent())
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Start failed",
+                f"Could not prepare selected controller:\n{e}",
+            )
+            return
+
+        self._update_agent_io_buttons()
 
         # Starting/resuming.
         is_human = isinstance(self.sim.agent, HumanKeyboardAgent)
+        is_dqn = isinstance(self.sim.agent, DQNAgent)
         if is_human and self.sim.env.frozen:
             # After crash/landing in human mode, Start begins a fresh episode.
             self.sim.reset()
+
+        if is_dqn and self.chk_stop_at_step.isChecked():
+            stop_at = self._get_stop_at_step()
+            if stop_at is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid stop step",
+                    "Please enter a positive integer in 'Stop at step'.",
+                )
+                return
+            # Absolute step target: stop when total learning steps reaches this value.
+            if self.sim.total_learning_steps >= int(stop_at):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Stop at step reached",
+                    f"Current learning steps are already {self.sim.total_learning_steps}.\n"
+                    f"Set a larger 'Stop at step' value, or reset the DQN agent.",
+                )
+                return
+            self.sim.set_stop_at_learning_step(int(stop_at))
+        else:
+            self.sim.set_stop_at_learning_step(None)
+
         self.sim.set_running(True)
         if is_human:
             # Ensure cursor keys work immediately (Start button would otherwise keep focus).
             self.sim.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _on_run_experiments(self) -> None:
+        if torch is None:
+            QtWidgets.QMessageBox.warning(self, "Run experiments", "PyTorch is not available.")
+            return
+
+        stop_at = self._get_stop_at_step()
+        if stop_at is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Run experiments",
+                "Please enter a positive integer in 'Stop at step'.",
+            )
+            return
+
+        self.sim.set_running(False)
+
+        root_dir = Path(__file__).resolve().parent
+        agents_dir = root_dir / "agents"
+        results_path = root_dir / "results.md"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+
+        combos_tricks = [
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ]
+        reward_profiles = [
+            ("landing_tube_only", "Landing Tube only"),
+            ("distance_only", "Distance reward only"),
+            ("stability_only", "Stability reward only"),
+            ("tube_plus_distance", "Landing Tube + Distance reward"),
+            ("tube_plus_distance_plus_stability", "Landing Tube + Distance + Stability reward"),
+        ]
+
+        rows: list[dict[str, Any]] = []
+        self._set_experiment_controls_enabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        progress = QtWidgets.QProgressDialog("Preparing experiments...", "Cancel", 0, 20, self)
+        progress.setWindowTitle("Run experiments")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        try:
+            exp_nr = 0
+            total = len(combos_tricks) * len(reward_profiles)
+            progress.setMaximum(total)
+            t_all_start = time.perf_counter()
+            canceled = False
+            for use_target_network, use_replay_buffer in combos_tricks:
+                self.chk_dqn_target.setChecked(use_target_network)
+                self.chk_dqn_replay.setChecked(use_replay_buffer)
+
+                for reward_key, reward_label in reward_profiles:
+                    if progress.wasCanceled():
+                        canceled = True
+                        break
+
+                    exp_nr += 1
+
+                    done_before = exp_nr - 1
+                    elapsed_before = max(0.0, time.perf_counter() - t_all_start)
+                    if done_before > 0:
+                        avg_per_exp = elapsed_before / float(done_before)
+                        eta_before = avg_per_exp * float(total - done_before)
+                        eta_text = self._format_duration(eta_before)
+                    else:
+                        eta_text = "calculating..."
+
+                    status_msg = f"Running experiment {exp_nr}/{total} (ETA {eta_text})"
+                    self.statusBar().showMessage(status_msg)
+                    progress.setLabelText(status_msg)
+                    progress.setValue(done_before)
+                    QtWidgets.QApplication.processEvents()
+
+                    self._apply_reward_profile(reward_key)
+                    self.sim.set_agent(self._build_dqn_agent())
+
+                    metrics = self._run_fixed_step_dqn_training(steps=int(stop_at), process_events=True)
+
+                    target_tag = "target_on" if use_target_network else "target_off"
+                    replay_tag = "replay_on" if use_replay_buffer else "replay_off"
+                    file_name = f"exp_{exp_nr:02d}_{target_tag}_{replay_tag}_{reward_key}_steps_{int(stop_at)}.pt"
+                    agent_path = agents_dir / file_name
+
+                    if isinstance(self.sim.agent, DQNAgent):
+                        ckpt = self.sim.agent.get_checkpoint(include_replay=False)
+                        ckpt["ui_learning_state"] = self.sim.get_learning_state()
+                        ckpt["reward_config"] = self._get_reward_config()
+                        ckpt["dqn_tricks"] = {
+                            "use_target_network": bool(use_target_network),
+                            "use_replay_buffer": bool(use_replay_buffer),
+                        }
+                        ckpt["experiment"] = {
+                            "id": int(exp_nr),
+                            "total_experiments": int(total),
+                            "reward_profile": reward_key,
+                            "reward_profile_label": reward_label,
+                            "steps": int(stop_at),
+                            "successes": int(metrics["successes"]),
+                        }
+                        torch.save(ckpt, str(agent_path))
+
+                    rows.append(
+                        {
+                            "id": int(exp_nr),
+                            "target": bool(use_target_network),
+                            "replay": bool(use_replay_buffer),
+                            "reward_label": str(reward_label),
+                            "steps": int(stop_at),
+                            "successes": int(metrics["successes"]),
+                            "agent_file": str(Path("agents") / file_name),
+                        }
+                    )
+
+                    elapsed_after = max(0.0, time.perf_counter() - t_all_start)
+                    avg_after = elapsed_after / float(exp_nr)
+                    remaining = max(0, total - exp_nr)
+                    eta_after = avg_after * float(remaining)
+                    done_msg = (
+                        f"Finished experiment {exp_nr}/{total} | "
+                        f"elapsed {self._format_duration(elapsed_after)} | "
+                        f"ETA {self._format_duration(eta_after)}"
+                    )
+                    self.statusBar().showMessage(done_msg)
+                    progress.setLabelText(done_msg)
+                    progress.setValue(exp_nr)
+                    QtWidgets.QApplication.processEvents()
+
+                if canceled:
+                    break
+
+            lines: list[str] = [
+                "# DQN Lunar Lander Experiment Results",
+                "",
+                f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                "| # | TargetNetwork | ReplayBuffer | Reward Setup | Steps | Successful Landings | Agent File |",
+                "|---:|:-------------:|:------------:|:-------------|------:|--------------------:|:-----------|",
+            ]
+            for row in rows:
+                lines.append(
+                    "| "
+                    f"{row['id']} | "
+                    f"{'yes' if row['target'] else 'no'} | "
+                    f"{'yes' if row['replay'] else 'no'} | "
+                    f"{row['reward_label']} | "
+                    f"{row['steps']} | "
+                    f"{row['successes']} | "
+                    f"{row['agent_file']} |"
+                )
+
+            results_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            total_elapsed = max(0.0, time.perf_counter() - t_all_start)
+            if canceled:
+                self.statusBar().showMessage(
+                    f"Canceled after {len(rows)} experiments. Wrote {results_path.name}. Elapsed {self._format_duration(total_elapsed)}.",
+                    10000,
+                )
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Run experiments",
+                    f"Canceled after {len(rows)} experiments.\n\n"
+                    f"Elapsed: {self._format_duration(total_elapsed)}\n"
+                    f"Partial results: {results_path}\n"
+                    f"Saved agents:    {agents_dir}",
+                )
+                return
+
+            self.statusBar().showMessage(
+                f"Finished {len(rows)} experiments in {self._format_duration(total_elapsed)}. Wrote {results_path.name} and saved agents.",
+                10000,
+            )
+            QtWidgets.QMessageBox.information(
+                self,
+                "Run experiments",
+                f"Finished {len(rows)} experiments.\n\n"
+                f"Elapsed: {self._format_duration(total_elapsed)}\n"
+                f"Results: {results_path}\n"
+                f"Agents:  {agents_dir}",
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Run experiments", f"Experiment run failed:\n{e}")
+        finally:
+            progress.close()
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._set_experiment_controls_enabled(True)
+            self._update_agent_io_buttons()
 
     def _on_running_changed(self, running: bool) -> None:
         self.btn_start.setText("Stop" if running else "Start")
