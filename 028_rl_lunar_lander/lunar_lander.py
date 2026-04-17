@@ -1509,6 +1509,11 @@ class LanderWidget(QtWidgets.QWidget):
     def _screen_to_world_y(self, y_screen: float) -> float:
         return self.height() - y_screen
 
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        # Keep physical top boundary aligned with the visible top edge.
+        self.env.world_h = float(self.height())
+
     def sizeHint(self) -> QtCore.QSize:
         return QtCore.QSize(900, 520)
 
