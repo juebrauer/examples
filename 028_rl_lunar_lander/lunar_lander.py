@@ -19,7 +19,7 @@ import time
 import wave
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, List, Protocol, Tuple
+from typing import Any, Callable, List, Protocol, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -1876,6 +1876,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Lunar Lander 2D (PySide6 demo)")
 
         self._contact_text_last: str | None = None
+        self._last_agent_dialog_dir: Path | None = None
 
         root = QtWidgets.QWidget(self)
         layout = QtWidgets.QHBoxLayout(root)
@@ -2284,7 +2285,14 @@ class MainWindow(QtWidgets.QMainWindow):
             use_replay_buffer=self.chk_dqn_replay.isChecked(),
         )
 
-    def _run_fixed_step_dqn_training(self, *, steps: int, process_events: bool = False) -> dict[str, Any]:
+    def _run_fixed_step_dqn_training(
+        self,
+        *,
+        steps: int,
+        process_events: bool = False,
+        progress_cb: Callable[[int, int], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(self.sim.agent, DQNAgent):
             raise RuntimeError("Active agent is not DQN")
 
@@ -2305,8 +2313,16 @@ class MainWindow(QtWidgets.QMainWindow):
         t0 = time.perf_counter()
         dt_step = 1.0 / 60.0
         ui_chunk = 2000
+        canceled = False
+
+        if progress_cb is not None:
+            progress_cb(0, int(steps))
 
         while total_steps < int(steps):
+            if should_stop is not None and should_stop():
+                canceled = True
+                break
+
             obs = env.observation()
             action = int(agent.take_action(obs, {}))
             obs2, reward, terminated, _info = env.step(action, dt_step, include_info=False)
@@ -2329,7 +2345,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 agent.reset()
 
             if process_events and (total_steps % ui_chunk) == 0:
+                if progress_cb is not None:
+                    progress_cb(total_steps, int(steps))
                 QtWidgets.QApplication.processEvents()
+
+        if progress_cb is not None:
+            progress_cb(total_steps, int(steps))
 
         wallclock_s = max(0.0, time.perf_counter() - t0)
 
@@ -2351,6 +2372,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "episodes": int(episode_nr),
             "successes": int(successful_landings),
             "learning_wallclock_s": float(wallclock_s),
+            "canceled": bool(canceled),
+            "completed": bool((not canceled) and (total_steps >= int(steps))),
         }
 
     def _set_experiment_controls_enabled(self, enabled: bool) -> None:
@@ -2547,14 +2570,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         default_name = "dqn_lunar_lander.pt"
+        initial_dir = self._get_agent_dialog_initial_dir()
         path, _flt = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save DQN agent",
-            str(Path.home() / default_name),
+            str(initial_dir / default_name),
             "PyTorch checkpoint (*.pt *.pth);;All files (*)",
         )
         if not path:
             return
+        self._remember_agent_dialog_dir(path)
 
         try:
             # Store both agent weights and the UI learning stats so a specific
@@ -2574,14 +2599,16 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Save DQN", f"Saved checkpoint to:\n{path}")
 
     def _on_load_dqn(self) -> None:
+        initial_dir = self._get_agent_dialog_initial_dir()
         path, _flt = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load DQN agent",
-            str(Path.home()),
+            str(initial_dir),
             "PyTorch checkpoint (*.pt *.pth);;All files (*)",
         )
         if not path:
             return
+        self._remember_agent_dialog_dir(path)
 
         try:
             ckpt = torch.load(path, map_location="cpu")
@@ -2664,6 +2691,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sim.reset_learning_stats()
         self._update_agent_io_buttons()
         self.statusBar().showMessage("DQN agent reset with fresh random initialization.", 5000)
+
+    def _get_agent_dialog_initial_dir(self) -> Path:
+        d = self._last_agent_dialog_dir
+        if d is not None and d.is_dir():
+            return d
+        return Path.cwd()
+
+    def _remember_agent_dialog_dir(self, selected_path: str) -> None:
+        p = Path(selected_path).expanduser()
+        d = p if p.is_dir() else p.parent
+        if d.is_dir():
+            self._last_agent_dialog_dir = d
 
     def _on_telemetry(self, t: dict) -> None:
         # Defensive: during headless learning we may intentionally skip info creation
@@ -2854,7 +2893,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             exp_nr = 0
             total = len(combos_tricks) * len(reward_profiles)
-            progress.setMaximum(total)
+            progress_scale = 1000
+            progress.setMaximum(total * progress_scale)
             t_all_start = time.perf_counter()
             canceled = False
             for use_target_network, use_replay_buffer in combos_tricks:
@@ -2880,13 +2920,52 @@ class MainWindow(QtWidgets.QMainWindow):
                     status_msg = f"Running experiment {exp_nr}/{total} (ETA {eta_text})"
                     self.statusBar().showMessage(status_msg)
                     progress.setLabelText(status_msg)
-                    progress.setValue(done_before)
+                    progress.setValue(done_before * progress_scale)
                     QtWidgets.QApplication.processEvents()
 
                     self._apply_reward_profile(reward_key)
                     self.sim.set_agent(self._build_dqn_agent())
 
-                    metrics = self._run_fixed_step_dqn_training(steps=int(stop_at), process_events=True)
+                    t_exp_start = time.perf_counter()
+
+                    def on_exp_progress(current_steps: int, target_steps: int) -> None:
+                        target = max(1, int(target_steps))
+                        cur = max(0, min(int(current_steps), target))
+                        frac = float(cur) / float(target)
+                        elapsed_exp = max(0.0, time.perf_counter() - t_exp_start)
+                        if cur > 0:
+                            eta_exp = elapsed_exp * float(target - cur) / float(cur)
+                            exp_eta_text = self._format_duration(eta_exp)
+                        else:
+                            exp_eta_text = "calculating..."
+
+                        virtual_done = float(done_before) + frac
+                        elapsed_global = max(0.0, time.perf_counter() - t_all_start)
+                        if virtual_done > 1e-9:
+                            eta_global = elapsed_global * float(total - virtual_done) / float(virtual_done)
+                            global_eta_text = self._format_duration(eta_global)
+                        else:
+                            global_eta_text = "calculating..."
+
+                        msg = (
+                            f"Running experiment {exp_nr}/{total} | "
+                            f"steps {cur}/{target} ({100.0 * frac:.1f}%) | "
+                            f"exp ETA {exp_eta_text} | total ETA {global_eta_text}"
+                        )
+                        self.statusBar().showMessage(msg)
+                        progress.setLabelText(msg)
+                        progress.setValue(int((float(done_before) + frac) * float(progress_scale)))
+
+                    metrics = self._run_fixed_step_dqn_training(
+                        steps=int(stop_at),
+                        process_events=True,
+                        progress_cb=on_exp_progress,
+                        should_stop=progress.wasCanceled,
+                    )
+
+                    if bool(metrics.get("canceled", False)):
+                        canceled = True
+                        break
 
                     target_tag = "target_on" if use_target_network else "target_off"
                     replay_tag = "replay_on" if use_replay_buffer else "replay_off"
@@ -2917,7 +2996,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             "target": bool(use_target_network),
                             "replay": bool(use_replay_buffer),
                             "reward_label": str(reward_label),
-                            "steps": int(stop_at),
+                            "steps": int(metrics["steps"]),
                             "successes": int(metrics["successes"]),
                             "agent_file": str(Path("agents") / file_name),
                         }
@@ -2934,7 +3013,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     self.statusBar().showMessage(done_msg)
                     progress.setLabelText(done_msg)
-                    progress.setValue(exp_nr)
+                    progress.setValue(exp_nr * progress_scale)
                     QtWidgets.QApplication.processEvents()
 
                 if canceled:
