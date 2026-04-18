@@ -1,11 +1,68 @@
-"""Minimal PySide6 lunar lander (no Gymnasium).
+"""Minimal PySide6 lunar lander demo with a small RL-friendly API.
 
-Controls:
+What this demo does:
+- Simulates a 2D lunar lander above procedurally generated terrain with a flat
+    landing pad.
+- Lets you fly the vehicle manually with the keyboard, run a random agent, or
+    train a small DQN agent online inside the GUI.
+- Visualizes telemetry, reward shaping, landing outcomes, and learning progress.
+
+Observation state / observation space:
+- The agent receives a continuous 8-dimensional observation tuple of floats.
+- The state variables are:
+    1. vel_x: horizontal velocity
+    2. vel_y: vertical velocity
+    3. angle_rad: current lander angle in radians, normalized to [-pi, pi]
+    4. ang_vel: angular velocity
+    5. pad_center_dx: horizontal offset to the landing pad center
+    6. pad_center_dy: vertical offset to the landing pad surface
+    7. altitude: height above the local ground directly below the lander
+    8. in_landing_pad: 1.0 if the lander is horizontally above the pad, else 0.0
+- In other words, the observation space is continuous, not discrete.
+
+Action state / action space:
+- The action space is discrete with 8 possible actions.
+- Internally, each action is a 3-bit mask that controls three thrusters:
+    main thruster, left thruster, and right thruster.
+- This yields all combinations from 0 to 7:
+    no thrust, only main, only left, only right, or any combination of them.
+
+Rewards used in the demo:
+- Optional landing-tube shaping reward: reward per step while the lander is
+    horizontally inside the pad region.
+- Optional distance shaping reward: reward per step when the distance to the pad
+    center decreases.
+- Optional stability shaping reward: reward per step when the lander is slow,
+    level, and not ascending.
+- Optional energy-usage shaping reward: usually a penalty per fired thruster.
+- Terminal reward for successful landing.
+- Terminal reward for crashing.
+- If a terminal reward is enabled and a terminal event happens, that terminal
+    reward overrides the shaping reward for that step.
+
+Hyperparameters and settings you can adjust in the demo UI:
+- Controller mode: Human, Random, or DQN.
+- DQN tricks: enable or disable the target network and replay buffer.
+- Reward shaping toggles and magnitudes:
+    landing tube, distance reward, stability reward, energy usage reward.
+- Terminal reward toggles and magnitudes for landing success and crash.
+- Learning run limit: stop automatically after a chosen number of learning steps.
+- Rendering on/off, which trades visualization for faster training.
+- Sound on/off.
+
+Important note:
+- The DQN implementation also has additional internal hyperparameters such as
+    hidden layer sizes, learning rate, gamma, batch size, replay size, warmup
+    steps, train frequency, and epsilon schedule. These exist in code, but in the
+    current version of the demo they are fixed defaults and are not exposed as GUI
+    controls.
+
+Manual controls:
 - Left Arrow: fire left thruster
 - Right Arrow: fire right thruster
 - Up Arrow: fire bottom thruster
 
-Goal: land softly on the uneven moon surface.
+Goal: land softly on the landing pad.
 """
 
 from __future__ import annotations
