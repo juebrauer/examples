@@ -335,7 +335,7 @@ class DQNAgent:
         *,
         obs_dim: int,
         action_space_n: int = ACTION_SPACE_N,
-        hidden_sizes: tuple[int, int] = (128, 128),
+        hidden_sizes: tuple[int, int] = (64, 32),
         lr: float = 1e-3,
         gamma: float = 0.995,
         batch_size: int = 64,
@@ -719,7 +719,7 @@ class LunarLanderEnv:
         self.tube_shaping_enabled = False
 
         # Shaping reward magnitudes (editable from UI).
-        self.tube_shaping_reward = 1.0
+        self.tube_shaping_reward = 2.0
 
         # +1 if the lander reduced its distance to the pad center this step.
         self.distance_shaping_enabled = False
@@ -734,7 +734,7 @@ class LunarLanderEnv:
         # Energy usage shaping: per-thruster penalty/reward applied each step.
         # Default: -1 for each thruster used (main/left/right).
         self.energy_usage_shaping_enabled = False
-        self.energy_usage_reward_per_throttle = -1.0
+        self.energy_usage_reward_per_throttle = -0.05
 
         # Terminal reward magnitude.
         self.terminal_reward_success = 100.0
