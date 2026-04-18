@@ -996,7 +996,12 @@ class LunarLanderEnv:
             dy1 = lander1.pos.y - (pad1.y + lander1.radius)
             d1 = math.hypot(dx1, dy1)
             distance_metric = float(d1)
-            reward_distance = float(self.distance_shaping_reward) if (d1 + 1e-9) < float(d0) else 0.0
+            if float(d1) < float(d0) - 1e-9:
+                reward_distance = float(self.distance_shaping_reward)
+            elif float(d1) > float(d0) + 1e-9:
+                reward_distance = -float(self.distance_shaping_reward)
+            else:
+                reward_distance = 0.0
 
         # Stability: configured reward when slow + level + not ascending (anywhere).
         if (not terminated) and self.stability_shaping_enabled:
