@@ -31,7 +31,9 @@ Rewards used in the demo:
 - Optional landing-tube shaping reward: reward per step while the lander is
     horizontally inside the pad region.
 - Optional distance shaping reward: reward per step when the distance to the pad
-    center decreases while the lander is inside the landing tube.
+    center decreases (independent of being inside the landing tube).
+- Optional near-to-crash shaping reward: penalty per step when the lander is low
+    above the terrain outside the landing pad region.
 - Optional stability shaping reward: reward per step when the lander is slow,
     level, and not ascending.
 - Optional energy-usage shaping reward: usually a penalty per fired thruster.
@@ -44,7 +46,8 @@ Hyperparameters and settings you can adjust in the demo UI:
 - Controller mode: Human, Random, or DQN.
 - DQN tricks: enable or disable the target network and replay buffer.
 - Reward shaping toggles and magnitudes:
-    landing tube, distance reward, stability reward, energy usage reward.
+    landing tube, distance reward, near-to-crash reward, stability reward,
+    energy usage reward.
 - Terminal reward toggles and magnitudes for landing success and crash.
 - Learning run limit: stop automatically after a chosen number of learning steps.
 - Rendering on/off, which trades visualization for faster training.
@@ -707,6 +710,7 @@ class LunarLanderEnv:
         self.last_reward_tube = 0.0
         self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
+        self.last_reward_near_crash = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
 
@@ -722,10 +726,15 @@ class LunarLanderEnv:
         self.tube_shaping_reward = 2.0
 
         # +1 if the lander reduced its distance to the pad center this step
-        # while inside the landing tube.
+        # (independent of whether it is inside the landing tube).
         self.distance_shaping_enabled = False
 
         self.distance_shaping_reward = 1.0
+
+        # Penalty when the lander gets too close to the ground away from pad.
+        self.near_crash_shaping_enabled = True
+        self.near_crash_shaping_reward = -5.0
+        self.near_crash_altitude_threshold = 50.0
 
         # +1 if the lander is in a "stable" configuration (slow + level + not ascending).
         self.stability_shaping_enabled = False
@@ -762,6 +771,21 @@ class LunarLanderEnv:
     def set_distance_shaping_reward(self, reward: float) -> None:
         try:
             self.distance_shaping_reward = float(reward)
+        except Exception:
+            return
+
+    def set_near_crash_shaping(self, enabled: bool) -> None:
+        self.near_crash_shaping_enabled = bool(enabled)
+
+    def set_near_crash_shaping_reward(self, reward: float) -> None:
+        try:
+            self.near_crash_shaping_reward = float(reward)
+        except Exception:
+            return
+
+    def set_near_crash_altitude_threshold(self, threshold: float) -> None:
+        try:
+            self.near_crash_altitude_threshold = max(0.0, float(threshold))
         except Exception:
             return
 
@@ -866,6 +890,7 @@ class LunarLanderEnv:
         self.last_reward_tube = 0.0
         self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
+        self.last_reward_near_crash = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
 
@@ -922,10 +947,12 @@ class LunarLanderEnv:
             "reward_tube": float(self.last_reward_tube),
             "reward_energy": float(self.last_reward_energy),
             "reward_terminal": float(self.last_reward_terminal),
+            "reward_near_crash": float(self.last_reward_near_crash),
             "distance_metric": float(self.last_distance_metric),
             "stability_metric": float(self.last_stability_metric),
             "tube_shaping_enabled": bool(self.tube_shaping_enabled),
             "distance_shaping_enabled": bool(self.distance_shaping_enabled),
+            "near_crash_shaping_enabled": bool(self.near_crash_shaping_enabled),
             "stability_shaping_enabled": bool(self.stability_shaping_enabled),
             "energy_usage_shaping_enabled": bool(self.energy_usage_shaping_enabled),
             "in_reward_tube": bool(self.landing_pad.x0 <= lander.pos.x <= self.landing_pad.x1),
@@ -949,6 +976,7 @@ class LunarLanderEnv:
         self.last_reward_tube = 0.0
         self.last_reward_energy = 0.0
         self.last_reward_terminal = 0.0
+        self.last_reward_near_crash = 0.0
         self.last_distance_metric = 0.0
         self.last_stability_metric = 0.0
 
@@ -964,6 +992,7 @@ class LunarLanderEnv:
         reward_stability = 0.0
         reward_tube = 0.0
         reward_energy = 0.0
+        reward_near_crash = 0.0
 
         distance_metric = 0.0
         stability_metric = 0.0
@@ -990,22 +1019,28 @@ class LunarLanderEnv:
             reward_tube = float(self.tube_shaping_reward) if in_tube1 else 0.0
 
         # Distance reduction: configured reward if the distance to the pad center
-        # decreased while inside the landing tube.
+        # decreased this step (everywhere, not only inside the tube).
         if (not terminated) and self.distance_shaping_enabled:
             lander1 = self.lander
             pad1 = self.landing_pad
-            in_tube1 = pad1.x0 <= lander1.pos.x <= pad1.x1
-            if in_tube1:
-                dx1 = lander1.pos.x - pad1.cx
-                dy1 = lander1.pos.y - (pad1.y + lander1.radius)
-                d1 = math.hypot(dx1, dy1)
-                distance_metric = float(d1)
-                if float(d1) < float(d0) - 1e-9:
-                    reward_distance = float(self.distance_shaping_reward)
-                elif float(d1) > float(d0) + 1e-9:
-                    reward_distance = -float(self.distance_shaping_reward)
-                else:
-                    reward_distance = 0.0
+            dx1 = lander1.pos.x - pad1.cx
+            dy1 = lander1.pos.y - (pad1.y + lander1.radius)
+            d1 = math.hypot(dx1, dy1)
+            distance_metric = float(d1)
+            if float(d1) < float(d0) - 1e-9:
+                reward_distance = float(self.distance_shaping_reward)
+            else:
+                reward_distance = 0.0
+
+        # Near-to-crash: penalty when low over terrain away from landing pad.
+        if (not terminated) and self.near_crash_shaping_enabled:
+            lander1 = self.lander
+            in_pad1 = self.landing_pad.x0 <= lander1.pos.x <= self.landing_pad.x1
+            if not in_pad1:
+                ground1 = self.terrain.height_at(lander1.pos.x)
+                altitude1 = max(0.0, lander1.pos.y - (ground1 + lander1.radius))
+                if altitude1 <= float(self.near_crash_altitude_threshold):
+                    reward_near_crash = float(self.near_crash_shaping_reward)
 
         # Stability: configured reward when slow + level + not ascending (anywhere).
         if (not terminated) and self.stability_shaping_enabled:
@@ -1019,7 +1054,7 @@ class LunarLanderEnv:
             throttles_used = int(burn_main > 0.0) + int(burn_left > 0.0) + int(burn_right > 0.0)
             reward_energy = float(self.energy_usage_reward_per_throttle) * float(throttles_used)
 
-        reward = reward_distance + reward_stability + reward_tube + reward_energy
+        reward = reward_distance + reward_stability + reward_tube + reward_energy + reward_near_crash
 
         terminal_success: bool | None = None
         terminal_reward = 0.0
@@ -1043,6 +1078,7 @@ class LunarLanderEnv:
         self.last_reward_tube = float(reward_tube)
         self.last_reward_energy = float(reward_energy)
         self.last_reward_terminal = float(terminal_reward)
+        self.last_reward_near_crash = float(reward_near_crash)
         # Expose current (post-step) metrics for UI overlays.
         self.last_distance_metric = float(distance_metric)
         self.last_stability_metric = float(stability_metric)
@@ -1765,6 +1801,7 @@ class LanderWidget(QtWidgets.QWidget):
         if not (
             self.env.tube_shaping_enabled
             or self.env.distance_shaping_enabled
+            or self.env.near_crash_shaping_enabled
             or self.env.stability_shaping_enabled
         ):
             return
@@ -1776,6 +1813,43 @@ class LanderWidget(QtWidgets.QWidget):
         p_pad_center = self._world_to_screen(Vec2(pad.cx, pad.y + lander.radius))
 
         painter.save()
+
+        # Near-to-crash visualization: near-ground danger band outside landing pad.
+        if self.env.near_crash_shaping_enabled:
+            threshold = float(self.env.near_crash_altitude_threshold)
+            terrain_points = self.env.terrain.points
+
+            def draw_near_crash_band(x0: float, x1: float) -> None:
+                if x1 <= x0 + 1e-9:
+                    return
+
+                seg: list[tuple[float, float]] = [(x, y) for (x, y) in terrain_points if x0 <= x <= x1]
+                if not seg or abs(seg[0][0] - x0) > 1e-9:
+                    seg.insert(0, (x0, self.env.terrain.height_at(x0)))
+                if abs(seg[-1][0] - x1) > 1e-9:
+                    seg.append((x1, self.env.terrain.height_at(x1)))
+                if len(seg) < 2:
+                    return
+
+                top_world = [(x, y + threshold) for (x, y) in seg]
+
+                poly = QtGui.QPolygonF()
+                for x, y in top_world:
+                    poly.append(QtCore.QPointF(x, self.height() - y))
+                for x, y in reversed(seg):
+                    poly.append(QtCore.QPointF(x, self.height() - y))
+
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 90, 90, 120), 1.5))
+                painter.setBrush(QtGui.QColor(255, 70, 70, 48))
+                painter.drawPolygon(poly)
+
+            # Draw the danger band on both sides of the landing pad.
+            draw_near_crash_band(0.0, pad.x0)
+            draw_near_crash_band(pad.x1, self.env.world_w)
+
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 150, 150), 1))
+            label_y = self.height() - (self.env.terrain.height_at(max(0.0, pad.x0 - 60.0)) + threshold) - 6.0
+            painter.drawText(QtCore.QPointF(8.0, max(16.0, label_y)), "near-to-crash zone")
 
         # Landing tube visualization.
         if self.env.tube_shaping_enabled:
@@ -1825,6 +1899,13 @@ class LanderWidget(QtWidgets.QWidget):
             if abs(r_stab) > 1e-12:
                 painter.setPen(QtGui.QPen(QtGui.QColor(180, 220, 255), 1))
                 painter.drawText(p_lander + QtCore.QPointF(18.0, -36.0), f"stab r: {r_stab:+.1f}")
+
+        # Show near-to-crash reward close to the lander when active.
+        if self.env.near_crash_shaping_enabled:
+            r_near = float(info.get("reward_near_crash", 0.0))
+            if abs(r_near) > 1e-12:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 140, 140), 1))
+                painter.drawText(p_lander + QtCore.QPointF(18.0, -50.0), f"near r: {r_near:+.1f}")
 
         painter.restore()
 
@@ -2097,6 +2178,15 @@ class MainWindow(QtWidgets.QMainWindow):
             on_value=self.sim.env.set_distance_shaping_reward,
             initial_value=float(self.sim.env.distance_shaping_reward),
         )
+
+        self.chk_shape_near_crash, self.spin_shape_near_crash = add_shaping_row(
+            "Near to crash",
+            "Per-step penalty if altitude is <= 50 above terrain while not over the landing pad",
+            on_toggle=self.sim.env.set_near_crash_shaping,
+            on_value=self.sim.env.set_near_crash_shaping_reward,
+            initial_value=float(self.sim.env.near_crash_shaping_reward),
+        )
+        self.chk_shape_near_crash.setChecked(bool(self.sim.env.near_crash_shaping_enabled))
 
         self.chk_shape_stability, self.spin_shape_stability = add_shaping_row(
             "Stability reward",
