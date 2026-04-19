@@ -1,6 +1,7 @@
 import math
 import random
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Tuple
@@ -58,7 +59,7 @@ class Simple2DWorld:
     ACTION_FORWARD = 2
     ACTION_BACKWARD = 3
 
-    def __init__(self, world_size: int = 160, max_steps: int = 260) -> None:
+    def __init__(self, world_size: int = 160, max_steps: int = 1000) -> None:
         self.world_size = world_size
         self.max_steps = max_steps
         self.robot_radius = 3.5
@@ -419,6 +420,7 @@ class WorldView(QWidget):
         super().__init__()
         self.env = env
         self.draw_trajectory = False
+        self.show_original_world_size = False
         self.trajectory_points: List[Tuple[float, float]] = []
         self.setMinimumSize(600, 600)
 
@@ -427,9 +429,12 @@ class WorldView(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
 
-        s = min(self.width(), self.height())
         margin = 14
-        draw_size = s - margin * 2
+        max_draw_size = min(self.width(), self.height()) - margin * 2
+        if self.show_original_world_size:
+            draw_size = min(int(self.env.world_size), max_draw_size)
+        else:
+            draw_size = max_draw_size
         if draw_size <= 10:
             return
         x0 = (self.width() - draw_size) // 2
@@ -557,17 +562,30 @@ class DistanceProgressPlot(QWidget):
 
         self._x: List[int] = []
         self._y: List[float] = []
+        self._needs_redraw = False
 
-    def append_point(self, episode_idx: int, fraction: float) -> None:
+    def append_point(self, episode_idx: int, fraction: float, render: bool = True) -> None:
         self._x.append(episode_idx)
         self._y.append(float(np.clip(fraction, 0.0, 1.0)))
 
+        self._apply_data_to_axes()
+        if render:
+            self.canvas.draw_idle()
+            self._needs_redraw = False
+        else:
+            self._needs_redraw = True
+
+    def redraw_if_needed(self) -> None:
+        self._apply_data_to_axes()
+        self.canvas.draw_idle()
+        self._needs_redraw = False
+
+    def _apply_data_to_axes(self) -> None:
         self.line.set_data(self._x, self._y)
         if self._x:
             left = max(1, self._x[0])
             right = max(left + 1, self._x[-1])
             self.ax.set_xlim(left, right)
-        self.canvas.draw_idle()
 
 
 class MainWindow(QMainWindow):
@@ -575,7 +593,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DQN + CNN Navigation Demo (PySide6)")
 
-        self.env = Simple2DWorld(world_size=160, max_steps=260)
+        self.env = Simple2DWorld(world_size=160, max_steps=1000)
         self.trainer = DQNTrainer(image_size=160)
 
         self.current_state_hwc = self.env.render_image()
@@ -586,6 +604,12 @@ class MainWindow(QMainWindow):
         self.last_reward = 0.0
         self.last_loss = None
         self.total_steps = 0
+        self.steps_since_speed_reset = 0
+        self.speed_reset_time = time.monotonic()
+        self.steps_per_sec = 0.0
+        self.rendering_enabled = True
+        self.status_refresh_interval_sec = 5.0
+        self._last_status_refresh_time = time.monotonic()
         self.running = False
         self.recent_episode_rewards: Deque[float] = deque(maxlen=20)
         self.trajectory_points: List[Tuple[float, float]] = [(self.env.robot_x, self.env.robot_y)]
@@ -625,6 +649,11 @@ class MainWindow(QMainWindow):
         self.chk_draw_trajectory.setChecked(False)
         self.chk_draw_trajectory.toggled.connect(self._on_draw_trajectory_toggled)
         rewards_layout.addWidget(self.chk_draw_trajectory)
+
+        self.chk_show_original_world_size = QCheckBox("Show original world size")
+        self.chk_show_original_world_size.setChecked(False)
+        self.chk_show_original_world_size.toggled.connect(self._on_show_original_world_size_toggled)
+        rewards_layout.addWidget(self.chk_show_original_world_size)
         right.addWidget(rewards_group)
 
         status_group = QGroupBox("Training Status")
@@ -638,6 +667,7 @@ class MainWindow(QMainWindow):
         self.lbl_loss = QLabel("Loss: -")
         self.lbl_steps = QLabel("Total steps: 0")
         self.lbl_episode_steps = QLabel(f"Episode steps: 0 / {self.env.max_steps}")
+        self.lbl_steps_per_sec = QLabel("Training steps/sec: -")
 
         status_layout.addWidget(self.lbl_episode, 0, 0)
         status_layout.addWidget(self.lbl_ep_reward, 1, 0)
@@ -647,6 +677,7 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.lbl_loss, 5, 0)
         status_layout.addWidget(self.lbl_steps, 6, 0)
         status_layout.addWidget(self.lbl_episode_steps, 7, 0)
+        status_layout.addWidget(self.lbl_steps_per_sec, 8, 0)
 
         right.addWidget(status_group)
 
@@ -655,6 +686,11 @@ class MainWindow(QMainWindow):
         self.progress_plot = DistanceProgressPlot()
         progress_layout.addWidget(self.progress_plot)
         right.addWidget(progress_group)
+
+        self.chk_rendering = QCheckBox("Rendering")
+        self.chk_rendering.setChecked(True)
+        self.chk_rendering.toggled.connect(self._on_rendering_toggled)
+        right.addWidget(self.chk_rendering)
 
         self.btn_start_stop = QPushButton("Start Training")
         self.btn_start_stop.clicked.connect(self.toggle_training)
@@ -702,10 +738,11 @@ class MainWindow(QMainWindow):
             self.episode_reward += reward
             self.last_reward = reward
             self.total_steps += 1
+            self.steps_since_speed_reset += 1
 
             if done:
                 frac = self._episode_max_distance_fraction()
-                self.progress_plot.append_point(self.episode_idx + 1, frac)
+                self.progress_plot.append_point(self.episode_idx + 1, frac, render=self.rendering_enabled)
                 self.recent_episode_rewards.append(self.episode_reward)
                 self.episode_idx += 1
                 self.episode_reward = 0.0
@@ -716,8 +753,15 @@ class MainWindow(QMainWindow):
                 self.episode_start_distance = self._current_start_goal_distance()
                 self.episode_min_distance = self.episode_start_distance
 
-        self.world_view.update()
-        self._refresh_labels()
+        if self.rendering_enabled:
+            self.world_view.update()
+            self._refresh_labels()
+        else:
+            now = time.monotonic()
+            if now - self._last_status_refresh_time >= self.status_refresh_interval_sec:
+                self._refresh_labels()
+                self.progress_plot.redraw_if_needed()
+                self._last_status_refresh_time = now
 
     def _on_step_limit_changed(self, value: int) -> None:
         self.env.max_steps = int(value)
@@ -726,6 +770,19 @@ class MainWindow(QMainWindow):
     def _on_draw_trajectory_toggled(self, checked: bool) -> None:
         self.world_view.draw_trajectory = checked
         self.world_view.update()
+
+    def _on_show_original_world_size_toggled(self, checked: bool) -> None:
+        self.world_view.show_original_world_size = checked
+        self.world_view.update()
+
+    def _on_rendering_toggled(self, checked: bool) -> None:
+        self.rendering_enabled = checked
+        if self.rendering_enabled:
+            self.world_view.update()
+            self._refresh_labels()
+            self.progress_plot.redraw_if_needed()
+        else:
+            self._last_status_refresh_time = time.monotonic()
 
     def _current_start_goal_distance(self) -> float:
         return self.env._distance(self.env.robot_x, self.env.robot_y, self.env.goal_x, self.env.goal_y)
@@ -746,8 +803,14 @@ class MainWindow(QMainWindow):
         self.lbl_avg_reward.setText(f"Avg reward (20): {avg_reward:.2f}")
         self.lbl_epsilon.setText(f"Epsilon: {self.trainer.epsilon():.3f}")
         self.lbl_loss.setText("Loss: -" if self.last_loss is None else f"Loss: {self.last_loss:.4f}")
+        elapsed = time.monotonic() - self.speed_reset_time
+        if elapsed >= 1.0:
+            self.steps_per_sec = self.steps_since_speed_reset / elapsed
+            self.steps_since_speed_reset = 0
+            self.speed_reset_time = time.monotonic()
         self.lbl_steps.setText(f"Total steps: {self.total_steps}")
         self.lbl_episode_steps.setText(f"Episode steps: {self.env.step_count} / {self.env.max_steps}")
+        self.lbl_steps_per_sec.setText(f"Training steps/sec: {self.steps_per_sec:.1f}")
 
 
 def main() -> None:
