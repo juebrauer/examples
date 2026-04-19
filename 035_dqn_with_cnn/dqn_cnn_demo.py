@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Deque, List, Tuple
 
 import numpy as np
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -534,6 +536,40 @@ class RewardEditor(QWidget):
         )
 
 
+class DistanceProgressPlot(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.figure = Figure(figsize=(5.0, 2.2), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        layout.addWidget(self.canvas)
+
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title("Max distance fraction per episode", fontsize=10)
+        self.ax.set_xlabel("Episode")
+        self.ax.set_ylabel("Fraction")
+        self.ax.set_ylim(0.0, 1.05)
+        self.ax.grid(True, alpha=0.25)
+        (self.line,) = self.ax.plot([], [], color="#2070b8", linewidth=1.8)
+
+        self._x: List[int] = []
+        self._y: List[float] = []
+
+    def append_point(self, episode_idx: int, fraction: float) -> None:
+        self._x.append(episode_idx)
+        self._y.append(float(np.clip(fraction, 0.0, 1.0)))
+
+        self.line.set_data(self._x, self._y)
+        if self._x:
+            left = max(1, self._x[0])
+            right = max(left + 1, self._x[-1])
+            self.ax.set_xlim(left, right)
+        self.canvas.draw_idle()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -553,6 +589,8 @@ class MainWindow(QMainWindow):
         self.running = False
         self.recent_episode_rewards: Deque[float] = deque(maxlen=20)
         self.trajectory_points: List[Tuple[float, float]] = [(self.env.robot_x, self.env.robot_y)]
+        self.episode_start_distance = self._current_start_goal_distance()
+        self.episode_min_distance = self.episode_start_distance
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -612,6 +650,12 @@ class MainWindow(QMainWindow):
 
         right.addWidget(status_group)
 
+        progress_group = QGroupBox("Learning Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.progress_plot = DistanceProgressPlot()
+        progress_layout.addWidget(self.progress_plot)
+        right.addWidget(progress_group)
+
         self.btn_start_stop = QPushButton("Start Training")
         self.btn_start_stop.clicked.connect(self.toggle_training)
         right.addWidget(self.btn_start_stop)
@@ -650,11 +694,18 @@ class MainWindow(QMainWindow):
             self.current_state_hwc = next_state_hwc
             self.trajectory_points.append((self.env.robot_x, self.env.robot_y))
 
+            current_dist = self.env._distance(
+                self.env.robot_x, self.env.robot_y, self.env.goal_x, self.env.goal_y
+            )
+            self.episode_min_distance = min(self.episode_min_distance, current_dist)
+
             self.episode_reward += reward
             self.last_reward = reward
             self.total_steps += 1
 
             if done:
+                frac = self._episode_max_distance_fraction()
+                self.progress_plot.append_point(self.episode_idx + 1, frac)
                 self.recent_episode_rewards.append(self.episode_reward)
                 self.episode_idx += 1
                 self.episode_reward = 0.0
@@ -662,6 +713,8 @@ class MainWindow(QMainWindow):
                 self.current_state_chw = self.trainer.to_chw(self.current_state_hwc)
                 self.trajectory_points = [(self.env.robot_x, self.env.robot_y)]
                 self.world_view.trajectory_points = self.trajectory_points
+                self.episode_start_distance = self._current_start_goal_distance()
+                self.episode_min_distance = self.episode_start_distance
 
         self.world_view.update()
         self._refresh_labels()
@@ -673,6 +726,13 @@ class MainWindow(QMainWindow):
     def _on_draw_trajectory_toggled(self, checked: bool) -> None:
         self.world_view.draw_trajectory = checked
         self.world_view.update()
+
+    def _current_start_goal_distance(self) -> float:
+        return self.env._distance(self.env.robot_x, self.env.robot_y, self.env.goal_x, self.env.goal_y)
+
+    def _episode_max_distance_fraction(self) -> float:
+        d0 = max(self.episode_start_distance, 1e-6)
+        return (d0 - self.episode_min_distance) / d0
 
     def _refresh_labels(self) -> None:
         avg_reward = (
