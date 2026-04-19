@@ -31,7 +31,7 @@ Rewards used in the demo:
 - Optional landing-tube shaping reward: reward per step while the lander is
     horizontally inside the pad region.
 - Optional distance shaping reward: reward per step when the distance to the pad
-    center decreases.
+    center decreases while the lander is inside the landing tube.
 - Optional stability shaping reward: reward per step when the lander is slow,
     level, and not ascending.
 - Optional energy-usage shaping reward: usually a penalty per fired thruster.
@@ -721,7 +721,8 @@ class LunarLanderEnv:
         # Shaping reward magnitudes (editable from UI).
         self.tube_shaping_reward = 2.0
 
-        # +1 if the lander reduced its distance to the pad center this step.
+        # +1 if the lander reduced its distance to the pad center this step
+        # while inside the landing tube.
         self.distance_shaping_enabled = False
 
         self.distance_shaping_reward = 1.0
@@ -988,20 +989,23 @@ class LunarLanderEnv:
             in_tube1 = self.landing_pad.x0 <= lander1.pos.x <= self.landing_pad.x1
             reward_tube = float(self.tube_shaping_reward) if in_tube1 else 0.0
 
-        # Distance reduction: configured reward if the distance to the pad center decreased.
+        # Distance reduction: configured reward if the distance to the pad center
+        # decreased while inside the landing tube.
         if (not terminated) and self.distance_shaping_enabled:
             lander1 = self.lander
             pad1 = self.landing_pad
-            dx1 = lander1.pos.x - pad1.cx
-            dy1 = lander1.pos.y - (pad1.y + lander1.radius)
-            d1 = math.hypot(dx1, dy1)
-            distance_metric = float(d1)
-            if float(d1) < float(d0) - 1e-9:
-                reward_distance = float(self.distance_shaping_reward)
-            elif float(d1) > float(d0) + 1e-9:
-                reward_distance = -float(self.distance_shaping_reward)
-            else:
-                reward_distance = 0.0
+            in_tube1 = pad1.x0 <= lander1.pos.x <= pad1.x1
+            if in_tube1:
+                dx1 = lander1.pos.x - pad1.cx
+                dy1 = lander1.pos.y - (pad1.y + lander1.radius)
+                d1 = math.hypot(dx1, dy1)
+                distance_metric = float(d1)
+                if float(d1) < float(d0) - 1e-9:
+                    reward_distance = float(self.distance_shaping_reward)
+                elif float(d1) > float(d0) + 1e-9:
+                    reward_distance = -float(self.distance_shaping_reward)
+                else:
+                    reward_distance = 0.0
 
         # Stability: configured reward when slow + level + not ascending (anywhere).
         if (not terminated) and self.stability_shaping_enabled:
