@@ -15,12 +15,14 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -59,7 +61,7 @@ class Simple2DWorld:
     ACTION_FORWARD = 2
     ACTION_BACKWARD = 3
 
-    def __init__(self, world_size: int = 160, max_steps: int = 1000) -> None:
+    def __init__(self, world_size: int = 160, max_steps: int = 500) -> None:
         self.world_size = world_size
         self.max_steps = max_steps
         self.robot_radius = 3.5
@@ -90,7 +92,7 @@ class Simple2DWorld:
     def step(self, action: int, rewards: RewardConfig) -> Tuple[np.ndarray, float, bool, dict]:
         self.step_count += 1
         old_dist = self._distance(self.robot_x, self.robot_y, self.goal_x, self.goal_y)
-        reward = 0.0
+        reward = -0.01
         done = False
         collision = False
 
@@ -334,14 +336,16 @@ class DQNTrainer:
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
         self.gamma = 0.99
-        self.lr = 1e-3
+        self.lr = 1e-4
         self.batch_size = 64
-        self.target_sync_every = 300
-        self.learn_starts = 600
+        self.target_sync_every = 1500
+        self.learn_starts = 5000
+        self.train_every = 4
+        self.reward_clip = 1.0
 
         self.epsilon_start = 1.0
         self.epsilon_end = 0.05
-        self.epsilon_decay_steps = 24000
+        self.epsilon_decay_steps = 120000
 
         self.num_actions = 4
         self.step_idx = 0
@@ -385,6 +389,8 @@ class DQNTrainer:
 
     def train_step(self) -> float | None:
         self.step_idx += 1
+        if self.step_idx % self.train_every != 0:
+            return None
         if len(self.replay) < max(self.learn_starts, self.batch_size):
             return None
 
@@ -399,10 +405,13 @@ class DQNTrainer:
         q_pred = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_q = self.target_net(next_states).max(dim=1)[0]
-            q_target = rewards + (1.0 - dones) * self.gamma * next_q
+            # Double DQN: choose next action with policy net, evaluate with target net.
+            next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
+            next_q = self.target_net(next_states).gather(1, next_actions).squeeze(1)
+            clipped_rewards = torch.clamp(rewards, -self.reward_clip, self.reward_clip)
+            q_target = clipped_rewards + (1.0 - dones) * self.gamma * next_q
 
-        loss = nn.functional.mse_loss(q_pred, q_target)
+        loss = nn.functional.smooth_l1_loss(q_pred, q_target)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -593,7 +602,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DQN + CNN Navigation Demo (PySide6)")
 
-        self.env = Simple2DWorld(world_size=160, max_steps=1000)
+        self.env = Simple2DWorld(world_size=160, max_steps=500)
         self.trainer = DQNTrainer(image_size=160)
 
         self.current_state_hwc = self.env.render_image()
@@ -695,6 +704,18 @@ class MainWindow(QMainWindow):
         self.btn_start_stop = QPushButton("Start Training")
         self.btn_start_stop.clicked.connect(self.toggle_training)
         right.addWidget(self.btn_start_stop)
+
+        agent_io_row = QWidget()
+        agent_io_layout = QHBoxLayout(agent_io_row)
+        agent_io_layout.setContentsMargins(0, 0, 0, 0)
+        btn_save = QPushButton("Save Agent")
+        btn_save.clicked.connect(self.save_agent)
+        btn_load = QPushButton("Load Agent")
+        btn_load.clicked.connect(self.load_agent)
+        agent_io_layout.addWidget(btn_save)
+        agent_io_layout.addWidget(btn_load)
+        right.addWidget(agent_io_row)
+
         right.addStretch(1)
 
         layout.addWidget(right_panel, stretch=1)
@@ -718,7 +739,7 @@ class MainWindow(QMainWindow):
         rewards_cfg = self.reward_editor.current_rewards()
 
         # Run multiple env transitions per timer event to keep learning reasonably fast.
-        for _ in range(4):
+        for _ in range(32):
             action = self.trainer.select_action(self.current_state_chw)
             next_state_hwc, reward, done, _ = self.env.step(action, rewards_cfg)
             next_state_chw = self.trainer.to_chw(next_state_hwc)
@@ -783,6 +804,104 @@ class MainWindow(QMainWindow):
             self.progress_plot.redraw_if_needed()
         else:
             self._last_status_refresh_time = time.monotonic()
+
+    def save_agent(self) -> None:
+        was_running = self.running
+        if was_running:
+            self.toggle_training()
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Agent", "dqn_agent.pt", "PyTorch checkpoint (*.pt *.pth)"
+        )
+        if not path:
+            if was_running:
+                self.toggle_training()
+            return
+
+        checkpoint = {
+            "checkpoint_format": "compact_v2",
+            "policy_net": self.trainer.policy_net.state_dict(),
+            "step_idx": self.trainer.step_idx,
+            "episode_idx": self.episode_idx,
+            "total_steps": self.total_steps,
+            "episode_reward": self.episode_reward,
+            "last_reward": self.last_reward,
+            "last_loss": self.last_loss,
+            "recent_episode_rewards": list(self.recent_episode_rewards),
+            "progress_plot_x": self.progress_plot._x,
+            "progress_plot_y": self.progress_plot._y,
+            "reward_goal": self.reward_editor.goal_spin.value(),
+            "reward_goal_enabled": self.reward_editor.goal_check.isChecked(),
+            "reward_dist": self.reward_editor.dist_spin.value(),
+            "reward_dist_enabled": self.reward_editor.dist_check.isChecked(),
+            "reward_obs": self.reward_editor.obs_spin.value(),
+            "reward_obs_enabled": self.reward_editor.obs_check.isChecked(),
+            "step_limit": self.env.max_steps,
+        }
+        torch.save(checkpoint, path)
+        QMessageBox.information(self, "Saved", f"Agent saved to:\n{path}")
+        if was_running:
+            self.toggle_training()
+
+    def load_agent(self) -> None:
+        was_running = self.running
+        if was_running:
+            self.toggle_training()
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Agent", "", "PyTorch checkpoint (*.pt *.pth)"
+        )
+        if not path:
+            if was_running:
+                self.toggle_training()
+            return
+
+        checkpoint = torch.load(path, map_location=self.trainer.device)
+
+        self.trainer.policy_net.load_state_dict(checkpoint["policy_net"])
+        if "target_net" in checkpoint:
+            self.trainer.target_net.load_state_dict(checkpoint["target_net"])
+        else:
+            # Compact checkpoints only store policy weights.
+            self.trainer.target_net.load_state_dict(self.trainer.policy_net.state_dict())
+
+        if "optimizer" in checkpoint:
+            self.trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+        else:
+            # Compact checkpoints intentionally drop optimizer state to reduce file size.
+            self.trainer.optimizer = optim.Adam(self.trainer.policy_net.parameters(), lr=self.trainer.lr)
+        self.trainer.replay.buffer.clear()
+        self.trainer.step_idx = checkpoint["step_idx"]
+
+        self.episode_idx = checkpoint["episode_idx"]
+        self.total_steps = checkpoint["total_steps"]
+        self.episode_reward = checkpoint["episode_reward"]
+        self.last_reward = checkpoint["last_reward"]
+        self.last_loss = checkpoint["last_loss"]
+        self.recent_episode_rewards = deque(checkpoint["recent_episode_rewards"], maxlen=20)
+
+        self.progress_plot._x = checkpoint["progress_plot_x"]
+        self.progress_plot._y = checkpoint["progress_plot_y"]
+        self.progress_plot.redraw_if_needed()
+
+        self.reward_editor.goal_spin.setValue(checkpoint["reward_goal"])
+        self.reward_editor.goal_check.setChecked(checkpoint["reward_goal_enabled"])
+        self.reward_editor.dist_spin.setValue(checkpoint["reward_dist"])
+        self.reward_editor.dist_check.setChecked(checkpoint["reward_dist_enabled"])
+        self.reward_editor.obs_spin.setValue(checkpoint["reward_obs"])
+        self.reward_editor.obs_check.setChecked(checkpoint["reward_obs_enabled"])
+
+        step_limit = checkpoint["step_limit"]
+        self.env.max_steps = step_limit
+        self.step_limit_spin.setValue(step_limit)
+
+        self.steps_per_sec = 0.0
+        self.steps_since_speed_reset = 0
+        self.speed_reset_time = time.monotonic()
+
+        self._refresh_labels()
+        self.world_view.update()
+        QMessageBox.information(self, "Loaded", f"Agent loaded from:\n{path}")
 
     def _current_start_goal_distance(self) -> float:
         return self.env._distance(self.env.robot_x, self.env.robot_y, self.env.goal_x, self.env.goal_y)
