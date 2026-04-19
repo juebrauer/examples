@@ -2305,7 +2305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_run_experiments = QtWidgets.QPushButton("Run experiments")
         self.btn_run_experiments.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.btn_run_experiments.setToolTip(
-            "Run all 20 DQN experiment combinations and write results.md + saved agent checkpoints"
+            "Run all 20 DQN experiment combinations (4 trick combos × 5 reward profiles) and write results.md + saved agent checkpoints"
         )
         self.btn_run_experiments.clicked.connect(self._on_run_experiments)
         left_v.addWidget(self.btn_run_experiments)
@@ -2553,17 +2553,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_reward_profile(self, name: str) -> None:
         # Profiles for automated experiment sweeps.
-        profiles: dict[str, tuple[bool, bool, bool]] = {
-            "landing_tube_only": (True, False, False),
-            "distance_only": (False, True, False),
-            "stability_only": (False, False, True),
-            "tube_plus_distance": (True, True, False),
-            "tube_plus_distance_plus_stability": (True, True, True),
+        # tuple: (tube, distance, stability, near_crash)
+        profiles: dict[str, tuple[bool, bool, bool, bool]] = {
+            "landing_tube_only": (True, False, False, False),
+            "distance_only": (False, True, False, False),
+            "stability_only": (False, False, True, False),
+            "near_to_crash_only": (False, False, False, True),
+            "all_four": (True, True, True, True),
         }
-        tube, distance, stability = profiles[name]
+        tube, distance, stability, near_crash = profiles[name]
         self.chk_shape_tube.setChecked(tube)
         self.chk_shape_distance.setChecked(distance)
         self.chk_shape_stability.setChecked(stability)
+        self.chk_shape_near_crash.setChecked(near_crash)
         self.chk_shape_energy.setChecked(False)
 
     def _format_duration(self, seconds: float) -> str:
@@ -3038,8 +3040,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("landing_tube_only", "Landing Tube only"),
             ("distance_only", "Distance reward only"),
             ("stability_only", "Stability reward only"),
-            ("tube_plus_distance", "Landing Tube + Distance reward"),
-            ("tube_plus_distance_plus_stability", "Landing Tube + Distance + Stability reward"),
+            ("near_to_crash_only", "Near-to-crash only"),
+            ("all_four", "Landing Tube + Distance + Stability + Near-to-crash"),
         ]
 
         rows: list[dict[str, Any]] = []

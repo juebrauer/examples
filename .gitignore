@@ -17,6 +17,7 @@
 !*.sh
 !*.md
 !*.yaml
+!*.pt
 
 # Ignore specific folders
 005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
@@ -45,3 +46,7 @@
 
 # Ignore checkpoint files
 *-checkpoint.ipynb
+024_robot_navigation/cnn.pt.best.pt
+.gitignore
+024_robot_navigation/resnet18.pt.best.pt
+024_robot_navigation/vit.pt
