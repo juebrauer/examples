@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Value Iteration demo (GridWorld) with a simple PySide6 UI.
+"""Value and Policy Iteration demo (GridWorld) with a simple PySide6 UI.
 
 Teaching-oriented goals:
 - Small, editable GridWorld with obstacles, per-cell rewards, and two terminal cells.
@@ -186,6 +186,30 @@ def _bellman_optimality_sweep(
     return V_new, delta
 
 
+def _policy_evaluation_sweep(
+    world: GridWorld,
+    V: Dict[Cell, float],
+    policy: Dict[Cell, str],
+    *,
+    gamma: float,
+) -> Tuple[Dict[Cell, float], float]:
+    """Run one Bellman expectation sweep for a fixed deterministic policy."""
+    V_new = dict(V)
+    delta = 0.0
+
+    for s in world.states():
+        if world.is_terminal(s):
+            V_new[s] = float(world.terminals[s])
+            continue
+
+        action = policy.get(s, ACTIONS[0])
+        s2, r, done = world.step(s, action)
+        V_new[s] = float(r) + (0.0 if done else gamma * float(V[s2]))
+        delta = max(delta, abs(V_new[s] - V[s]))
+
+    return V_new, delta
+
+
 def _optimal_action_and_q(
     world: GridWorld,
     V: Dict[Cell, float],
@@ -252,6 +276,55 @@ def value_iteration(
     return V, max_iterations, last_delta
 
 
+def policy_iteration(
+    world: GridWorld,
+    *,
+    gamma: float,
+    theta: float = 1e-4,
+    max_iterations: int = 200,
+) -> Tuple[Dict[Cell, float], Dict[Cell, str], int, int, float, bool]:
+    if not (0.0 <= gamma < 1.0):
+        raise ValueError("gamma must be in [0, 1)")
+
+    V: Dict[Cell, float] = {s: 0.0 for s in world.states()}
+    for t, r in world.terminals.items():
+        V[t] = float(r)
+
+    policy: Dict[Cell, str] = {
+        s: ACTIONS[0] for s in world.states() if not world.is_terminal(s)
+    }
+
+    total_eval_sweeps = 0
+    last_delta = math.inf
+
+    for i in range(max_iterations):
+        # Full policy evaluation: sweep until V converges for the current policy.
+        eval_sweeps = 0
+        while eval_sweeps < max_iterations:
+            V, delta = _policy_evaluation_sweep(world, V, policy, gamma=gamma)
+            eval_sweeps += 1
+            total_eval_sweeps += 1
+            last_delta = delta
+            if delta < theta:
+                break
+
+        policy_stable = True
+        improved_policy: Dict[Cell, str] = {}
+        for s in world.states():
+            if world.is_terminal(s):
+                continue
+            best_action, _ = _optimal_action_and_q(world, V, s, gamma=gamma)
+            improved_policy[s] = best_action
+            if best_action != policy.get(s, ACTIONS[0]):
+                policy_stable = False
+
+        policy = improved_policy
+        if policy_stable:
+            return V, policy, i + 1, total_eval_sweeps, last_delta, True
+
+    return V, policy, max_iterations, total_eval_sweeps, last_delta, False
+
+
 class ValueIterationSession:
     """Incremental value iteration (one full sweep per step).
 
@@ -285,6 +358,79 @@ class ValueIterationSession:
         return dict(self.V), delta, self.iteration
 
 
+class PolicyIterationSession:
+    """Incremental policy iteration (one evaluate/improve round per step)."""
+
+    def __init__(
+        self,
+        world: GridWorld,
+        *,
+        gamma: float,
+        theta: float,
+    ) -> None:
+        if not (0.0 <= gamma < 1.0):
+            raise ValueError("gamma must be in [0, 1)")
+        self.world = world
+        self.gamma = float(gamma)
+        self.theta = float(theta)
+
+        self.V: Dict[Cell, float] = {s: 0.0 for s in world.states()}
+        for t, r in world.terminals.items():
+            self.V[t] = float(r)
+
+        self.policy: Dict[Cell, str] = {
+            s: ACTIONS[0] for s in world.states() if not world.is_terminal(s)
+        }
+        self.iteration = 0
+        self.last_eval_delta = math.inf
+        self.last_eval_sweeps = 0
+        self.policy_stable = False
+
+    def step(
+        self,
+        *,
+        max_eval_iterations: int,
+    ) -> Tuple[Dict[Cell, float], Dict[Cell, str], float, int, int, bool]:
+        """Perform full policy evaluation (until Δ < theta) then policy improvement."""
+        # Full policy evaluation: sweep until V converges for the current policy.
+        delta = math.inf
+        eval_sweeps = 0
+        while eval_sweeps < max_eval_iterations:
+            self.V, delta = _policy_evaluation_sweep(
+                self.world,
+                self.V,
+                self.policy,
+                gamma=self.gamma,
+            )
+            eval_sweeps += 1
+            if delta < self.theta:
+                break
+
+        improved_policy: Dict[Cell, str] = {}
+        policy_stable = True
+        for s in self.world.states():
+            if self.world.is_terminal(s):
+                continue
+            best_action, _ = _optimal_action_and_q(self.world, self.V, s, gamma=self.gamma)
+            improved_policy[s] = best_action
+            if best_action != self.policy.get(s, ACTIONS[0]):
+                policy_stable = False
+
+        self.policy = improved_policy
+        self.iteration += 1
+        self.last_eval_delta = delta
+        self.last_eval_sweeps = eval_sweeps
+        self.policy_stable = policy_stable
+        return (
+            dict(self.V),
+            dict(self.policy),
+            delta,
+            eval_sweeps,
+            self.iteration,
+            policy_stable,
+        )
+
+
 class GridWorldWidget(QWidget):
     worldEdited = Signal()
 
@@ -296,21 +442,22 @@ class GridWorldWidget(QWidget):
         self._terminal_pos_reward: float = 10.0
         self._terminal_neg_reward: float = -10.0
 
-        self._values: Dict[Cell, float] = {}
-        self._show_values = False
-
-        self._policy: Dict[Cell, str] = {}
-        self._show_policy = False
+        self._vi_values: Dict[Cell, float] = {}
+        self._pi_values: Dict[Cell, float] = {}
+        self._vi_policy: Dict[Cell, str] = {}
+        self._pi_policy: Dict[Cell, str] = {}
+        self._show_comparison = False
 
         self.setMinimumSize(520, 520)
         self.setMouseTracking(True)
 
     def set_world(self, world: GridWorld) -> None:
         self._world = world
-        self._values = {}
-        self._show_values = False
-        self._policy = {}
-        self._show_policy = False
+        self._vi_values = {}
+        self._pi_values = {}
+        self._vi_policy = {}
+        self._pi_policy = {}
+        self._show_comparison = False
         self.update()
 
     def set_mode(self, mode: str) -> None:
@@ -325,21 +472,32 @@ class GridWorldWidget(QWidget):
     def set_terminal_neg_reward(self, reward: float) -> None:
         self._terminal_neg_reward = float(reward)
 
-    def set_values(self, values: Dict[Cell, float]) -> None:
-        self._values = dict(values)
-        self._show_values = True
+    def set_value_comparison(
+        self,
+        vi_values: Dict[Cell, float],
+        pi_values: Dict[Cell, float],
+    ) -> None:
+        self._vi_values = dict(vi_values)
+        self._pi_values = dict(pi_values)
+        self._show_comparison = True
         self.update()
 
-    def set_policy(self, policy: Dict[Cell, str]) -> None:
-        self._policy = dict(policy)
-        self._show_policy = True
+    def set_policy_comparison(
+        self,
+        vi_policy: Dict[Cell, str],
+        pi_policy: Dict[Cell, str],
+    ) -> None:
+        self._vi_policy = dict(vi_policy)
+        self._pi_policy = dict(pi_policy)
+        self._show_comparison = True
         self.update()
 
     def clear_values(self) -> None:
-        self._values = {}
-        self._show_values = False
-        self._policy = {}
-        self._show_policy = False
+        self._vi_values = {}
+        self._pi_values = {}
+        self._vi_policy = {}
+        self._pi_policy = {}
+        self._show_comparison = False
         self.update()
 
     def _draw_action_arrow(self, painter: QPainter, rect: QRectF, action: str) -> None:
@@ -471,7 +629,8 @@ class GridWorldWidget(QWidget):
                 # Text overlays: reward and value
                 if not self._world.is_obstacle(cell):
                     reward = self._world.get_reward(cell)
-                    value = self._values.get(cell)
+                    vi_value = self._vi_values.get(cell)
+                    pi_value = self._pi_values.get(cell)
 
                     painter.setPen(QPen(QColor(20, 20, 20)))
                     font = QFont(self.font())
@@ -485,34 +644,43 @@ class GridWorldWidget(QWidget):
                         f"R: {reward:g}",
                     )
 
-                    # Value larger, centered (only after running VI)
-                    if self._show_values and value is not None:
-                        font.setPointSize(max(9, int(cell_size * 0.18)))
+                    # Center shows V(s) from VI / Vpi(s) from PI.
+                    if self._show_comparison and vi_value is not None and pi_value is not None:
+                        font.setPointSize(max(8, int(cell_size * 0.14)))
                         font.setBold(True)
                         painter.setFont(font)
-                        painter.drawText(rect, Qt.AlignCenter, f"{value:.2f}")
+                        painter.drawText(
+                            rect,
+                            Qt.AlignCenter,
+                            f"{vi_value:.2f} / {pi_value:.2f}",
+                        )
 
-                    # Greedy action arrow (only when we have values/policy)
-                    if (
-                        self._show_values
-                        and self._show_policy
-                        and (not self._world.is_terminal(cell))
-                    ):
-                        action = self._policy.get(cell)
-                        if action is not None:
-                            pen_arrow = QPen(QColor(20, 20, 20))
-                            # Reuse the same green as the positive terminal.
+                    if self._show_comparison and (not self._world.is_terminal(cell)):
+                        vi_action = self._vi_policy.get(cell)
+                        if vi_action is not None:
                             pen_arrow = QPen(QColor(60, 160, 60))
-                            pen_arrow.setWidth(max(2, int(cell_size * 0.05)))
+                            pen_arrow.setWidth(max(2, int(cell_size * 0.045)))
                             painter.setPen(pen_arrow)
-                            # Draw the arrow away from the centered V(s) text.
-                            arrow_rect = rect.adjusted(
-                                rect.width() * 0.15,
+                            vi_arrow_rect = rect.adjusted(
+                                rect.width() * 0.08,
                                 rect.height() * 0.64,
-                                -rect.width() * 0.15,
-                                -rect.height() * 0.04,
+                                -rect.width() * 0.54,
+                                -rect.height() * 0.06,
                             )
-                            self._draw_action_arrow(painter, arrow_rect, action)
+                            self._draw_action_arrow(painter, vi_arrow_rect, vi_action)
+
+                        pi_action = self._pi_policy.get(cell)
+                        if pi_action is not None:
+                            pen_arrow = QPen(QColor(60, 90, 190))
+                            pen_arrow.setWidth(max(2, int(cell_size * 0.045)))
+                            painter.setPen(pen_arrow)
+                            pi_arrow_rect = rect.adjusted(
+                                rect.width() * 0.54,
+                                rect.height() * 0.64,
+                                -rect.width() * 0.08,
+                                -rect.height() * 0.06,
+                            )
+                            self._draw_action_arrow(painter, pi_arrow_rect, pi_action)
 
         # Draw grid lines
         pen = QPen(QColor(30, 30, 30))
@@ -577,7 +745,7 @@ class ControlsPanel(QWidget):
         self.terminal_neg_spin.setSingleStep(1.0)
         self.terminal_neg_spin.setValue(-10.0)
 
-        # Value iteration params
+        # Value / policy iteration params
         self.gamma_spin = QDoubleSpinBox()
         self.gamma_spin.setDecimals(3)
         self.gamma_spin.setRange(0.0, 0.999)
@@ -594,7 +762,7 @@ class ControlsPanel(QWidget):
         self.max_iter_spin.setRange(1, 5000)
         self.max_iter_spin.setValue(200)
 
-        self.run_vi_btn = QPushButton("Run value iteration")
+        self.run_vi_btn = QPushButton("Run VI and PI")
         self.status = QLabel("")
         self.status.setWordWrap(True)
 
@@ -626,7 +794,7 @@ class ControlsPanel(QWidget):
         paint_form.addRow("Terminal -", self.terminal_neg_spin)
         paint_layout.addLayout(paint_form)
 
-        vi_box = QGroupBox("Value iteration")
+        vi_box = QGroupBox("Value iteration and policy iteration")
         vi_form = QFormLayout(vi_box)
         vi_form.addRow("Gamma (discount)", self.gamma_spin)
         vi_form.addRow("Theta (stop)", self.theta_spin)
@@ -647,7 +815,7 @@ class ControlsPanel(QWidget):
         hint = QLabel(
             "Click cells in the grid to edit. "
             "Obstacles are unreachable. Terminal cells end the episode." 
-            "\nValues appear after running value iteration."
+            "\nCenter text shows V(s) / Vpi(s). Green arrow = VI greedy action, blue arrow = PI current action."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -656,12 +824,13 @@ class ControlsPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Value Iteration Demo (GridWorld)")
+        self.setWindowTitle("Value Iteration and Policy Iteration Demo (GridWorld)")
 
         self.world = build_demo_world()
         self.grid = GridWorldWidget(self.world)
         self.controls = ControlsPanel()
         self._vi_session: Optional[ValueIterationSession] = None
+        self._pi_session: Optional[PolicyIterationSession] = None
 
         self._wire_events()
 
@@ -728,6 +897,21 @@ class MainWindow(QMainWindow):
 
     def _reset_vi_session(self) -> None:
         self._vi_session = None
+        self._pi_session = None
+
+    def _update_grid_comparison(
+        self,
+        vi_values: Dict[Cell, float],
+        pi_values: Dict[Cell, float],
+        *,
+        gamma: float,
+        pi_policy: Dict[Cell, str],
+    ) -> None:
+        self.grid.set_value_comparison(vi_values, pi_values)
+        self.grid.set_policy_comparison(
+            greedy_policy_from_values(self.world, vi_values, gamma=gamma),
+            pi_policy,
+        )
 
     def _run_value_iteration(self) -> None:
         if not any(True for _ in self.world.states()):
@@ -741,7 +925,13 @@ class MainWindow(QMainWindow):
         max_iter = int(self.controls.max_iter_spin.value())
 
         try:
-            values, iterations, delta = value_iteration(
+            vi_values, vi_iterations, vi_delta = value_iteration(
+                self.world,
+                gamma=gamma,
+                theta=theta,
+                max_iterations=max_iter,
+            )
+            pi_values, pi_policy, pi_iterations, pi_eval_sweeps, pi_delta, pi_stable = policy_iteration(
                 self.world,
                 gamma=gamma,
                 theta=theta,
@@ -751,10 +941,18 @@ class MainWindow(QMainWindow):
             self.controls.status.setText(f"Error: {e}")
             return
 
-        self.grid.set_values(values)
-        self.grid.set_policy(greedy_policy_from_values(self.world, values, gamma=gamma))
+        self._update_grid_comparison(
+            vi_values,
+            pi_values,
+            gamma=gamma,
+            pi_policy=pi_policy,
+        )
         self.controls.status.setText(
-            f"Done: {iterations} iterations, last Δ={delta:.6g}"
+            "VI: "
+            f"{vi_iterations} sweeps, last Δ={vi_delta:.6g}"
+            "\nPI: "
+            f"{pi_iterations} improvement steps, {pi_eval_sweeps} eval sweeps, "
+            f"last eval Δ={pi_delta:.6g}, stable={pi_stable}"
         )
 
     def _step_value_iteration(self) -> None:
@@ -773,19 +971,54 @@ class MainWindow(QMainWindow):
                 self.controls.status.setText(f"Error: {e}")
                 return
 
-        if self._vi_session.iteration >= max_iter:
-            self.controls.status.setText("Reached max iterations.")
-            self.grid.set_values(self._vi_session.V)
-            return
-        if self._vi_session.last_delta < theta:
-            self.controls.status.setText("Already converged (Δ < theta).")
-            self.grid.set_values(self._vi_session.V)
-            return
+        if self._pi_session is None or self._pi_session.world is not self.world or self._pi_session.gamma != gamma:
+            try:
+                self._pi_session = PolicyIterationSession(self.world, gamma=gamma, theta=theta)
+            except Exception as e:  # pragma: no cover
+                self.controls.status.setText(f"Error: {e}")
+                return
 
-        values, delta, k = self._vi_session.step()
-        self.grid.set_values(values)
-        self.grid.set_policy(greedy_policy_from_values(self.world, values, gamma=gamma))
-        self.controls.status.setText(f"Step: iteration {k}, Δ={delta:.6g}")
+        self._pi_session.theta = theta
+
+        if self._vi_session.iteration >= max_iter:
+            vi_values = dict(self._vi_session.V)
+            vi_delta = self._vi_session.last_delta
+            vi_message = "VI reached max sweeps"
+        elif self._vi_session.last_delta < theta:
+            vi_values = dict(self._vi_session.V)
+            vi_delta = self._vi_session.last_delta
+            vi_message = f"VI already converged, Δ={vi_delta:.6g}"
+        else:
+            vi_values, vi_delta, k = self._vi_session.step()
+            vi_message = f"VI sweep {k}, Δ={vi_delta:.6g}"
+
+        if self._pi_session.iteration >= max_iter:
+            pi_values = dict(self._pi_session.V)
+            pi_policy = dict(self._pi_session.policy)
+            pi_delta = self._pi_session.last_eval_delta
+            pi_message = "PI reached max policy steps"
+        elif self._pi_session.policy_stable:
+            pi_values = dict(self._pi_session.V)
+            pi_policy = dict(self._pi_session.policy)
+            pi_delta = self._pi_session.last_eval_delta
+            pi_message = f"PI already stable, eval Δ={pi_delta:.6g}"
+        else:
+            pi_values, pi_policy, pi_delta, pi_eval_sweeps, pi_k, pi_stable = self._pi_session.step(
+                max_eval_iterations=max_iter,
+            )
+            stable_suffix = ", stable" if pi_stable else ""
+            pi_message = (
+                f"PI step {pi_k}, {pi_eval_sweeps} eval sweeps, "
+                f"eval Δ={pi_delta:.6g}{stable_suffix}"
+            )
+
+        self._update_grid_comparison(
+            vi_values,
+            pi_values,
+            gamma=gamma,
+            pi_policy=pi_policy,
+        )
+        self.controls.status.setText(f"{vi_message}\n{pi_message}")
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key_Space:
