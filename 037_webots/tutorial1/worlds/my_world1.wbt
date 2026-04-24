@@ -1,0 +1,56 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/containers/protos/WoodenBox.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+
+WorldInfo {
+  basicTimeStep 16
+}
+Viewpoint {
+  orientation -0.13919181747785042 -0.4399428602232007 0.8871729919727278 5.5980600122806194
+  position -0.8737933269559226 0.21311021922433993 0.3463845343433277
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+RectangleArena {
+  translation -0.000116292 -0.0397201 0
+  floorTileSize 0.25 0.25
+  wallHeight 0.05
+}
+WoodenBox {
+  translation 0.28 -0.08 0.05
+  rotation 0 0 1 2.8797896938995744
+  size 0.03 0.4 0.1
+}
+WoodenBox {
+  translation -0.22 -0.36 0.05
+  name "wooden box(2)"
+  size 0.1 0.1 0.1
+}
+WoodenBox {
+  translation -0.21 0.28 0.04999607600000003
+  rotation -7.12142050224612e-18 1.1015488255708805e-16 1 0.523599
+  name "wooden box(1)"
+  size 0.1 0.1 0.1
+  mass 0.02
+}
+E-puck {
+  hidden position_0_0 37.735644665113526
+  hidden position_0_1 24.289736375765038
+  hidden linearVelocity_0 0.00012959174918202764 0.018772643428128025 6.368748276012948e-08
+  hidden angularVelocity_0 0.004501940033472415 -4.561168938911991e-05 -0.22046555220182687
+  hidden rotation_1 0 1 0 0.03653282203600176
+  hidden linearVelocity_1 0.00016838673246552494 0.024482282563347814 -1.727939624718525e-08
+  hidden angularVelocity_1 -1.2514713019852093 0.00843921539573459 -0.22068323763740544
+  hidden rotation_2 0 -1 0 0.8430048529533076
+  hidden linearVelocity_2 8.450122126804117e-05 0.013017998573417587 1.7427802290184655e-08
+  hidden angularVelocity_2 -0.623484660313358 0.0042050579288236 -0.22051971711367654
+  translation -0.3019688980125296 -0.17610118918691 -3.193427584224223e-05
+  rotation -0.0012929439412313986 0.0013038403143709246 -0.9999983141467786 -1.5622615233070283
+  controller "ctrl1"
+}

@@ -50,3 +50,5 @@
 .gitignore
 024_robot_navigation/resnet18.pt.best.pt
 024_robot_navigation/vit.pt
+
+!037_webots/tutorial1/worlds/my_world1.wbt
