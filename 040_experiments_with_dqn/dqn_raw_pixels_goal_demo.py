@@ -73,9 +73,25 @@ class GridWorldRawPixels:
         self.agent_y = float(self.start_pos[1])
 
     def reset(self) -> np.ndarray:
+        self._sample_new_goal_position()
         self.agent_x = float(self.start_pos[0])
         self.agent_y = float(self.start_pos[1])
         return self.render()
+
+    def _sample_new_goal_position(self) -> None:
+        """Choose a random goal position for the next episode."""
+        min_xy = self.goal_radius
+        max_xy = self.size - self.goal_radius
+        reach_sq = (self.agent_radius + self.goal_radius) ** 2
+        while True:
+            gx = random.randint(min_xy, max_xy)
+            gy = random.randint(min_xy, max_xy)
+            dx = gx - self.start_pos[0]
+            dy = gy - self.start_pos[1]
+            # Avoid trivial episodes where start is already inside goal reach radius.
+            if dx * dx + dy * dy > reach_sq:
+                self.goal_pos = (gx, gy)
+                return
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, float, float]:
         """Returns (obs, base_reward, done, old_dist, new_dist).
@@ -131,6 +147,33 @@ class GridWorldRawPixels:
 
         return img
 
+    def compute_min_steps(self) -> int:
+        """Compute minimum number of steps from start_pos to reach the goal via BFS."""
+        from collections import deque as _deque
+        reach_sq = (self.agent_radius + self.goal_radius) ** 2
+        sx, sy = int(self.start_pos[0]), int(self.start_pos[1])
+        dx0 = sx - self.goal_pos[0]
+        dy0 = sy - self.goal_pos[1]
+        if dx0 * dx0 + dy0 * dy0 <= reach_sq:
+            return 0
+        queue: deque = _deque([(sx, sy, 0)])
+        visited = {(sx, sy)}
+        deltas = [(0, -self.step_size), (0, self.step_size), (-self.step_size, 0), (self.step_size, 0)]
+        while queue:
+            x, y, steps = queue.popleft()
+            for ddx, ddy in deltas:
+                nx = int(np.clip(x + ddx, self.agent_radius, self.size - self.agent_radius))
+                ny = int(np.clip(y + ddy, self.agent_radius, self.size - self.agent_radius))
+                if (nx, ny) in visited:
+                    continue
+                ex = nx - self.goal_pos[0]
+                ey = ny - self.goal_pos[1]
+                if ex * ex + ey * ey <= reach_sq:
+                    return steps + 1
+                visited.add((nx, ny))
+                queue.append((nx, ny, steps + 1))
+        return 1  # fallback
+
     @staticmethod
     def _draw_filled_circle(arr: np.ndarray, cx: int, cy: int, radius: int, color: np.ndarray) -> None:
         h, w, _ = arr.shape
@@ -149,16 +192,16 @@ class DQNCNN(nn.Module):
     def __init__(self, n_actions: int) -> None:
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=8, stride=4),  # 3 RGB channels
+            nn.Conv2d(3, 8, kernel_size=8, stride=4),  # 3 RGB channels
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
+            nn.Conv2d(8, 16, kernel_size=4, stride=2),
             nn.ReLU(),
         )
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(32 * 9 * 9, 256),
+            nn.Linear(16 * 9 * 9, 64),
             nn.ReLU(),
-            nn.Linear(256, n_actions),
+            nn.Linear(64, n_actions),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -166,21 +209,23 @@ class DQNCNN(nn.Module):
         return self.head(x)
 
 
-class RewardPlotCanvas(FigureCanvas):
+class EpisodeStepsRatioCanvas(FigureCanvas):
     def __init__(self) -> None:
         self.figure = Figure(figsize=(4.8, 3.6), tight_layout=True)
         self.ax = self.figure.add_subplot(111)
         super().__init__(self.figure)
 
-    def update_plot(self, rewards_last_1000: List[float]) -> None:
+    def update_plot(self, ratios: List[float]) -> None:
         self.ax.clear()
-        self.ax.set_title("Rewards der letzten 1000 Schritte")
-        self.ax.set_xlabel("Schritt-Index")
-        self.ax.set_ylabel("Reward")
-        self.ax.grid(True, alpha=0.3)
-        if rewards_last_1000:
-            x = np.arange(len(rewards_last_1000))
-            self.ax.plot(x, rewards_last_1000, color="#2B6CB0", linewidth=1.3)
+        self.ax.set_title("Schritte pro Episode / Mindestschritte")
+        self.ax.set_xlabel("Episode")
+        self.ax.set_ylabel("Verhältnis (Schritte / Min-Schritte)")
+        self.ax.axhline(y=1.0, color="green", linestyle="--", linewidth=1.2, label="Optimal (= 1)")
+        self.ax.legend(fontsize=8)
+        self.ax.grid(True, alpha=0.3, axis="y")
+        if ratios:
+            x = np.arange(1, len(ratios) + 1)
+            self.ax.bar(x, ratios, color="#2B6CB0", width=0.8)
         self.draw_idle()
 
 
@@ -197,7 +242,8 @@ class DQNRawPixelsDemo(QMainWindow):
         self.gamma = 0.99
         self.batch_size = 64
         self.lr = 1e-3
-        self.target_sync_every = 250
+        self.target_sync_every = 10000
+        #self.target_sync_every = 250
         self.learning_starts = 300
 
         self.epsilon = 1.0
@@ -215,7 +261,12 @@ class DQNRawPixelsDemo(QMainWindow):
         self.loss_fn = nn.MSELoss()
 
         self.total_steps = 0
-        self.rewards_window: Deque[float] = deque(maxlen=1000)
+        self.episode_steps = 0
+        self.episode_count = 0
+        self.episode_steps_history: List[float] = []
+        self.last_r_energy = 0.0
+        self.last_r_goal = 0.0
+        self.last_r_dist = 0.0
 
         self.current_observation = self.env.reset()
 
@@ -257,12 +308,21 @@ class DQNRawPixelsDemo(QMainWindow):
         self.cnn_input_label.setFixedSize(84, 84)
         self.cnn_input_label.setStyleSheet("border: 1px solid #888;")
 
-        self.plot_canvas = RewardPlotCanvas()
+        self.plot_canvas = EpisodeStepsRatioCanvas()
         self.plot_canvas.setMinimumHeight(280)
+
+        self.reward_breakdown_title = QLabel("Reward-Aufschlüsselung (letzter Schritt):")
+        self.reward_breakdown_title.setStyleSheet("font-size: 13px; font-weight: bold; margin-top: 6px;")
+        self.r_energy_label = QLabel("  Energieverbrauch: —")
+        self.r_goal_label   = QLabel("  Zielerreichung:   —")
+        self.r_dist_label   = QLabel("  Distanzreduktion: —")
+        for lbl in (self.r_energy_label, self.r_goal_label, self.r_dist_label):
+            lbl.setStyleSheet("font-size: 13px; font-family: monospace;")
+
+        self.current_episode_min_steps = max(1, self.env.compute_min_steps())
 
         self._setup_layout()
         self._refresh_world_view()
-        self.plot_canvas.update_plot(list(self.rewards_window))
 
     def _setup_layout(self) -> None:
         root = QWidget()
@@ -284,6 +344,10 @@ class DQNRawPixelsDemo(QMainWindow):
         right_layout.addWidget(self.cnn_input_title)
         right_layout.addWidget(self.cnn_input_label)
         right_layout.addWidget(self.plot_canvas)
+        right_layout.addWidget(self.reward_breakdown_title)
+        right_layout.addWidget(self.r_energy_label)
+        right_layout.addWidget(self.r_goal_label)
+        right_layout.addWidget(self.r_dist_label)
         right_layout.addStretch()
 
         layout.addLayout(left_layout)
@@ -316,13 +380,20 @@ class DQNRawPixelsDemo(QMainWindow):
         # Potential-Based Reward Shaping: F(s,s') = gamma*Phi(s') - Phi(s)
         # Phi(s) = -dist/D_max  =>  approaching goal gives positive F,
         # oscillating gives net-negative due to gamma < 1 (reward-hack-proof).
+        r_energy = -0.01
+        r_goal = 1.0 if done else 0.0
         if self.pbrs_checkbox.isChecked():
             D_max = self.env._D_max
             phi_s = -old_dist / D_max
             phi_s_next = 0.0 if done else -new_dist / D_max  # terminal potential = 0
-            reward = base_reward + self.gamma * phi_s_next - phi_s
+            r_dist = self.gamma * phi_s_next - phi_s
+            reward = base_reward + 20*r_dist
         else:
+            r_dist = 0.0
             reward = base_reward
+        self.last_r_energy = r_energy
+        self.last_r_goal = r_goal
+        self.last_r_dist = r_dist
 
         self.replay.push(
             Transition(
@@ -335,7 +406,7 @@ class DQNRawPixelsDemo(QMainWindow):
         )
 
         self.total_steps += 1
-        self.rewards_window.append(reward)
+        self.episode_steps += 1
 
         if len(self.replay) >= self.learning_starts:
             self._optimize_model()
@@ -346,17 +417,27 @@ class DQNRawPixelsDemo(QMainWindow):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
         if done:
+            ratio = self.episode_steps / self.current_episode_min_steps
+            self.episode_steps_history.append(ratio)
+            self.episode_count += 1
+            self.episode_steps = 0
             self.current_observation = self.env.reset()
+            self.current_episode_min_steps = max(1, self.env.compute_min_steps())
         else:
             self.current_observation = next_observation
 
         self.steps_label.setText(f"Lernschritte: {self.total_steps}")
 
+        # Reward-Aufschlüsselung aktualisieren
+        self.r_energy_label.setText(f"  Energieverbrauch: {self.last_r_energy:+.4f}")
+        self.r_goal_label.setText(  f"  Zielerreichung:   {self.last_r_goal:+.4f}")
+        self.r_dist_label.setText(  f"  Distanzreduktion: {self.last_r_dist:+.6f}")
+
         # UI-Update: immer oder nur alle 100 Schritte (je nach Checkbox)
         slow_mode = self.slow_ui_checkbox.isChecked()
         if not slow_mode or self.total_steps % 100 == 0:
             self._refresh_world_view()
-            self.plot_canvas.update_plot(list(self.rewards_window))
+            self.plot_canvas.update_plot(self.episode_steps_history[-50:])
 
     def _obs_to_state_tensor(self, obs: np.ndarray) -> np.ndarray:
         # Keep full RGB information; only spatial downscaling to 84x84.
