@@ -877,7 +877,7 @@ class LunarLanderEnv:
         self.terrain = Terrain(points=flattened, width=self.world_w)
         self.landing_pad = LandingPad(x0=pad_x0, x1=pad_x1, y=pad_y)
 
-        self.lander = self._spawn_lander()
+        self.lander = self._spawn_lander(rng)
         self.status_text = None
         self.frozen = False
         self.last_contact = None
@@ -1093,11 +1093,19 @@ class LunarLanderEnv:
 
         return obs, reward, terminated, info
 
-    def _spawn_lander(self) -> Lander:
+    def _spawn_lander(self, rng: random.Random | None = None) -> Lander:
+        if rng is None:
+            rng = random.Random()
+
+        spawn_margin_x = 80.0
+        spawn_x = rng.uniform(spawn_margin_x, self.world_w - spawn_margin_x)
+        spawn_y = rng.uniform(self.world_h * 0.72, self.world_h * 0.9)
+        spawn_angle = rng.uniform(math.radians(-35.0), math.radians(35.0))
+
         return Lander(
-            pos=Vec2(self.world_w * 0.25, self.world_h * 0.78),
+            pos=Vec2(spawn_x, spawn_y),
             vel=Vec2(0.0, 0.0),
-            angle=0.25,
+            angle=spawn_angle,
             ang_vel=0.0,
             radius=14.0,
             mass=1.0,
