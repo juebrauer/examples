@@ -18,14 +18,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 OPENGL_IMPORT_ERROR = ""
 try:
     from OpenGL.GL import (  # type: ignore[import-not-found]
         GL_COLOR_BUFFER_BIT,
+        GL_DEPTH_COMPONENT,
         GL_DEPTH_BUFFER_BIT,
         GL_DEPTH_TEST,
+        GL_FLOAT,
         GL_LEQUAL,
-        GL_LINES,
         GL_MODELVIEW,
         GL_PROJECTION,
         GL_QUADS,
@@ -142,7 +145,6 @@ class OpenGLWorldWidget(QOpenGLWidget):
     def paintGL(self) -> None:
         width = max(1, self.width())
         height = max(1, self.height())
-        aspect = width / max(1, height)
 
         eye_x = 33.0 * math.cos(math.radians(self._main_view_angle))
         eye_y = 33.0 * math.sin(math.radians(self._main_view_angle))
@@ -192,19 +194,29 @@ class OpenGLWorldWidget(QOpenGLWidget):
 
         glEnd()
 
-    def _draw_ground_grid(self, grid_size: int = 30, spacing: float = 1.6) -> None:
-        glColor3f(0.18, 0.2, 0.22)
-        glBegin(GL_LINES)
-        for i in range(-grid_size, grid_size + 1):
-            v = i * spacing
-            glVertex3f(-grid_size * spacing, v, 0.0)
-            glVertex3f(grid_size * spacing, v, 0.0)
-            glVertex3f(v, -grid_size * spacing, 0.0)
-            glVertex3f(v, grid_size * spacing, 0.0)
-        glEnd()
+    def _draw_ground_tiles(self, half_tiles: int = 40, tile_size: float = 1.2) -> None:
+        for tx in range(-half_tiles, half_tiles):
+            for ty in range(-half_tiles, half_tiles):
+                # Subtle checkerboard pattern for spatial orientation.
+                if (tx + ty) % 2 == 0:
+                    glColor3f(0.11, 0.14, 0.19)
+                else:
+                    glColor3f(0.07, 0.1, 0.15)
+
+                x0 = tx * tile_size
+                y0 = ty * tile_size
+                x1 = x0 + tile_size
+                y1 = y0 + tile_size
+
+                glBegin(GL_QUADS)
+                glVertex3f(x0, y0, 0.0)
+                glVertex3f(x1, y0, 0.0)
+                glVertex3f(x1, y1, 0.0)
+                glVertex3f(x0, y1, 0.0)
+                glEnd()
 
     def _draw_world(self) -> None:
-        self._draw_ground_grid()
+        self._draw_ground_tiles()
         for obj in self._objects:
             glPushMatrix()
             glTranslatef(obj.position[0], obj.position[1], obj.position[2])
@@ -252,6 +264,63 @@ class OpenGLWorldWidget(QOpenGLWidget):
         self.doneCurrent()
         return image
 
+    def render_depth_array(
+        self,
+        camera: CameraPose,
+        width: int,
+        height: int,
+        fov_deg: float = 72.0,
+        near_plane: float = 0.05,
+        far_plane: float = 250.0,
+    ) -> np.ndarray:
+        self.makeCurrent()
+        fmt = QOpenGLFramebufferObjectFormat()
+        fmt.setAttachment(QOpenGLFramebufferObject.CombinedDepthStencil)
+        fbo = QOpenGLFramebufferObject(width, height, fmt)
+        fbo.bind()
+
+        self._render_scene(width=width, height=height, fov_deg=fov_deg, camera=camera)
+        depth_data = glReadPixels(0, 0, width, height, GL_DEPTH_COMPONENT, GL_FLOAT)
+        if hasattr(depth_data, "tobytes"):
+            depth_bytes = depth_data.tobytes()
+        else:
+            depth_bytes = bytes(depth_data)
+        depth_values = np.frombuffer(depth_bytes, dtype=np.float32).reshape((height, width))
+        z_ndc = 2.0 * depth_values - 1.0
+        denom = far_plane + near_plane - z_ndc * (far_plane - near_plane)
+        linear_depth = (2.0 * near_plane * far_plane) / np.maximum(1e-6, denom)
+        linear_depth = np.clip(linear_depth, near_plane, far_plane).astype(np.float32)
+        linear_depth = np.flipud(linear_depth)
+
+        fbo.release()
+        self.doneCurrent()
+        return linear_depth[:, :, None]
+
+    @staticmethod
+    def depth_array_to_colormap_image(depth_array: np.ndarray, min_depth_m: float, max_depth_m: float) -> QImage:
+        depth = depth_array[:, :, 0]
+        depth_span = max(1e-6, max_depth_m - min_depth_m)
+        t = np.clip((depth - min_depth_m) / depth_span, 0.0, 1.0)
+
+        blue = np.array([59.0, 76.0, 192.0], dtype=np.float32)
+        mid = np.array([221.0, 221.0, 221.0], dtype=np.float32)
+        red = np.array([180.0, 4.0, 38.0], dtype=np.float32)
+
+        rgb = np.empty((depth.shape[0], depth.shape[1], 3), dtype=np.float32)
+        low_mask = t <= 0.5
+        high_mask = ~low_mask
+
+        t_low = (t[low_mask] * 2.0)[:, None]
+        t_high = ((t[high_mask] - 0.5) * 2.0)[:, None]
+
+        rgb[low_mask] = blue[None, :] * (1.0 - t_low) + mid[None, :] * t_low
+        rgb[high_mask] = mid[None, :] * (1.0 - t_high) + red[None, :] * t_high
+
+        rgba = np.empty((depth.shape[0], depth.shape[1], 4), dtype=np.uint8)
+        rgba[:, :, :3] = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        rgba[:, :, 3] = 255
+        return QImage(rgba.data, depth.shape[1], depth.shape[0], 4 * depth.shape[1], QImage.Format_RGBA8888).copy()
+
     @staticmethod
     def stereo_from_rig(
         rig_pos: tuple[float, float, float],
@@ -288,6 +357,7 @@ class MainWindow(QWidget):
         self.world_view = OpenGLWorldWidget()
         self.left_preview = StereoPreview("Left")
         self.right_preview = StereoPreview("Right")
+        self.depth_preview = StereoPreview("Depth")
         self.collect_button = QPushButton("Collect train data")
         self.frame_count_label = QLabel("Frames to collect")
         self.frame_count_spinbox = QSpinBox()
@@ -302,6 +372,7 @@ class MainWindow(QWidget):
         right_layout.addWidget(QLabel("Stereo camera previews"))
         right_layout.addWidget(self.left_preview)
         right_layout.addWidget(self.right_preview)
+        right_layout.addWidget(self.depth_preview)
         right_layout.addWidget(self.frame_count_label)
         right_layout.addWidget(self.frame_count_spinbox)
         right_layout.addWidget(self.collect_button)
@@ -330,6 +401,8 @@ class MainWindow(QWidget):
         self.capture_size = (640, 400)
         self.stereo_baseline = 0.48
         self.look_distance = 8.0
+        self.depth_min_m = 0.0
+        self.depth_max_m = 50.0
 
     def _path_pose(self, t: float) -> tuple[tuple[float, float, float], tuple[float, float]]:
         x = -22.0 + 44.0 * t
@@ -398,31 +471,69 @@ class MainWindow(QWidget):
             baseline=self.stereo_baseline,
             look_distance=self.look_distance,
         )
+        center_cam = CameraPose(
+            eye=rig_pos,
+            target=(
+                rig_pos[0] + self.look_distance * forward_xy[0],
+                rig_pos[1] + self.look_distance * forward_xy[1],
+                rig_pos[2] - 0.04,
+            ),
+            up=(0.0, 0.0, 1.0),
+        )
 
         width, height = self.capture_size
         left_image = self.world_view.render_camera_image(left_cam, width, height)
         right_image = self.world_view.render_camera_image(right_cam, width, height)
+        depth_array = self.world_view.render_depth_array(
+            center_cam,
+            width,
+            height,
+        )
+        depth_preview_image = self.world_view.depth_array_to_colormap_image(
+            depth_array,
+            self.depth_min_m,
+            self.depth_max_m,
+        )
+
+        depth_span = max(1e-6, self.depth_max_m - self.depth_min_m)
+        depth_clipped = np.clip(depth_array, self.depth_min_m, self.depth_max_m)
+        depth_uint16 = np.rint(((depth_clipped - self.depth_min_m) / depth_span) * 65535.0).astype(np.uint16)
 
         left_name = f"frame_{self.frame_index:04d}_left.png"
         right_name = f"frame_{self.frame_index:04d}_right.png"
+        depth_name = f"depth_{self.frame_index:04d}.npy"
         left_path = self.current_run_dir / left_name
         right_path = self.current_run_dir / right_name
+        depth_path = self.current_run_dir / depth_name
 
         if not left_image.save(str(left_path)) or not right_image.save(str(right_path)):
             self._stop_collection("Error: could not save one or more images.")
             return
 
+        try:
+            np.save(depth_path, depth_uint16)
+        except Exception:  # noqa: BLE001
+            self._stop_collection("Error: could not save depth array.")
+            return
+
         self.left_preview.set_image(left_image)
         self.right_preview.set_image(right_image)
+        self.depth_preview.set_image(depth_preview_image)
 
         meta = {
             "frame_index": self.frame_index,
             "left_image": left_name,
             "right_image": right_name,
+            "depth_array": depth_name,
+            "depth_shape": [height, width, 1],
+            "depth_dtype": "uint16",
             "rig_position": [rig_pos[0], rig_pos[1], rig_pos[2]],
             "forward_xy": [forward_xy[0], forward_xy[1]],
             "baseline": self.stereo_baseline,
             "look_distance": self.look_distance,
+            "depth_reference_camera": "center",
+            "depth_min_m": self.depth_min_m,
+            "depth_max_m": self.depth_max_m,
         }
         with self.current_meta_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(meta) + "\n")
