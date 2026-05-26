@@ -14,11 +14,28 @@ import math
 import random
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+MATPLOTLIB_IMPORT_ERROR = ""
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+except Exception as exc:  # noqa: BLE001
+    MATPLOTLIB_IMPORT_ERROR = str(exc)
+
+TORCH_IMPORT_ERROR = ""
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, Dataset, random_split
+except Exception as exc:  # noqa: BLE001
+    TORCH_IMPORT_ERROR = str(exc)
 
 OPENGL_IMPORT_ERROR = ""
 try:
@@ -63,6 +80,7 @@ from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectF
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -102,6 +120,92 @@ class StereoPreview(QLabel):
     def reset(self) -> None:
         self.clear()
         self.setText(f"{self._title}: no image")
+
+
+def qimage_to_rgb_array(image: QImage) -> np.ndarray:
+    rgb_image = image.convertToFormat(QImage.Format_RGB888)
+    width = rgb_image.width()
+    height = rgb_image.height()
+    bytes_per_line = rgb_image.bytesPerLine()
+    data = np.frombuffer(rgb_image.bits(), dtype=np.uint8, count=bytes_per_line * height)
+    return data.reshape((height, bytes_per_line))[:, : width * 3].reshape((height, width, 3)).copy()
+
+
+class StereoDepthDataset(Dataset):
+    def __init__(self, run_dir: Path, records: list[dict], target_size: tuple[int, int]) -> None:
+        self.run_dir = run_dir
+        self.records = records
+        self.target_size = target_size  # (height, width)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        record = self.records[index]
+        left_path = self.run_dir / record["left_image"]
+        right_path = self.run_dir / record["right_image"]
+        depth_path = self.run_dir / record["depth_array"]
+
+        left_qimg = QImage(str(left_path))
+        right_qimg = QImage(str(right_path))
+        if left_qimg.isNull() or right_qimg.isNull():
+            raise RuntimeError(f"Could not load RGB images for sample {index}.")
+
+        left = qimage_to_rgb_array(left_qimg).astype(np.float32) / 255.0
+        right = qimage_to_rgb_array(right_qimg).astype(np.float32) / 255.0
+
+        depth_u16 = np.load(depth_path)
+        if depth_u16.ndim == 2:
+            depth_u16 = depth_u16[:, :, None]
+        depth_u16 = depth_u16.astype(np.float32)
+
+        depth_min_m = float(record.get("depth_min_m", 0.0))
+        depth_max_m = float(record.get("depth_max_m", 50.0))
+        depth_span = max(1e-6, depth_max_m - depth_min_m)
+        depth_m = (depth_u16 / 65535.0) * depth_span + depth_min_m
+        depth_norm = np.clip((depth_m - depth_min_m) / depth_span, 0.0, 1.0)
+
+        left_t = torch.from_numpy(left).permute(2, 0, 1)
+        right_t = torch.from_numpy(right).permute(2, 0, 1)
+        x = torch.cat([left_t, right_t], dim=0)
+        y = torch.from_numpy(depth_norm).permute(2, 0, 1)
+
+        x = F.interpolate(x.unsqueeze(0), size=self.target_size, mode="bilinear", align_corners=False).squeeze(0)
+        y = F.interpolate(y.unsqueeze(0), size=self.target_size, mode="bilinear", align_corners=False).squeeze(0)
+        return x, y
+
+
+class StereoDepthFusionNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(6, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.down = nn.MaxPool2d(kernel_size=2)
+        self.mid = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.up = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        m = self.mid(self.down(e1))
+        u = self.up(m)
+        if u.shape[-2:] != e1.shape[-2:]:
+            u = F.interpolate(u, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        y = self.dec(torch.cat([e1, u], dim=1))
+        return torch.sigmoid(y)
 
 
 class OpenGLWorldWidget(QOpenGLWidget):
@@ -359,6 +463,7 @@ class MainWindow(QWidget):
         self.right_preview = StereoPreview("Right")
         self.depth_preview = StereoPreview("Depth")
         self.collect_button = QPushButton("Collect train data")
+        self.train_model_button = QPushButton("Train sensor data fusion model")
         self.frame_count_label = QLabel("Frames to collect")
         self.frame_count_spinbox = QSpinBox()
         self.frame_count_spinbox.setRange(1, 200000)
@@ -366,22 +471,62 @@ class MainWindow(QWidget):
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
 
-        self.collect_button.clicked.connect(self.toggle_collection)
+        self.training_eta_label = QLabel("ETA: -")
+        self.training_epoch_label = QLabel("Epochs: -")
+        self.training_batch_label = QLabel("Mini-batches: -")
+        self.train_loss_history: list[float] = []
+        self.val_loss_history: list[float] = []
 
-        right_layout = QVBoxLayout()
-        right_layout.addWidget(QLabel("Stereo camera previews"))
-        right_layout.addWidget(self.left_preview)
-        right_layout.addWidget(self.right_preview)
-        right_layout.addWidget(self.depth_preview)
-        right_layout.addWidget(self.frame_count_label)
-        right_layout.addWidget(self.frame_count_spinbox)
-        right_layout.addWidget(self.collect_button)
-        right_layout.addWidget(self.status_label)
-        right_layout.addStretch(1)
+        self.loss_canvas = None
+        self.loss_figure = None
+        self.loss_ax = None
+        if not MATPLOTLIB_IMPORT_ERROR:
+            self.loss_figure = Figure(figsize=(4.0, 2.8), tight_layout=True)
+            self.loss_ax = self.loss_figure.add_subplot(111)
+            self.loss_canvas = FigureCanvas(self.loss_figure)
+            self.loss_canvas.setMinimumSize(420, 280)
+            self._update_loss_plot()
+        else:
+            self.loss_placeholder_label = QLabel(
+                "Matplotlib not available.\n"
+                "Install with: pip install matplotlib"
+            )
+            self.loss_placeholder_label.setWordWrap(True)
+            self.loss_placeholder_label.setStyleSheet("color:#bbbbbb;")
+
+        self.collect_button.clicked.connect(self.toggle_collection)
+        self.train_model_button.clicked.connect(self.train_sensor_data_fusion_model)
+
+        controls_layout = QVBoxLayout()
+        controls_layout.addWidget(QLabel("Stereo camera previews"))
+        controls_layout.addWidget(self.left_preview)
+        controls_layout.addWidget(self.right_preview)
+        controls_layout.addWidget(self.depth_preview)
+        controls_layout.addWidget(self.frame_count_label)
+        controls_layout.addWidget(self.frame_count_spinbox)
+        controls_layout.addWidget(self.collect_button)
+        controls_layout.addWidget(self.train_model_button)
+        controls_layout.addWidget(self.status_label)
+        controls_layout.addStretch(1)
+
+        training_layout = QVBoxLayout()
+        training_layout.addWidget(QLabel("Training progress"))
+        training_layout.addWidget(self.training_eta_label)
+        training_layout.addWidget(self.training_epoch_label)
+        training_layout.addWidget(self.training_batch_label)
+        if self.loss_canvas is not None:
+            training_layout.addWidget(self.loss_canvas)
+        else:
+            training_layout.addWidget(self.loss_placeholder_label)
+        training_layout.addStretch(1)
+
+        right_panel_layout = QHBoxLayout()
+        right_panel_layout.addLayout(controls_layout, stretch=2)
+        right_panel_layout.addLayout(training_layout, stretch=1)
 
         root_layout = QHBoxLayout(self)
         root_layout.addWidget(self.world_view, stretch=1)
-        root_layout.addLayout(right_layout, stretch=0)
+        root_layout.addLayout(right_panel_layout, stretch=0)
 
         self.drive_timer = QTimer(self)
         self.drive_timer.setInterval(45)
@@ -403,6 +548,40 @@ class MainWindow(QWidget):
         self.look_distance = 8.0
         self.depth_min_m = 0.0
         self.depth_max_m = 50.0
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        sec = max(0, int(round(seconds)))
+        hours, rem = divmod(sec, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _reset_training_progress_ui(self) -> None:
+        self.training_eta_label.setText("ETA: -")
+        self.training_epoch_label.setText("Epochs: -")
+        self.training_batch_label.setText("Mini-batches: -")
+        self.train_loss_history = []
+        self.val_loss_history = []
+        self._update_loss_plot()
+
+    def _update_loss_plot(self) -> None:
+        if self.loss_ax is None or self.loss_canvas is None:
+            return
+        self.loss_ax.clear()
+        self.loss_ax.set_title("Loss per epoch")
+        self.loss_ax.set_xlabel("Epoch")
+        self.loss_ax.set_ylabel("MSE")
+        self.loss_ax.grid(True, alpha=0.3)
+
+        if self.train_loss_history:
+            epochs_axis = list(range(1, len(self.train_loss_history) + 1))
+            self.loss_ax.plot(epochs_axis, self.train_loss_history, marker="o", label="train")
+            self.loss_ax.plot(epochs_axis, self.val_loss_history, marker="o", label="val")
+            self.loss_ax.legend(loc="best")
+
+        self.loss_canvas.draw_idle()
 
     def _path_pose(self, t: float) -> tuple[tuple[float, float, float], tuple[float, float]]:
         x = -22.0 + 44.0 * t
@@ -443,6 +622,7 @@ class MainWindow(QWidget):
         self.frame_index = 0
         self.frame_count_spinbox.setEnabled(False)
         self.collect_button.setText("Stop collection")
+        self.train_model_button.setEnabled(False)
         self.status_label.setText(f"Collecting stereo data into:\n{run_dir}")
         self.drive_timer.start()
         self._collect_next_frame()
@@ -452,7 +632,173 @@ class MainWindow(QWidget):
             self.drive_timer.stop()
         self.frame_count_spinbox.setEnabled(True)
         self.collect_button.setText("Collect train data")
+        self.train_model_button.setEnabled(True)
         self.status_label.setText(message)
+
+    def _set_training_ui_running(self, running: bool) -> None:
+        self.train_model_button.setEnabled(not running)
+        self.collect_button.setEnabled(not running)
+        self.frame_count_spinbox.setEnabled(not running)
+        if running:
+            self._reset_training_progress_ui()
+
+    def _load_training_records(self, run_dir: Path) -> list[dict]:
+        metadata_path = run_dir / "metadata.jsonl"
+        if not metadata_path.exists():
+            raise RuntimeError("metadata.jsonl not found in selected training directory.")
+
+        records: list[dict] = []
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not all(key in record for key in ("left_image", "right_image", "depth_array")):
+                    continue
+                if not (run_dir / record["left_image"]).exists():
+                    continue
+                if not (run_dir / record["right_image"]).exists():
+                    continue
+                if not (run_dir / record["depth_array"]).exists():
+                    continue
+                records.append(record)
+        if not records:
+            raise RuntimeError("No valid training samples found in metadata.jsonl.")
+        return records
+
+    def _train_model(self, run_dir: Path) -> Path:
+        if TORCH_IMPORT_ERROR:
+            raise RuntimeError(
+                "PyTorch is not available. Install with: pip install torch\n"
+                f"Import error: {TORCH_IMPORT_ERROR}"
+            )
+
+        records = self._load_training_records(run_dir)
+        target_size = (128, 192)
+        dataset = StereoDepthDataset(run_dir, records, target_size)
+
+        if len(dataset) < 2:
+            raise RuntimeError("Need at least 2 samples for training.")
+
+        val_len = max(1, int(0.1 * len(dataset)))
+        train_len = len(dataset) - val_len
+        train_set, val_set = random_split(dataset, [train_len, val_len])
+
+        train_loader = DataLoader(train_set, batch_size=8, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=0)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = StereoDepthFusionNet().to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        criterion = nn.MSELoss()
+
+        epochs = 8
+        num_train_batches = max(1, len(train_loader))
+        total_steps = epochs * num_train_batches
+        start_time = time.perf_counter()
+
+        self.status_label.setText(
+            f"Training started on {device.type} with {len(records)} samples.\n"
+            f"Train/Val: {train_len}/{val_len}"
+        )
+        self.training_epoch_label.setText(f"Epochs: 0/{epochs}")
+        self.training_batch_label.setText(f"Mini-batches: 0/{num_train_batches}")
+        self.training_eta_label.setText("ETA: calculating...")
+        QApplication.processEvents()
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            train_loss_sum = 0.0
+            train_batches = 0
+            for batch_idx, (x, y) in enumerate(train_loader, start=1):
+                x = x.to(device)
+                y = y.to(device)
+                optimizer.zero_grad()
+                pred = model(x)
+                loss = criterion(pred, y)
+                loss.backward()
+                optimizer.step()
+                train_loss_sum += float(loss.item())
+                train_batches += 1
+
+                completed_steps = (epoch - 1) * num_train_batches + batch_idx
+                elapsed = time.perf_counter() - start_time
+                seconds_per_step = elapsed / max(1, completed_steps)
+                eta = seconds_per_step * (total_steps - completed_steps)
+
+                self.training_epoch_label.setText(f"Epochs: {epoch}/{epochs}")
+                self.training_batch_label.setText(f"Mini-batches: {batch_idx}/{num_train_batches}")
+                self.training_eta_label.setText(f"ETA: {self._format_seconds(eta)}")
+
+                if batch_idx % 5 == 0 or batch_idx == num_train_batches:
+                    QApplication.processEvents()
+
+            model.eval()
+            val_loss_sum = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x = x.to(device)
+                    y = y.to(device)
+                    pred = model(x)
+                    loss = criterion(pred, y)
+                    val_loss_sum += float(loss.item())
+                    val_batches += 1
+
+            train_loss = train_loss_sum / max(1, train_batches)
+            val_loss = val_loss_sum / max(1, val_batches)
+            self.train_loss_history.append(train_loss)
+            self.val_loss_history.append(val_loss)
+            self._update_loss_plot()
+            self.status_label.setText(
+                f"Training model in {run_dir.name}\n"
+                f"Epoch {epoch}/{epochs} - train_loss={train_loss:.6f}, val_loss={val_loss:.6f}"
+            )
+            QApplication.processEvents()
+
+        self.training_epoch_label.setText(f"Epochs: {epochs}/{epochs}")
+        self.training_batch_label.setText(f"Mini-batches: {num_train_batches}/{num_train_batches}")
+        self.training_eta_label.setText("ETA: 00:00")
+
+        model_path = run_dir / "sensor_fusion_model.pth"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "input_channels": 6,
+                "output_channels": 1,
+                "target_size": target_size,
+                "depth_min_m": self.depth_min_m,
+                "depth_max_m": self.depth_max_m,
+                "epochs": epochs,
+            },
+            model_path,
+        )
+        return model_path
+
+    def train_sensor_data_fusion_model(self) -> None:
+        if self.drive_timer.isActive():
+            self.status_label.setText("Stop data collection before training the model.")
+            return
+
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select training data directory",
+            str(self.output_root),
+        )
+        if not selected_dir:
+            return
+
+        run_dir = Path(selected_dir)
+        self._set_training_ui_running(True)
+        try:
+            model_path = self._train_model(run_dir)
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(f"Training failed:\n{exc}")
+        else:
+            self.status_label.setText(f"Training complete. Model saved to:\n{model_path}")
+        finally:
+            self._set_training_ui_running(False)
 
     def _collect_next_frame(self) -> None:
         if self.current_run_dir is None or self.current_meta_path is None:
