@@ -54,3 +54,7 @@
 !037_webots/tutorial1/worlds/my_world1.wbt
 
 038_sensor_data_fusion_virtual_lab/traindata
+
+!048_particle_filter_demo_spaceships/Makefile
+!048_particle_filter_demo_spaceships/pics/earth_orbit.jpg
+
