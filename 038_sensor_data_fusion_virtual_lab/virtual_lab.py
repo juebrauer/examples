@@ -83,6 +83,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -462,8 +463,12 @@ class MainWindow(QWidget):
         self.left_preview = StereoPreview("Left")
         self.right_preview = StereoPreview("Right")
         self.depth_preview = StereoPreview("Depth")
+        self.gt_depth_preview = StereoPreview("GT depth")
+        self.pred_depth_preview = StereoPreview("Pred depth")
+        self.diff_depth_preview = StereoPreview("Abs diff")
         self.collect_button = QPushButton("Collect train data")
         self.train_model_button = QPushButton("Train sensor data fusion model")
+        self.test_model_button = QPushButton("Test trained depth model")
         self.frame_count_label = QLabel("Frames to collect")
         self.frame_count_spinbox = QSpinBox()
         self.frame_count_spinbox.setRange(1, 200000)
@@ -496,16 +501,22 @@ class MainWindow(QWidget):
 
         self.collect_button.clicked.connect(self.toggle_collection)
         self.train_model_button.clicked.connect(self.train_sensor_data_fusion_model)
+        self.test_model_button.clicked.connect(self.test_trained_depth_model)
 
         controls_layout = QVBoxLayout()
         controls_layout.addWidget(QLabel("Stereo camera previews"))
         controls_layout.addWidget(self.left_preview)
         controls_layout.addWidget(self.right_preview)
         controls_layout.addWidget(self.depth_preview)
+        controls_layout.addWidget(QLabel("Model test previews"))
+        controls_layout.addWidget(self.gt_depth_preview)
+        controls_layout.addWidget(self.pred_depth_preview)
+        controls_layout.addWidget(self.diff_depth_preview)
         controls_layout.addWidget(self.frame_count_label)
         controls_layout.addWidget(self.frame_count_spinbox)
         controls_layout.addWidget(self.collect_button)
         controls_layout.addWidget(self.train_model_button)
+        controls_layout.addWidget(self.test_model_button)
         controls_layout.addWidget(self.status_label)
         controls_layout.addStretch(1)
 
@@ -637,10 +648,17 @@ class MainWindow(QWidget):
 
     def _set_training_ui_running(self, running: bool) -> None:
         self.train_model_button.setEnabled(not running)
+        self.test_model_button.setEnabled(not running)
         self.collect_button.setEnabled(not running)
         self.frame_count_spinbox.setEnabled(not running)
         if running:
             self._reset_training_progress_ui()
+
+    def _set_testing_ui_running(self, running: bool) -> None:
+        self.train_model_button.setEnabled(not running)
+        self.test_model_button.setEnabled(not running)
+        self.collect_button.setEnabled(not running)
+        self.frame_count_spinbox.setEnabled(not running)
 
     def _load_training_records(self, run_dir: Path) -> list[dict]:
         metadata_path = run_dir / "metadata.jsonl"
@@ -666,6 +684,129 @@ class MainWindow(QWidget):
         if not records:
             raise RuntimeError("No valid training samples found in metadata.jsonl.")
         return records
+
+    def _prepare_stereo_input_tensor(self, run_dir: Path, record: dict, target_size: tuple[int, int]) -> torch.Tensor:
+        left_path = run_dir / record["left_image"]
+        right_path = run_dir / record["right_image"]
+        left_qimg = QImage(str(left_path))
+        right_qimg = QImage(str(right_path))
+        if left_qimg.isNull() or right_qimg.isNull():
+            raise RuntimeError("Could not load stereo RGB images.")
+
+        left = qimage_to_rgb_array(left_qimg).astype(np.float32) / 255.0
+        right = qimage_to_rgb_array(right_qimg).astype(np.float32) / 255.0
+
+        left_t = torch.from_numpy(left).permute(2, 0, 1)
+        right_t = torch.from_numpy(right).permute(2, 0, 1)
+        x = torch.cat([left_t, right_t], dim=0)
+        x = F.interpolate(x.unsqueeze(0), size=target_size, mode="bilinear", align_corners=False)
+        return x
+
+    @staticmethod
+    def _load_depth_meters(run_dir: Path, record: dict) -> np.ndarray:
+        depth_path = run_dir / record["depth_array"]
+        depth_u16 = np.load(depth_path)
+        if depth_u16.ndim == 3 and depth_u16.shape[2] == 1:
+            depth_u16 = depth_u16[:, :, 0]
+        if depth_u16.ndim != 2:
+            raise RuntimeError("Depth array has invalid shape. Expected HxW or HxWx1.")
+
+        depth_min_m = float(record.get("depth_min_m", 0.0))
+        depth_max_m = float(record.get("depth_max_m", 50.0))
+        depth_span = max(1e-6, depth_max_m - depth_min_m)
+        depth_m = (depth_u16.astype(np.float32) / 65535.0) * depth_span + depth_min_m
+        return depth_m
+
+    @staticmethod
+    def _to_uint16_depth(depth_m: np.ndarray, min_depth_m: float, max_depth_m: float) -> np.ndarray:
+        depth_span = max(1e-6, max_depth_m - min_depth_m)
+        clipped = np.clip(depth_m, min_depth_m, max_depth_m)
+        return np.rint(((clipped - min_depth_m) / depth_span) * 65535.0).astype(np.uint16)
+
+    def _test_model(self, model_path: Path, run_dir: Path) -> tuple[float, int]:
+        if TORCH_IMPORT_ERROR:
+            raise RuntimeError(
+                "PyTorch is not available. Install with: pip install torch\n"
+                f"Import error: {TORCH_IMPORT_ERROR}"
+            )
+        if not model_path.exists():
+            raise RuntimeError("Selected model file does not exist.")
+
+        records = self._load_training_records(run_dir)
+        checkpoint = torch.load(model_path, map_location="cpu")
+        model_state_dict = checkpoint.get("model_state_dict")
+        if model_state_dict is None:
+            raise RuntimeError("Checkpoint does not contain model_state_dict.")
+
+        target_size_raw = checkpoint.get("target_size", (128, 192))
+        if not isinstance(target_size_raw, (tuple, list)) or len(target_size_raw) != 2:
+            raise RuntimeError("Checkpoint target_size is invalid.")
+        target_size = (int(target_size_raw[0]), int(target_size_raw[1]))
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = StereoDepthFusionNet().to(device)
+        model.load_state_dict(model_state_dict)
+        model.eval()
+
+        maes: list[float] = []
+        total = len(records)
+        self.status_label.setText(
+            f"Testing model on {total} samples.\n"
+            f"Model: {model_path.name}\n"
+            f"Dataset: {run_dir.name}"
+        )
+        QApplication.processEvents()
+
+        with torch.no_grad():
+            for idx, record in enumerate(records, start=1):
+                x = self._prepare_stereo_input_tensor(run_dir, record, target_size).to(device)
+                pred_norm = model(x).detach().cpu()[0, 0].numpy().astype(np.float32)
+
+                gt_depth_m_full = self._load_depth_meters(run_dir, record)
+                gt_depth_t = torch.from_numpy(gt_depth_m_full).unsqueeze(0).unsqueeze(0)
+                gt_depth_m = F.interpolate(
+                    gt_depth_t,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0].numpy().astype(np.float32)
+
+                depth_min_m = float(record.get("depth_min_m", checkpoint.get("depth_min_m", self.depth_min_m)))
+                depth_max_m = float(record.get("depth_max_m", checkpoint.get("depth_max_m", self.depth_max_m)))
+                depth_span = max(1e-6, depth_max_m - depth_min_m)
+
+                pred_depth_m = np.clip(pred_norm, 0.0, 1.0) * depth_span + depth_min_m
+                abs_diff_m = np.abs(pred_depth_m - gt_depth_m)
+                mae = float(abs_diff_m.mean())
+                maes.append(mae)
+
+                gt_u16 = self._to_uint16_depth(gt_depth_m, depth_min_m, depth_max_m)
+                pred_u16 = self._to_uint16_depth(pred_depth_m, depth_min_m, depth_max_m)
+
+                # Keep diff visualization robust across easy and hard samples.
+                diff_vis_max = max(1e-3, float(np.percentile(abs_diff_m, 95.0)))
+                diff_u16 = self._to_uint16_depth(abs_diff_m, 0.0, diff_vis_max)
+
+                gt_img = self.world_view.depth_array_to_colormap_image(gt_u16[:, :, None], 0.0, 65535.0)
+                pred_img = self.world_view.depth_array_to_colormap_image(pred_u16[:, :, None], 0.0, 65535.0)
+                diff_img = self.world_view.depth_array_to_colormap_image(diff_u16[:, :, None], 0.0, 65535.0)
+
+                self.gt_depth_preview.set_image(gt_img)
+                self.pred_depth_preview.set_image(pred_img)
+                self.diff_depth_preview.set_image(diff_img)
+
+                self.training_epoch_label.setText(f"Test samples: {idx}/{total}")
+                self.training_batch_label.setText(f"Image MAE: {mae:.4f} m")
+                self.training_eta_label.setText(f"Running avg MAE: {float(np.mean(maes)):.4f} m")
+                self.status_label.setText(
+                    f"Testing model: {model_path.name}\n"
+                    f"Sample {idx}/{total} - frame {record.get('frame_index', idx - 1)}\n"
+                    f"MAE={mae:.4f} m"
+                )
+                QApplication.processEvents()
+
+        mean_mae = float(np.mean(maes)) if maes else 0.0
+        return mean_mae, total
 
     def _train_model(self, run_dir: Path) -> Path:
         if TORCH_IMPORT_ERROR:
@@ -799,6 +940,51 @@ class MainWindow(QWidget):
             self.status_label.setText(f"Training complete. Model saved to:\n{model_path}")
         finally:
             self._set_training_ui_running(False)
+
+    def test_trained_depth_model(self) -> None:
+        if self.drive_timer.isActive():
+            self.status_label.setText("Stop data collection before testing a model.")
+            return
+
+        model_file, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select trained model checkpoint",
+            str(self.output_root),
+            "PyTorch model (*.pth);;All files (*)",
+        )
+        if not model_file:
+            return
+
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select test data directory",
+            str(self.output_root),
+        )
+        if not selected_dir:
+            return
+
+        model_path = Path(model_file)
+        run_dir = Path(selected_dir)
+
+        self._set_testing_ui_running(True)
+        try:
+            mean_mae, sample_count = self._test_model(model_path, run_dir)
+        except Exception as exc:  # noqa: BLE001
+            self.status_label.setText(f"Model test failed:\n{exc}")
+        else:
+            self.status_label.setText(
+                f"Model test complete.\n"
+                f"Samples: {sample_count}\n"
+                f"Average image MAE: {mean_mae:.4f} m"
+            )
+            QMessageBox.information(
+                self,
+                "Test complete",
+                f"Evaluated {sample_count} samples.\n"
+                f"Average image MAE: {mean_mae:.4f} m",
+            )
+        finally:
+            self._set_testing_ui_running(False)
 
     def _collect_next_frame(self) -> None:
         if self.current_run_dir is None or self.current_meta_path is None:
