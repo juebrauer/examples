@@ -111,7 +111,7 @@
 
 // decides whether to use or not to use resampling
 // of particles
-#define RESAMPLING true
+#define RESAMPLING false
 
 // this should help, when resampling to reduce
 // the problem of losing the tracking of objects
