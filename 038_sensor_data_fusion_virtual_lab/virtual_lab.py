@@ -407,12 +407,8 @@ class StereoDepthFusionNet(nn.Module):
         return torch.sigmoid(y)
 
 
-class StereoDepthViTNet(nn.Module):
-    """Vision Transformer-based stereo depth estimation model.
-    
-    Uses patch embedding, transformer encoder, and depth decoder for multi-scale
-    spatial understanding of stereo image pairs.
-    """
+class StereoDepthLegacyViTNet(nn.Module):
+    """Original patch-only ViT depth model kept for loading older checkpoints."""
 
     def __init__(self, patch_size: int = 8, embed_dim: int = 256, num_heads: int = 8, num_layers: int = 4) -> None:
         super().__init__()
@@ -489,6 +485,133 @@ class StereoDepthViTNet(nn.Module):
         depth_patch_grid = self.decoder(x_spatial)  # (B, 1, H/patch, W/patch)
         depth = F.interpolate(depth_patch_grid, size=(H, W), mode="bilinear", align_corners=False)
         return torch.sigmoid(depth)
+
+
+class StereoDepthViTNet(nn.Module):
+    """Hybrid CNN/ViT U-Net for stereo depth estimation.
+
+    A pure patch ViT is a poor inductive bias for dense depth from a small
+    synthetic dataset: it tends to learn row-wise scene priors and loses the
+    local object boundaries. This hybrid keeps high-resolution CNN skip
+    features, lets the transformer reason globally on a compact H/8 x W/8 grid,
+    and decodes with skip connections back to full resolution.
+    """
+
+    def __init__(self, embed_dim: int = 192, num_heads: int = 6, num_layers: int = 3) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        self.enc_full = nn.Sequential(
+            nn.Conv2d(6, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.enc_half = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.enc_quarter = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        # H/4 x W/4 -> H/8 x W/8 transformer tokens.
+        self.patch_proj = nn.Conv2d(128, embed_dim, kernel_size=3, stride=2, padding=1)
+        self.pos_embedding_2d = nn.Parameter(torch.randn(1, embed_dim, 16, 24) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.05,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer_norm = nn.LayerNorm(embed_dim)
+
+        self.up_to_quarter = nn.ConvTranspose2d(embed_dim, 128, kernel_size=2, stride=2)
+        self.dec_quarter = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.up_to_half = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec_half = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.up_to_full = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec_full = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    @staticmethod
+    def _resize_like(x: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        if x.shape[-2:] == reference.shape[-2:]:
+            return x
+        return F.interpolate(x, size=reference.shape[-2:], mode="bilinear", align_corners=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        full = self.enc_full(x)
+        half = self.enc_half(full)
+        quarter = self.enc_quarter(half)
+
+        tokens_2d = self.patch_proj(quarter)
+        token_h, token_w = tokens_2d.shape[-2:]
+        pos = F.interpolate(self.pos_embedding_2d, size=(token_h, token_w), mode="bilinear", align_corners=False)
+        tokens_2d = tokens_2d + pos.to(device=tokens_2d.device, dtype=tokens_2d.dtype)
+
+        tokens = tokens_2d.flatten(2).transpose(1, 2)
+        tokens = self.transformer_encoder(tokens)
+        tokens = self.transformer_norm(tokens)
+        tokens_2d = tokens.transpose(1, 2).reshape(x.shape[0], self.embed_dim, token_h, token_w)
+
+        up_quarter = self._resize_like(self.up_to_quarter(tokens_2d), quarter)
+        dec_quarter = self.dec_quarter(torch.cat([up_quarter, quarter], dim=1))
+
+        up_half = self._resize_like(self.up_to_half(dec_quarter), half)
+        dec_half = self.dec_half(torch.cat([up_half, half], dim=1))
+
+        up_full = self._resize_like(self.up_to_full(dec_half), full)
+        depth_logits = self.dec_full(torch.cat([up_full, full], dim=1))
+        return torch.sigmoid(depth_logits)
+
+
+def weighted_depth_l1_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L1 depth loss with extra weight for near regions and object boundaries."""
+    abs_error = torch.abs(pred - target)
+    near_weight = 1.0 + 2.0 * (1.0 - target).clamp(0.0, 1.0)
+
+    grad_x = F.pad(torch.abs(target[:, :, :, 1:] - target[:, :, :, :-1]), (0, 1, 0, 0))
+    grad_y = F.pad(torch.abs(target[:, :, 1:, :] - target[:, :, :-1, :]), (0, 0, 0, 1))
+    edge_weight = 1.0 + 4.0 * torch.clamp((grad_x + grad_y) * 10.0, 0.0, 1.0)
+    weight = near_weight * edge_weight
+    return (abs_error * weight).sum() / weight.sum().clamp_min(1e-6)
 
 
 class OpenGLWorldWidget(QOpenGLWidget):
@@ -873,7 +996,7 @@ class MainWindow(QWidget):
         self.loss_ax.clear()
         self.loss_ax.set_title("Loss per epoch")
         self.loss_ax.set_xlabel("Epoch")
-        self.loss_ax.set_ylabel("MAE")
+        self.loss_ax.set_ylabel("weighted L1 depth loss")
         self.loss_ax.grid(True, alpha=0.3)
 
         if self.train_loss_history:
@@ -1027,6 +1150,20 @@ class MainWindow(QWidget):
         clipped = np.clip(depth_m, min_depth_m, max_depth_m)
         return np.rint(((clipped - min_depth_m) / depth_span) * 65535.0).astype(np.uint16)
 
+    @staticmethod
+    def _create_model_for_checkpoint(checkpoint: dict, model_state_dict: dict, device: torch.device) -> nn.Module:
+        model_type = checkpoint.get("model_type", "CNN")
+        model_version = checkpoint.get("model_version", "")
+
+        if model_type == "ViT":
+            # Older checkpoints used the original patch-only ViT. Detect them
+            # from their state-dict keys so they can still be visualized/tested.
+            if model_version != "hybrid_vit_v2" and "patch_embedding.weight" in model_state_dict:
+                return StereoDepthLegacyViTNet().to(device)
+            return StereoDepthViTNet().to(device)
+
+        return StereoDepthFusionNet().to(device)
+
     def _test_model(self, model_path: Path, run_dir: Path) -> tuple[float, int]:
         if TORCH_IMPORT_ERROR:
             raise RuntimeError(
@@ -1049,12 +1186,7 @@ class MainWindow(QWidget):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Auto-detect model type from checkpoint
-        model_type = checkpoint.get("model_type", "CNN")
-        if model_type == "ViT":
-            model = StereoDepthViTNet().to(device)
-        else:
-            model = StereoDepthFusionNet().to(device)
+        model = self._create_model_for_checkpoint(checkpoint, model_state_dict, device)
         
         model.load_state_dict(model_state_dict)
         model.eval()
@@ -1199,8 +1331,7 @@ class MainWindow(QWidget):
             model = StereoDepthFusionNet().to(device)
         
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        #criterion = nn.MSELoss()
-        criterion = nn.L1Loss()
+        criterion = weighted_depth_l1_loss
 
         epochs = int(self.epochs_spinbox.value())
         num_train_batches = max(1, len(train_loader))
@@ -1275,6 +1406,7 @@ class MainWindow(QWidget):
             {
                 "model_state_dict": model.state_dict(),
                 "model_type": selected_model_type,
+                "model_version": "hybrid_vit_v2" if selected_model_type == "ViT" else "cnn_v1",
                 "input_channels": 6,
                 "output_channels": 1,
                 "target_size": target_size,

@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1050" viewBox="0 0 1800 1050" role="img" aria-labelledby="title desc">
+  <title id="title">Neue Hybrid-CNN/ViT-U-Net Architektur für Stereo-Tiefenschätzung</title>
+  <desc id="desc">Architekturdiagramm des Hybrid-CNN/ViT-U-Net Modells mit Stereo-Eingang, CNN-Encoder, Transformer-Bottleneck, U-Net Decoder mit Skip-Connections und gewichteter Tiefen-Loss.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowPink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#db2777"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 19px Arial, Helvetica, sans-serif; fill: #475569; }
+      .box { rx: 18; ry: 18; stroke-width: 3; filter: url(#shadow); }
+      .input { fill: #dbeafe; stroke: #2563eb; }
+      .tensor { fill: #e0f2fe; stroke: #0284c7; }
+      .cnn { fill: #dcfce7; stroke: #16a34a; }
+      .vit { fill: #fef3c7; stroke: #d97706; }
+      .decoder { fill: #fae8ff; stroke: #a21caf; }
+      .skip { fill: #fce7f3; stroke: #db2777; }
+      .output { fill: #fee2e2; stroke: #dc2626; }
+      .loss { fill: #ede9fe; stroke: #7c3aed; }
+      .target { fill: #f1f5f9; stroke: #475569; }
+      .label { font: 700 18px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .text { font: 400 15px Arial, Helvetica, sans-serif; fill: #1e293b; }
+      .small { font: 400 13px Arial, Helvetica, sans-serif; fill: #475569; }
+      .arrow { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .skipArrow { stroke: #db2777; stroke-width: 3; stroke-dasharray: 9 7; fill: none; marker-end: url(#arrowPink); }
+      .lossArrow { stroke: #7c3aed; stroke-width: 3; fill: none; marker-end: url(#arrowPurple); }
+      .stage { font: 700 16px Arial, Helvetica, sans-serif; fill: #64748b; letter-spacing: 0.08em; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1050"/>
+  <text class="title" x="900" y="52" text-anchor="middle">Neue Hybrid-CNN/ViT-U-Net Architektur</text>
+  <text class="subtitle" x="900" y="83" text-anchor="middle">Stereo-Tiefenschätzung: lokale CNN-Details + globaler Transformer-Kontext + U-Net Skip-Decoder</text>
+
+  <!-- Stage captions -->
+  <text class="stage" x="95" y="130">INPUT</text>
+  <text class="stage" x="335" y="130">CNN ENCODER</text>
+  <text class="stage" x="825" y="130">TRANSFORMER BOTTLENECK</text>
+  <text class="stage" x="1200" y="130">DECODER MIT SKIPS</text>
+  <text class="stage" x="1515" y="130">OUTPUT / LOSS</text>
+
+  <!-- Inputs -->
+  <rect class="box input" x="70" y="170" width="210" height="92"/>
+  <text class="label" x="175" y="204" text-anchor="middle">Linkes RGB-Bild</text>
+  <text class="text" x="175" y="232" text-anchor="middle">3 × H × W</text>
+
+  <rect class="box input" x="70" y="300" width="210" height="92"/>
+  <text class="label" x="175" y="334" text-anchor="middle">Rechtes RGB-Bild</text>
+  <text class="text" x="175" y="362" text-anchor="middle">3 × H × W</text>
+
+  <rect class="box tensor" x="340" y="235" width="230" height="100"/>
+  <text class="label" x="455" y="269" text-anchor="middle">Konkatenation</text>
+  <text class="text" x="455" y="297" text-anchor="middle">6 × H × W</text>
+
+  <path class="arrow" d="M 280 216 C 300 216, 315 260, 340 272"/>
+  <path class="arrow" d="M 280 346 C 300 346, 315 310, 340 298"/>
+
+  <!-- Encoder -->
+  <rect class="box cnn" x="630" y="180" width="250" height="120"/>
+  <text class="label" x="755" y="215" text-anchor="middle">CNN Encoder Full-Res</text>
+  <text class="text" x="755" y="243" text-anchor="middle">Conv 6→32, Conv 32→32</text>
+  <text class="small" x="755" y="271" text-anchor="middle">Feature: 32 × H × W</text>
+
+  <rect class="box cnn" x="630" y="360" width="250" height="120"/>
+  <text class="label" x="755" y="395" text-anchor="middle">CNN Encoder Half-Res</text>
+  <text class="text" x="755" y="423" text-anchor="middle">Stride-Conv 32→64</text>
+  <text class="small" x="755" y="451" text-anchor="middle">Feature: 64 × H/2 × W/2</text>
+
+  <rect class="box cnn" x="630" y="540" width="250" height="120"/>
+  <text class="label" x="755" y="575" text-anchor="middle">CNN Encoder Quarter-Res</text>
+  <text class="text" x="755" y="603" text-anchor="middle">Stride-Conv 64→128</text>
+  <text class="small" x="755" y="631" text-anchor="middle">Feature: 128 × H/4 × W/4</text>
+
+  <path class="arrow" d="M 570 285 C 600 270, 605 250, 630 240"/>
+  <path class="arrow" d="M 755 300 L 755 360"/>
+  <path class="arrow" d="M 755 480 L 755 540"/>
+
+  <!-- Transformer -->
+  <rect class="box vit" x="980" y="475" width="260" height="125"/>
+  <text class="label" x="1110" y="511" text-anchor="middle">Patch / Token Projection</text>
+  <text class="text" x="1110" y="539" text-anchor="middle">Conv stride 2, 128→192</text>
+  <text class="small" x="1110" y="567" text-anchor="middle">Tokens: 192 × H/8 × W/8</text>
+
+  <rect class="box vit" x="970" y="285" width="280" height="110"/>
+  <text class="label" x="1110" y="321" text-anchor="middle">2D Positional Embedding</text>
+  <text class="text" x="1110" y="349" text-anchor="middle">interpoliert auf Tokenraster</text>
+
+  <rect class="box vit" x="1310" y="475" width="250" height="125"/>
+  <text class="label" x="1435" y="511" text-anchor="middle">Transformer Encoder</text>
+  <text class="text" x="1435" y="539" text-anchor="middle">3 Layer, 6 Heads</text>
+  <text class="small" x="1435" y="567" text-anchor="middle">globaler Kontext</text>
+
+  <rect class="box vit" x="1620" y="495" width="150" height="85"/>
+  <text class="label" x="1695" y="528" text-anchor="middle">LayerNorm</text>
+  <text class="small" x="1695" y="555" text-anchor="middle">Token Features</text>
+
+  <path class="arrow" d="M 880 600 C 920 600, 940 545, 980 538"/>
+  <path class="arrow" d="M 1110 395 L 1110 475"/>
+  <path class="arrow" d="M 1240 538 L 1310 538"/>
+  <path class="arrow" d="M 1560 538 L 1620 538"/>
+
+  <!-- Decoder lower row -->
+  <rect class="box decoder" x="1290" y="690" width="245" height="95"/>
+  <text class="label" x="1412" y="724" text-anchor="middle">Upsample H/4</text>
+  <text class="text" x="1412" y="752" text-anchor="middle">ConvTranspose 192→128</text>
+
+  <rect class="box skip" x="1000" y="720" width="240" height="92"/>
+  <text class="label" x="1120" y="754" text-anchor="middle">Skip concat Quarter</text>
+  <text class="text" x="1120" y="782" text-anchor="middle">128 + 128 = 256</text>
+
+  <rect class="box decoder" x="710" y="720" width="230" height="92"/>
+  <text class="label" x="825" y="754" text-anchor="middle">Decoder Quarter</text>
+  <text class="text" x="825" y="782" text-anchor="middle">Conv 256→128→128</text>
+
+  <rect class="box decoder" x="430" y="720" width="230" height="92"/>
+  <text class="label" x="545" y="754" text-anchor="middle">Upsample H/2</text>
+  <text class="text" x="545" y="782" text-anchor="middle">ConvTranspose 128→64</text>
+
+  <rect class="box skip" x="160" y="720" width="220" height="92"/>
+  <text class="label" x="270" y="754" text-anchor="middle">Skip concat Half</text>
+  <text class="text" x="270" y="782" text-anchor="middle">64 + 64 = 128</text>
+
+  <path class="arrow" d="M 1695 580 C 1695 650, 1550 665, 1535 738"/>
+  <path class="arrow" d="M 1290 738 L 1240 766"/>
+  <path class="arrow" d="M 1000 766 L 940 766"/>
+  <path class="arrow" d="M 710 766 L 660 766"/>
+  <path class="arrow" d="M 430 766 L 380 766"/>
+
+  <!-- Decoder upper/output row -->
+  <rect class="box decoder" x="430" y="880" width="230" height="92"/>
+  <text class="label" x="545" y="914" text-anchor="middle">Decoder Half</text>
+  <text class="text" x="545" y="942" text-anchor="middle">Conv 128→64→64</text>
+
+  <rect class="box decoder" x="710" y="880" width="230" height="92"/>
+  <text class="label" x="825" y="914" text-anchor="middle">Upsample H×W</text>
+  <text class="text" x="825" y="942" text-anchor="middle">ConvTranspose 64→32</text>
+
+  <rect class="box skip" x="1000" y="880" width="230" height="92"/>
+  <text class="label" x="1115" y="914" text-anchor="middle">Skip concat Full</text>
+  <text class="text" x="1115" y="942" text-anchor="middle">32 + 32 = 64</text>
+
+  <rect class="box decoder" x="1290" y="880" width="230" height="92"/>
+  <text class="label" x="1405" y="914" text-anchor="middle">Decoder Full</text>
+  <text class="text" x="1405" y="942" text-anchor="middle">Conv 64→32→32→1</text>
+
+  <rect class="box output" x="1570" y="870" width="200" height="112"/>
+  <text class="label" x="1670" y="907" text-anchor="middle">Sigmoid Output</text>
+  <text class="text" x="1670" y="935" text-anchor="middle">normalisierte Tiefe</text>
+  <text class="small" x="1670" y="963" text-anchor="middle">1 × H × W</text>
+
+  <path class="arrow" d="M 270 812 C 270 875, 380 880, 430 926"/>
+  <path class="arrow" d="M 660 926 L 710 926"/>
+  <path class="arrow" d="M 940 926 L 1000 926"/>
+  <path class="arrow" d="M 1230 926 L 1290 926"/>
+  <path class="arrow" d="M 1520 926 L 1570 926"/>
+
+  <!-- Skip arrows from encoder -->
+  <path class="skipArrow" d="M 880 600 C 935 650, 980 692, 1090 720"/>
+  <text class="small" x="955" y="670" fill="#db2777">lokale Kanten / Objektstruktur</text>
+
+  <path class="skipArrow" d="M 630 420 C 460 455, 270 560, 270 720"/>
+  <text class="small" x="350" y="560" fill="#db2777">Half-Res Skip</text>
+
+  <path class="skipArrow" d="M 630 240 C 960 180, 1115 550, 1115 880"/>
+  <text class="small" x="1040" y="230" fill="#db2777">High-Res Skip</text>
+
+  <!-- Loss -->
+  <rect class="box target" x="1185" y="145" width="230" height="98"/>
+  <text class="label" x="1300" y="180" text-anchor="middle">Ground Truth Depth</text>
+  <text class="text" x="1300" y="208" text-anchor="middle">normalisiert 0..1</text>
+
+  <rect class="box loss" x="1490" y="135" width="280" height="128"/>
+  <text class="label" x="1630" y="173" text-anchor="middle">Weighted L1 Loss</text>
+  <text class="text" x="1630" y="202" text-anchor="middle">nahe Bereiche stärker</text>
+  <text class="text" x="1630" y="229" text-anchor="middle">Tiefenkanten stärker</text>
+
+  <path class="lossArrow" d="M 1415 194 L 1490 194"/>
+  <path class="lossArrow" d="M 1670 870 C 1728 720, 1720 410, 1660 263"/>
+
+  <!-- Note -->
+  <rect x="70" y="1000" width="1660" height="1" fill="#cbd5e1"/>
+  <text class="small" x="900" y="1028" text-anchor="middle">Modell in virtual_lab.py: StereoDepthViTNet — Hybrid aus CNN-Encoder, Transformer-Bottleneck und U-Net Decoder</text>
+</svg>

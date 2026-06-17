@@ -56,6 +56,7 @@
 038_sensor_data_fusion_virtual_lab/traindata
 038_sensor_data_fusion_virtual_lab/models
 038_sensor_data_fusion_virtual_lab/testdata
+!038_sensor_data_fusion_virtual_lab/vit_architecture_hybrid.svg
 
 
 !048_particle_filter_demo_spaceships/Makefile
