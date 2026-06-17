@@ -80,6 +80,7 @@ from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectF
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -406,6 +407,90 @@ class StereoDepthFusionNet(nn.Module):
         return torch.sigmoid(y)
 
 
+class StereoDepthViTNet(nn.Module):
+    """Vision Transformer-based stereo depth estimation model.
+    
+    Uses patch embedding, transformer encoder, and depth decoder for multi-scale
+    spatial understanding of stereo image pairs.
+    """
+
+    def __init__(self, patch_size: int = 8, embed_dim: int = 256, num_heads: int = 8, num_layers: int = 4) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.max_patches = 4096
+
+        # Patch embedding: project 6-channel patches to embedding dimension
+        patch_channels = 6 * patch_size * patch_size
+        self.patch_embedding = nn.Linear(patch_channels, embed_dim)
+
+        # Trainable positional embedding table (sliced to current patch count).
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.max_patches, self.embed_dim) * 0.02)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.1,
+            activation="relu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Depth decoder in patch-grid space; final resize to full image is done in forward().
+        self.decoder = nn.Sequential(
+            nn.Conv2d(embed_dim, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Input tensor of shape (B, 6, H, W) with stereo RGB images
+            
+        Returns:
+            Depth map of shape (B, 1, H, W) with values in [0, 1]
+        """
+        B, C, H, W = x.shape
+
+        # Extract patches
+        x_patches = F.unfold(x, kernel_size=self.patch_size, stride=self.patch_size)
+        x_patches = x_patches.transpose(1, 2)  # (B, num_patches, patch_dim)
+
+        # Embed patches
+        x_embedded = self.patch_embedding(x_patches)  # (B, num_patches, embed_dim)
+
+        # Add positional embeddings on the same device/dtype as the current batch.
+        num_patches = x_embedded.shape[1]
+        if num_patches > self.max_patches:
+            raise RuntimeError(
+                f"Too many patches ({num_patches}) for ViT positional embedding table ({self.max_patches})."
+            )
+        pos_emb = self.pos_embedding[:, :num_patches, :].to(device=x_embedded.device, dtype=x_embedded.dtype)
+        x_embedded = x_embedded + pos_emb
+
+        # Apply transformer encoder
+        x_transformed = self.transformer_encoder(x_embedded)  # (B, num_patches, embed_dim)
+
+        # Reshape back to spatial structure
+        num_patches_h = H // self.patch_size
+        num_patches_w = W // self.patch_size
+        x_spatial = x_transformed.reshape(B, num_patches_h, num_patches_w, self.embed_dim)
+        x_spatial = x_spatial.permute(0, 3, 1, 2)  # (B, embed_dim, num_patches_h, num_patches_w)
+
+        # Decode on patch grid then resize once to the original resolution.
+        depth_patch_grid = self.decoder(x_spatial)  # (B, 1, H/patch, W/patch)
+        depth = F.interpolate(depth_patch_grid, size=(H, W), mode="bilinear", align_corners=False)
+        return torch.sigmoid(depth)
+
+
 class OpenGLWorldWidget(QOpenGLWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -671,6 +756,11 @@ class MainWindow(QWidget):
         self.epochs_spinbox = QSpinBox()
         self.epochs_spinbox.setRange(1, 1000)
         self.epochs_spinbox.setValue(8)
+        self.model_type_label = QLabel("Model architecture")
+        self.model_type_combobox = QComboBox()
+        self.model_type_combobox.addItem("CNN")
+        self.model_type_combobox.addItem("ViT")
+        self.model_type_combobox.setCurrentIndex(0)
         self.diff_visualization_max_m = 5.0
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
@@ -711,6 +801,8 @@ class MainWindow(QWidget):
         controls_layout.addWidget(self.frame_count_spinbox)
         controls_layout.addWidget(self.epochs_label)
         controls_layout.addWidget(self.epochs_spinbox)
+        controls_layout.addWidget(self.model_type_label)
+        controls_layout.addWidget(self.model_type_combobox)
         controls_layout.addWidget(self.collect_button)
         controls_layout.addWidget(self.train_model_button)
         controls_layout.addWidget(self.test_model_button)
@@ -850,6 +942,7 @@ class MainWindow(QWidget):
         self.collect_button.setEnabled(not running)
         self.frame_count_spinbox.setEnabled(not running)
         self.epochs_spinbox.setEnabled(not running)
+        self.model_type_combobox.setEnabled(not running)
         if running:
             if self.preview_animation_timer.isActive():
                 self.preview_animation_timer.stop()
@@ -864,6 +957,7 @@ class MainWindow(QWidget):
         self.collect_button.setEnabled(not running)
         self.frame_count_spinbox.setEnabled(not running)
         self.epochs_spinbox.setEnabled(not running)
+        self.model_type_combobox.setEnabled(not running)
         if running:
             if self.preview_animation_timer.isActive():
                 self.preview_animation_timer.stop()
@@ -954,7 +1048,14 @@ class MainWindow(QWidget):
         target_size = (int(target_size_raw[0]), int(target_size_raw[1]))
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = StereoDepthFusionNet().to(device)
+        
+        # Auto-detect model type from checkpoint
+        model_type = checkpoint.get("model_type", "CNN")
+        if model_type == "ViT":
+            model = StereoDepthViTNet().to(device)
+        else:
+            model = StereoDepthFusionNet().to(device)
+        
         model.load_state_dict(model_state_dict)
         model.eval()
 
@@ -1089,7 +1190,14 @@ class MainWindow(QWidget):
         val_loader = DataLoader(val_set, batch_size=8, shuffle=False, num_workers=0)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = StereoDepthFusionNet().to(device)
+        
+        # Create model based on user selection
+        selected_model_type = self.model_type_combobox.currentText()
+        if selected_model_type == "ViT":
+            model = StereoDepthViTNet().to(device)
+        else:
+            model = StereoDepthFusionNet().to(device)
+        
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         #criterion = nn.MSELoss()
         criterion = nn.L1Loss()
@@ -1166,6 +1274,7 @@ class MainWindow(QWidget):
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
+                "model_type": selected_model_type,
                 "input_channels": 6,
                 "output_channels": 1,
                 "target_size": target_size,
