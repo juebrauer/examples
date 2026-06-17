@@ -410,18 +410,18 @@ class OpenGLWorldWidget(QOpenGLWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumSize(960, 620)
-        self._objects = self._generate_world_objects(320)
+        self._objects = self._generate_world_objects(1000)
         self._main_view_angle = 0.0
 
     def _generate_world_objects(self, count: int) -> list[BoxObject]:
         objects: list[BoxObject] = []
         for _ in range(count):
-            x = random.uniform(-24.0, 24.0)
-            y = random.uniform(-24.0, 24.0)
-            z = random.uniform(0.15, 3.4)
-            sx = random.uniform(0.2, 1.1)
-            sy = random.uniform(0.2, 1.1)
-            sz = random.uniform(0.2, 2.8)
+            x = random.uniform(-50.0, 50.0)
+            y = random.uniform(-50.0, 50.0)
+            z = random.uniform(0.15, 5.0)
+            sx = random.uniform(0.2, 1.3)
+            sy = random.uniform(0.2, 1.3)
+            sz = random.uniform(0.2, 4.0)
             yaw = random.uniform(0.0, 360.0)
             color = (
                 random.uniform(0.15, 0.95),
@@ -667,6 +667,10 @@ class MainWindow(QWidget):
         self.frame_count_spinbox = QSpinBox()
         self.frame_count_spinbox.setRange(1, 200000)
         self.frame_count_spinbox.setValue(1000)
+        self.epochs_label = QLabel("Training epochs")
+        self.epochs_spinbox = QSpinBox()
+        self.epochs_spinbox.setRange(1, 1000)
+        self.epochs_spinbox.setValue(8)
         self.diff_visualization_max_m = 5.0
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
@@ -705,6 +709,8 @@ class MainWindow(QWidget):
         controls_layout.addWidget(self.depth_preview)
         controls_layout.addWidget(self.frame_count_label)
         controls_layout.addWidget(self.frame_count_spinbox)
+        controls_layout.addWidget(self.epochs_label)
+        controls_layout.addWidget(self.epochs_spinbox)
         controls_layout.addWidget(self.collect_button)
         controls_layout.addWidget(self.train_model_button)
         controls_layout.addWidget(self.test_model_button)
@@ -775,7 +781,7 @@ class MainWindow(QWidget):
         self.loss_ax.clear()
         self.loss_ax.set_title("Loss per epoch")
         self.loss_ax.set_xlabel("Epoch")
-        self.loss_ax.set_ylabel("MSE")
+        self.loss_ax.set_ylabel("MAE")
         self.loss_ax.grid(True, alpha=0.3)
 
         if self.train_loss_history:
@@ -843,6 +849,12 @@ class MainWindow(QWidget):
         self.test_model_button.setEnabled(not running)
         self.collect_button.setEnabled(not running)
         self.frame_count_spinbox.setEnabled(not running)
+        self.epochs_spinbox.setEnabled(not running)
+        if running:
+            if self.preview_animation_timer.isActive():
+                self.preview_animation_timer.stop()
+        elif not self.preview_animation_timer.isActive():
+            self.preview_animation_timer.start()
         if running:
             self._reset_training_progress_ui()
 
@@ -851,6 +863,12 @@ class MainWindow(QWidget):
         self.test_model_button.setEnabled(not running)
         self.collect_button.setEnabled(not running)
         self.frame_count_spinbox.setEnabled(not running)
+        self.epochs_spinbox.setEnabled(not running)
+        if running:
+            if self.preview_animation_timer.isActive():
+                self.preview_animation_timer.stop()
+        elif not self.preview_animation_timer.isActive():
+            self.preview_animation_timer.start()
 
     def _load_training_records(self, run_dir: Path) -> list[dict]:
         metadata_path = run_dir / "metadata.jsonl"
@@ -1073,9 +1091,10 @@ class MainWindow(QWidget):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = StereoDepthFusionNet().to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
+        #criterion = nn.MSELoss()
+        criterion = nn.L1Loss()
 
-        epochs = 8
+        epochs = int(self.epochs_spinbox.value())
         num_train_batches = max(1, len(train_loader))
         total_steps = epochs * num_train_batches
         start_time = time.perf_counter()
@@ -1163,11 +1182,21 @@ class MainWindow(QWidget):
             self.status_label.setText("Stop data collection before training the model.")
             return
 
-        selected_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Select training data directory",
-            str(self.output_root),
-        )
+        preview_was_running = self.preview_animation_timer.isActive()
+        if preview_was_running:
+            self.preview_animation_timer.stop()
+            QApplication.processEvents()
+
+        try:
+            selected_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select training data directory",
+                str(self.output_root),
+            )
+        finally:
+            if preview_was_running and not self.preview_animation_timer.isActive():
+                self.preview_animation_timer.start()
+
         if not selected_dir:
             return
 
@@ -1187,20 +1216,40 @@ class MainWindow(QWidget):
             self.status_label.setText("Stop data collection before testing a model.")
             return
 
-        model_file, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "Select trained model checkpoint",
-            str(self.output_root),
-            "PyTorch model (*.pth);;All files (*)",
-        )
+        preview_was_running = self.preview_animation_timer.isActive()
+        if preview_was_running:
+            self.preview_animation_timer.stop()
+            QApplication.processEvents()
+
+        try:
+            model_file, _selected_filter = QFileDialog.getOpenFileName(
+                self,
+                "Select trained model checkpoint",
+                str(self.output_root),
+                "PyTorch model (*.pth);;All files (*)",
+            )
+        finally:
+            if preview_was_running and not self.preview_animation_timer.isActive():
+                self.preview_animation_timer.start()
+
         if not model_file:
             return
 
-        selected_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Select test data directory",
-            str(self.output_root),
-        )
+        preview_was_running = self.preview_animation_timer.isActive()
+        if preview_was_running:
+            self.preview_animation_timer.stop()
+            QApplication.processEvents()
+
+        try:
+            selected_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Select test data directory",
+                str(self.output_root),
+            )
+        finally:
+            if preview_was_running and not self.preview_animation_timer.isActive():
+                self.preview_animation_timer.start()
+
         if not selected_dir:
             return
 
