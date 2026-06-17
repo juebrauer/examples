@@ -6,33 +6,61 @@ Phase 2 (next): line following can reuse the same wheel motor setup.
 
 from controller import Keyboard, Robot
 
-print("PR2 Line Follower Controller - Version 2")
+print("PR2 Line Follower Controller - Version 5")
 
 
 MAX_WHEEL_SPEED = 3.0
 FORWARD_SPEED = 1.5
 TURN_SPEED = 0.8
 
+PR2_CASTER_NAMES = ["fl", "fr", "bl", "br"]
+PR2_FORWARD_CASTER_ANGLES = {name: 0.0 for name in PR2_CASTER_NAMES}
+PR2_TURN_CASTER_ANGLES = {
+    "fl": 2.3561944902,   # 135 degrees
+    "fr": 0.7853981634,   # 45 degrees
+    "bl": -2.3561944902,  # -135 degrees
+    "br": -0.7853981634,  # -45 degrees
+}
+
+
+def detect_pr2_caster_modules(robot):
+    modules = []
+    try:
+        for name in PR2_CASTER_NAMES:
+            modules.append(
+                {
+                    "name": name,
+                    "rotation_motor": robot.getDevice(f"{name}_caster_rotation_joint"),
+                    "wheel_motors": [
+                        robot.getDevice(f"{name}_caster_l_wheel_joint"),
+                        robot.getDevice(f"{name}_caster_r_wheel_joint"),
+                    ],
+                }
+            )
+        return modules
+    except BaseException:
+        return []
+
 
 def detect_drive_motors(robot):
-    """Detect left/right drive motors from device names.
+    """Detect robot-left/robot-right drive motors from device names.
 
-    Works for PR2 naming (e.g. fl_caster_l_wheel_joint) and also for
-    simple differential robots (left wheel motor / right wheel motor).
+    In PR2 caster names, l/r describes the wheel inside one caster module.
+    For turning, the controller needs robot-side groups instead.
     """
     left = []
     right = []
 
     pr2_left_names = [
         "fl_caster_l_wheel_joint",
-        "fr_caster_l_wheel_joint",
+        "fl_caster_r_wheel_joint",
         "bl_caster_l_wheel_joint",
-        "br_caster_l_wheel_joint",
+        "bl_caster_r_wheel_joint",
     ]
     pr2_right_names = [
-        "fl_caster_r_wheel_joint",
+        "fr_caster_l_wheel_joint",
         "fr_caster_r_wheel_joint",
-        "bl_caster_r_wheel_joint",
+        "br_caster_l_wheel_joint",
         "br_caster_r_wheel_joint",
     ]
 
@@ -75,12 +103,26 @@ def clamp(value, lo, hi):
 def set_side_speed(motors, speed):
     speed = clamp(speed, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
     for m in motors:
+        # print(f"Motor {m.getName()}: {speed}")
         m.setVelocity(speed)
+
+
+def set_pr2_caster_angles(caster_modules, angles):
+    for module in caster_modules:
+        module["rotation_motor"].setPosition(angles[module["name"]])
+
+
+def set_pr2_wheel_speed(caster_modules, speed):
+    speed = clamp(speed, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
+    for module in caster_modules:
+        for motor in module["wheel_motors"]:
+            motor.setVelocity(speed)
 
 
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 
+pr2_caster_modules = detect_pr2_caster_modules(robot)
 left_motors, right_motors = detect_drive_motors(robot)
 
 if not left_motors or not right_motors:
@@ -91,19 +133,30 @@ if not left_motors or not right_motors:
         print(f"  - {d.getName()}")
     raise RuntimeError("Cannot control base without wheel motors.")
 
-for motor in left_motors + right_motors:
-    motor.setPosition(float("inf"))
-    motor.setVelocity(0.0)
+if pr2_caster_modules:
+    set_pr2_caster_angles(pr2_caster_modules, PR2_FORWARD_CASTER_ANGLES)
+    for module in pr2_caster_modules:
+        for motor in module["wheel_motors"]:
+            motor.setPosition(float("inf"))
+    set_pr2_wheel_speed(pr2_caster_modules, 0.0)
+else:
+    for motor in left_motors + right_motors:
+        motor.setPosition(float("inf"))
+        motor.setVelocity(0.0)
 
 keyboard = Keyboard()
 keyboard.enable(timestep)
 
 print("[INFO] PR2 manual drive ready.")
 print("[INFO] Controls: W/S/A/D or Arrow Keys, Space=Stop, Q=Quit")
-print("[INFO] Left motors:")
+if pr2_caster_modules:
+    print("[INFO] PR2 caster steering motors:")
+    for module in pr2_caster_modules:
+        print(f"  - {module['rotation_motor'].getName()}")
+print("[INFO] Robot-left motors:")
 for m in left_motors:
     print(f"  - {m.getName()}")
-print("[INFO] Right motors:")
+print("[INFO] Robot-right motors:")
 for m in right_motors:
     print(f"  - {m.getName()}")
 
@@ -139,6 +192,14 @@ while running and robot.step(timestep) != -1:
         target_turn = 0.0
         left_speed = 0.0
         right_speed = 0.0
+    elif pr2_caster_modules and target_turn != 0.0 and target_forward == 0.0:
+        set_pr2_caster_angles(pr2_caster_modules, PR2_TURN_CASTER_ANGLES)
+        set_pr2_wheel_speed(pr2_caster_modules, target_turn)
+        continue
+    elif pr2_caster_modules:
+        set_pr2_caster_angles(pr2_caster_modules, PR2_FORWARD_CASTER_ANGLES)
+        set_pr2_wheel_speed(pr2_caster_modules, target_forward)
+        continue
     else:
         # Differential-style command mixing.
         left_speed = target_forward - target_turn
@@ -148,5 +209,8 @@ while running and robot.step(timestep) != -1:
     set_side_speed(right_motors, right_speed)
 
 # Ensure robot is stopped when leaving the controller loop.
-set_side_speed(left_motors, 0.0)
-set_side_speed(right_motors, 0.0)
+if pr2_caster_modules:
+    set_pr2_wheel_speed(pr2_caster_modules, 0.0)
+else:
+    set_side_speed(left_motors, 0.0)
+    set_side_speed(right_motors, 0.0)
