@@ -80,11 +80,16 @@ from PySide6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectF
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -121,6 +126,198 @@ class StereoPreview(QLabel):
     def reset(self) -> None:
         self.clear()
         self.setText(f"{self._title}: no image")
+
+
+class TestResultDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None, initial_diff_max_m: float = 5.0) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Depth Model Test Results")
+        self.resize(1760, 860)
+
+        self.left_image_preview = StereoPreview("Left camera")
+        self.right_image_preview = StereoPreview("Right camera")
+        self.gt_depth_preview = StereoPreview("Ground-truth depth")
+        self.pred_depth_preview = StereoPreview("Predicted depth")
+        self.diff_depth_preview = StereoPreview("Absolute difference")
+        for preview in (
+            self.left_image_preview,
+            self.right_image_preview,
+            self.gt_depth_preview,
+            self.pred_depth_preview,
+            self.diff_depth_preview,
+        ):
+            preview.setMinimumSize(480, 290)
+            preview.setFixedSize(520, 320)
+
+        self.metrics_text = QPlainTextEdit()
+        self.metrics_text.setReadOnly(True)
+        self.metrics_text.setMinimumHeight(130)
+
+        self.depth_colorbar_image = QLabel()
+        self.depth_colorbar_image.setFixedHeight(28)
+        self.depth_colorbar_image.setMinimumWidth(320)
+        self.depth_colorbar_scale = QLabel("Blau: 0.00 m   |   Weiss: 25.00 m   |   Rot: 50.00 m")
+        self.depth_colorbar_scale.setWordWrap(True)
+
+        self.diff_colorbar_image = QLabel()
+        self.diff_colorbar_image.setFixedHeight(28)
+        self.diff_colorbar_image.setMinimumWidth(320)
+        self.diff_colorbar_scale = QLabel("Blau: 0.0000 m   |   Weiss: 0.5000 m   |   Rot: 1.0000 m")
+        self.diff_colorbar_scale.setWordWrap(True)
+
+        self.diff_max_slider = QSlider(Qt.Horizontal)
+        self.diff_max_slider.setRange(1, 10000)  # 0.01 m .. 100.00 m
+        self.diff_max_slider.setSingleStep(10)
+        self.diff_max_slider.setPageStep(100)
+        self.diff_max_spinbox = QDoubleSpinBox()
+        self.diff_max_spinbox.setRange(0.01, 100.0)
+        self.diff_max_spinbox.setDecimals(2)
+        self.diff_max_spinbox.setSingleStep(0.1)
+        self.diff_max_value_label = QLabel()
+
+        self._syncing_diff_controls = False
+        self.set_diff_max_value(initial_diff_max_m)
+        self.diff_max_slider.valueChanged.connect(self._on_diff_slider_changed)
+        self.diff_max_spinbox.valueChanged.connect(self._on_diff_spinbox_changed)
+
+        default_bar = self._create_colorbar_pixmap(width=420, height=24)
+        self.depth_colorbar_image.setPixmap(default_bar)
+        self.diff_colorbar_image.setPixmap(default_bar)
+
+        compact_panel = QWidget()
+        compact_panel.setMaximumWidth(420)
+        compact_layout = QVBoxLayout(compact_panel)
+        compact_layout.setContentsMargins(4, 4, 4, 4)
+        compact_layout.setSpacing(6)
+        compact_layout.addWidget(QLabel("Depth colorbar (GT / Pred)"))
+        compact_layout.addWidget(self.depth_colorbar_image)
+        compact_layout.addWidget(self.depth_colorbar_scale)
+        compact_layout.addWidget(QLabel("Difference colorbar (Abs diff)"))
+        compact_layout.addWidget(self.diff_colorbar_image)
+        compact_layout.addWidget(self.diff_colorbar_scale)
+        compact_layout.addWidget(QLabel("Diff max [m] (fixed scale)"))
+        compact_slider_row = QHBoxLayout()
+        compact_slider_row.addWidget(self.diff_max_slider, stretch=1)
+        compact_slider_row.addWidget(self.diff_max_spinbox, stretch=0)
+        compact_layout.addLayout(compact_slider_row)
+        compact_layout.addWidget(self.diff_max_value_label)
+        compact_layout.addStretch(1)
+
+        images_grid = QGridLayout()
+        images_grid.setHorizontalSpacing(12)
+        images_grid.setVerticalSpacing(12)
+        images_grid.addWidget(self.left_image_preview, 0, 0)
+        images_grid.addWidget(self.right_image_preview, 0, 1)
+        images_grid.addWidget(compact_panel, 0, 2)
+        images_grid.addWidget(self.gt_depth_preview, 1, 0)
+        images_grid.addWidget(self.pred_depth_preview, 1, 1)
+        images_grid.addWidget(self.diff_depth_preview, 1, 2)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.addLayout(images_grid)
+        root_layout.addWidget(QLabel("Test metrics"))
+        root_layout.addWidget(self.metrics_text)
+
+    def _on_diff_slider_changed(self, slider_value: int) -> None:
+        if self._syncing_diff_controls:
+            return
+        self._syncing_diff_controls = True
+        diff_m = slider_value / 100.0
+        self.diff_max_spinbox.setValue(diff_m)
+        self.diff_max_value_label.setText(f"Aktuelle Diff-Max-Skala: {diff_m:.2f} m")
+        self._syncing_diff_controls = False
+
+    def _on_diff_spinbox_changed(self, diff_m: float) -> None:
+        if self._syncing_diff_controls:
+            return
+        self._syncing_diff_controls = True
+        self.diff_max_slider.setValue(int(round(diff_m * 100.0)))
+        self.diff_max_value_label.setText(f"Aktuelle Diff-Max-Skala: {diff_m:.2f} m")
+        self._syncing_diff_controls = False
+
+    def set_diff_max_value(self, diff_m: float) -> None:
+        clamped = min(100.0, max(0.01, float(diff_m)))
+        self._syncing_diff_controls = True
+        self.diff_max_spinbox.setValue(clamped)
+        self.diff_max_slider.setValue(int(round(clamped * 100.0)))
+        self.diff_max_value_label.setText(f"Aktuelle Diff-Max-Skala: {clamped:.2f} m")
+        self._syncing_diff_controls = False
+
+    def get_diff_max_value(self) -> float:
+        return float(self.diff_max_spinbox.value())
+
+    @staticmethod
+    def _create_colorbar_pixmap(width: int, height: int) -> QPixmap:
+        w = max(2, int(width))
+        h = max(2, int(height))
+        x = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        t = np.tile(x[None, :], (h, 1))
+
+        blue = np.array([59.0, 76.0, 192.0], dtype=np.float32)
+        mid = np.array([221.0, 221.0, 221.0], dtype=np.float32)
+        red = np.array([180.0, 4.0, 38.0], dtype=np.float32)
+
+        rgb = np.empty((h, w, 3), dtype=np.float32)
+        low_mask = t <= 0.5
+        high_mask = ~low_mask
+
+        t_low = (t[low_mask] * 2.0)[:, None]
+        t_high = ((t[high_mask] - 0.5) * 2.0)[:, None]
+
+        rgb[low_mask] = blue[None, :] * (1.0 - t_low) + mid[None, :] * t_low
+        rgb[high_mask] = mid[None, :] * (1.0 - t_high) + red[None, :] * t_high
+
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        rgba[:, :, 3] = 255
+        qimg = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        return QPixmap.fromImage(qimg)
+
+    def update_images(
+        self,
+        left_image: QImage,
+        right_image: QImage,
+        gt_depth_image: QImage,
+        pred_depth_image: QImage,
+        diff_image: QImage,
+    ) -> None:
+        self.left_image_preview.set_image(left_image)
+        self.right_image_preview.set_image(right_image)
+        self.gt_depth_preview.set_image(gt_depth_image)
+        self.pred_depth_preview.set_image(pred_depth_image)
+        self.diff_depth_preview.set_image(diff_image)
+
+    def update_metrics(
+        self,
+        current_mae: float,
+        running_mae: float,
+        sample_index: int,
+        sample_count: int,
+        depth_min_m: float,
+        depth_max_m: float,
+        diff_vis_max_m: float,
+        final_mae: float | None = None,
+    ) -> None:
+        lines = [
+            f"Sample: {sample_index}/{sample_count}",
+            f"Aktueller MAE (GT vs. Praediziert): {current_mae:.4f} m",
+            f"Laufender MAE ueber Testordner: {running_mae:.4f} m",
+            f"Depth-Skala (GT/Pred): {depth_min_m:.2f} m bis {depth_max_m:.2f} m",
+            f"Diff-Skala (Abs diff): 0.0000 m bis {diff_vis_max_m:.4f} m (clipped)",
+        ]
+        if final_mae is None:
+            lines.append("Gesamt MAE (final): wird nach Abschluss berechnet")
+        else:
+            lines.append(f"Gesamt MAE (final): {final_mae:.4f} m")
+        self.metrics_text.setPlainText("\n".join(lines))
+
+        mid_depth = 0.5 * (depth_min_m + depth_max_m)
+        self.depth_colorbar_scale.setText(
+            f"Blau: {depth_min_m:.2f} m   |   Weiss: {mid_depth:.2f} m   |   Rot: {depth_max_m:.2f} m"
+        )
+        self.diff_colorbar_scale.setText(
+            f"Blau: 0.0000 m   |   Weiss: {0.5 * diff_vis_max_m:.4f} m   |   Rot: {diff_vis_max_m:.4f} m"
+        )
 
 
 def qimage_to_rgb_array(image: QImage) -> np.ndarray:
@@ -463,9 +660,6 @@ class MainWindow(QWidget):
         self.left_preview = StereoPreview("Left")
         self.right_preview = StereoPreview("Right")
         self.depth_preview = StereoPreview("Depth")
-        self.gt_depth_preview = StereoPreview("GT depth")
-        self.pred_depth_preview = StereoPreview("Pred depth")
-        self.diff_depth_preview = StereoPreview("Abs diff")
         self.collect_button = QPushButton("Collect train data")
         self.train_model_button = QPushButton("Train sensor data fusion model")
         self.test_model_button = QPushButton("Test trained depth model")
@@ -473,6 +667,7 @@ class MainWindow(QWidget):
         self.frame_count_spinbox = QSpinBox()
         self.frame_count_spinbox.setRange(1, 200000)
         self.frame_count_spinbox.setValue(1000)
+        self.diff_visualization_max_m = 5.0
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
 
@@ -508,10 +703,6 @@ class MainWindow(QWidget):
         controls_layout.addWidget(self.left_preview)
         controls_layout.addWidget(self.right_preview)
         controls_layout.addWidget(self.depth_preview)
-        controls_layout.addWidget(QLabel("Model test previews"))
-        controls_layout.addWidget(self.gt_depth_preview)
-        controls_layout.addWidget(self.pred_depth_preview)
-        controls_layout.addWidget(self.diff_depth_preview)
         controls_layout.addWidget(self.frame_count_label)
         controls_layout.addWidget(self.frame_count_spinbox)
         controls_layout.addWidget(self.collect_button)
@@ -559,6 +750,7 @@ class MainWindow(QWidget):
         self.look_distance = 8.0
         self.depth_min_m = 0.0
         self.depth_max_m = 50.0
+        self.test_result_dialog: TestResultDialog | None = None
 
     @staticmethod
     def _format_seconds(seconds: float) -> str:
@@ -750,6 +942,14 @@ class MainWindow(QWidget):
 
         maes: list[float] = []
         total = len(records)
+        if self.test_result_dialog is None:
+            self.test_result_dialog = TestResultDialog(self, initial_diff_max_m=self.diff_visualization_max_m)
+        else:
+            self.test_result_dialog.set_diff_max_value(self.diff_visualization_max_m)
+        self.test_result_dialog.show()
+        self.test_result_dialog.raise_()
+        self.test_result_dialog.activateWindow()
+
         self.status_label.setText(
             f"Testing model on {total} samples.\n"
             f"Model: {model_path.name}\n"
@@ -758,6 +958,9 @@ class MainWindow(QWidget):
         QApplication.processEvents()
 
         with torch.no_grad():
+            last_depth_min_m = self.depth_min_m
+            last_depth_max_m = self.depth_max_m
+            last_diff_vis_max = 1.0
             for idx, record in enumerate(records, start=1):
                 x = self._prepare_stereo_input_tensor(run_dir, record, target_size).to(device)
                 pred_norm = model(x).detach().cpu()[0, 0].numpy().astype(np.float32)
@@ -783,21 +986,48 @@ class MainWindow(QWidget):
                 gt_u16 = self._to_uint16_depth(gt_depth_m, depth_min_m, depth_max_m)
                 pred_u16 = self._to_uint16_depth(pred_depth_m, depth_min_m, depth_max_m)
 
-                # Keep diff visualization robust across easy and hard samples.
-                diff_vis_max = max(1e-3, float(np.percentile(abs_diff_m, 95.0)))
+                # Fixed scale keeps all diff images directly comparable.
+                diff_vis_max = max(1e-3, float(self.test_result_dialog.get_diff_max_value()))
+                self.diff_visualization_max_m = diff_vis_max
                 diff_u16 = self._to_uint16_depth(abs_diff_m, 0.0, diff_vis_max)
+                last_depth_min_m = depth_min_m
+                last_depth_max_m = depth_max_m
+                last_diff_vis_max = diff_vis_max
 
                 gt_img = self.world_view.depth_array_to_colormap_image(gt_u16[:, :, None], 0.0, 65535.0)
                 pred_img = self.world_view.depth_array_to_colormap_image(pred_u16[:, :, None], 0.0, 65535.0)
                 diff_img = self.world_view.depth_array_to_colormap_image(diff_u16[:, :, None], 0.0, 65535.0)
 
-                self.gt_depth_preview.set_image(gt_img)
-                self.pred_depth_preview.set_image(pred_img)
-                self.diff_depth_preview.set_image(diff_img)
+                left_qimg = QImage(str(run_dir / record["left_image"]))
+                right_qimg = QImage(str(run_dir / record["right_image"]))
+                if left_qimg.isNull() or right_qimg.isNull():
+                    raise RuntimeError("Could not load test stereo images for preview dialog.")
+
+                self.left_preview.set_image(left_qimg)
+                self.right_preview.set_image(right_qimg)
+
+                running_mae = float(np.mean(maes))
+                self.test_result_dialog.update_images(
+                    left_image=left_qimg,
+                    right_image=right_qimg,
+                    gt_depth_image=gt_img,
+                    pred_depth_image=pred_img,
+                    diff_image=diff_img,
+                )
+                self.test_result_dialog.update_metrics(
+                    current_mae=mae,
+                    running_mae=running_mae,
+                    sample_index=idx,
+                    sample_count=total,
+                    depth_min_m=depth_min_m,
+                    depth_max_m=depth_max_m,
+                    diff_vis_max_m=diff_vis_max,
+                    final_mae=None,
+                )
 
                 self.training_epoch_label.setText(f"Test samples: {idx}/{total}")
                 self.training_batch_label.setText(f"Image MAE: {mae:.4f} m")
-                self.training_eta_label.setText(f"Running avg MAE: {float(np.mean(maes)):.4f} m")
+                self.training_eta_label.setText(f"Running avg MAE: {running_mae:.4f} m")
                 self.status_label.setText(
                     f"Testing model: {model_path.name}\n"
                     f"Sample {idx}/{total} - frame {record.get('frame_index', idx - 1)}\n"
@@ -806,6 +1036,17 @@ class MainWindow(QWidget):
                 QApplication.processEvents()
 
         mean_mae = float(np.mean(maes)) if maes else 0.0
+        if self.test_result_dialog is not None and total > 0:
+            self.test_result_dialog.update_metrics(
+                current_mae=maes[-1],
+                running_mae=mean_mae,
+                sample_index=total,
+                sample_count=total,
+                depth_min_m=last_depth_min_m,
+                depth_max_m=last_depth_max_m,
+                diff_vis_max_m=last_diff_vis_max,
+                final_mae=mean_mae,
+            )
         return mean_mae, total
 
     def _train_model(self, run_dir: Path) -> Path:
