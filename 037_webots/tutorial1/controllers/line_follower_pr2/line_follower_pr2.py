@@ -6,12 +6,33 @@ Phase 2 (next): line following can reuse the same wheel motor setup.
 
 from controller import Keyboard, Robot
 
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
+camera_display_enabled = cv2 is not None and np is not None
+
 print("PR2 Line Follower Controller - Version 5")
 
 
 MAX_WHEEL_SPEED = 3.0
 FORWARD_SPEED = 1.5
 TURN_SPEED = 0.8
+HEAD_TILT_STEP = 0.1
+HEAD_TILT_DEFAULT = 0.0
+HEAD_TILT_FALLBACK_MIN = -0.5
+HEAD_TILT_FALLBACK_MAX = 1.2
+
+PR2_CAMERA_NAMES = [
+    "high_def_sensor",
+    "l_forearm_cam_sensor",
+    "r_forearm_cam_sensor",
+    "wide_stereo_l_stereo_camera_sensor",
+    "wide_stereo_r_stereo_camera_sensor",
+]
 
 PR2_CASTER_NAMES = ["fl", "fr", "bl", "br"]
 PR2_FORWARD_CASTER_ANGLES = {name: 0.0 for name in PR2_CASTER_NAMES}
@@ -96,6 +117,61 @@ def detect_drive_motors(robot):
     return left, right
 
 
+def detect_pr2_cameras(robot, timestep):
+    cameras = []
+    for name in PR2_CAMERA_NAMES:
+        try:
+            camera = robot.getDevice(name)
+            camera.enable(timestep)
+            cameras.append(camera)
+        except BaseException:
+            pass
+    return cameras
+
+
+def detect_head_tilt_motor(robot):
+    try:
+        return robot.getDevice("head_tilt_joint")
+    except BaseException:
+        return None
+
+
+def get_motor_position_limits(motor, fallback_min, fallback_max):
+    try:
+        min_position = motor.getMinPosition()
+        max_position = motor.getMaxPosition()
+        if min_position < max_position:
+            return min_position, max_position
+    except BaseException:
+        pass
+
+    return fallback_min, fallback_max
+
+
+def show_camera_images(cameras):
+    global camera_display_enabled
+
+    if not camera_display_enabled:
+        return
+
+    try:
+        for camera in cameras:
+            image = camera.getImage()
+            if image is None:
+                continue
+
+            width = camera.getWidth()
+            height = camera.getHeight()
+            frame = np.frombuffer(image, dtype=np.uint8).reshape((height, width, 4))
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            cv2.imshow(camera.getName(), frame_bgr)
+
+        cv2.waitKey(1)
+    except BaseException as exc:
+        camera_display_enabled = False
+        print(f"[WARNING] OpenCV camera display disabled: {exc}")
+
+
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 
@@ -121,9 +197,23 @@ def set_pr2_wheel_speed(caster_modules, speed):
 
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
+print("timestep: ", timestep)
 
 pr2_caster_modules = detect_pr2_caster_modules(robot)
 left_motors, right_motors = detect_drive_motors(robot)
+pr2_cameras = detect_pr2_cameras(robot, timestep)
+head_tilt_motor = detect_head_tilt_motor(robot)
+head_tilt_min, head_tilt_max = HEAD_TILT_FALLBACK_MIN, HEAD_TILT_FALLBACK_MAX
+target_head_tilt = HEAD_TILT_DEFAULT
+
+if head_tilt_motor is not None:
+    head_tilt_min, head_tilt_max = get_motor_position_limits(
+        head_tilt_motor,
+        HEAD_TILT_FALLBACK_MIN,
+        HEAD_TILT_FALLBACK_MAX,
+    )
+    target_head_tilt = clamp(HEAD_TILT_DEFAULT, head_tilt_min, head_tilt_max)
+    head_tilt_motor.setPosition(target_head_tilt)
 
 if not left_motors or not right_motors:
     print("[ERROR] No left/right wheel motor groups found.")
@@ -148,22 +238,39 @@ keyboard = Keyboard()
 keyboard.enable(timestep)
 
 print("[INFO] PR2 manual drive ready.")
-print("[INFO] Controls: W/S/A/D or Arrow Keys, Space=Stop, Q=Quit")
+print("[INFO] Controls: W/S/A/D or Arrow Keys, P=Head up, L=Head down, Space=Stop, Q=Quit")
 if pr2_caster_modules:
     print("[INFO] PR2 caster steering motors:")
     for module in pr2_caster_modules:
         print(f"  - {module['rotation_motor'].getName()}")
+if head_tilt_motor is not None:
+    print(
+        f"[INFO] Head tilt motor: {head_tilt_motor.getName()} "
+        f"({head_tilt_min:.2f} to {head_tilt_max:.2f} rad)"
+    )
+else:
+    print("[INFO] Head tilt motor 'head_tilt_joint' not found.")
 print("[INFO] Robot-left motors:")
 for m in left_motors:
     print(f"  - {m.getName()}")
 print("[INFO] Robot-right motors:")
 for m in right_motors:
     print(f"  - {m.getName()}")
+if pr2_cameras:
+    print("[INFO] PR2 cameras enabled:")
+    for camera in pr2_cameras:
+        print(f"  - {camera.getName()} ({camera.getWidth()}x{camera.getHeight()})")
+    if cv2 is None or np is None:
+        print("[INFO] Install opencv-python and numpy to show camera images in OpenCV windows.")
+else:
+    print("[INFO] No PR2 cameras found with the configured names.")
 
 running = True
 target_forward = 0.0
 target_turn = 0.0
 while running and robot.step(timestep) != -1:
+    show_camera_images(pr2_cameras)
+
     stop_requested = False
 
     key = keyboard.getKey()
@@ -180,6 +287,20 @@ while running and robot.step(timestep) != -1:
         elif key in (Keyboard.RIGHT, ord("D"), ord("d")):
             target_forward = 0.0
             target_turn = -TURN_SPEED
+        elif key in (ord("P"), ord("p")) and head_tilt_motor is not None:
+            target_head_tilt = clamp(
+                target_head_tilt + HEAD_TILT_STEP,
+                head_tilt_min,
+                head_tilt_max,
+            )
+            head_tilt_motor.setPosition(target_head_tilt)
+        elif key in (ord("L"), ord("l")) and head_tilt_motor is not None:
+            target_head_tilt = clamp(
+                target_head_tilt - HEAD_TILT_STEP,
+                head_tilt_min,
+                head_tilt_max,
+            )
+            head_tilt_motor.setPosition(target_head_tilt)
         elif key == ord(" "):
             stop_requested = True
         elif key in (ord("Q"), ord("q"), 27):  # Q/q or ESC
@@ -208,9 +329,15 @@ while running and robot.step(timestep) != -1:
     set_side_speed(left_motors, left_speed)
     set_side_speed(right_motors, right_speed)
 
+
+print("Controller stopped!")
+
 # Ensure robot is stopped when leaving the controller loop.
 if pr2_caster_modules:
     set_pr2_wheel_speed(pr2_caster_modules, 0.0)
 else:
     set_side_speed(left_motors, 0.0)
     set_side_speed(right_motors, 0.0)
+
+if cv2 is not None:
+    cv2.destroyAllWindows()
