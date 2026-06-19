@@ -15,23 +15,40 @@ except ImportError:
 
 camera_display_enabled = cv2 is not None and np is not None
 
-print("PR2 Line Follower Controller - Version 5")
+print("PR2 Line Follower Controller - Version 7")
 
 
 MAX_WHEEL_SPEED = 3.0
 FORWARD_SPEED = 1.5
 TURN_SPEED = 0.8
 HEAD_TILT_STEP = 0.1
-HEAD_TILT_DEFAULT = 0.0
+HEAD_TILT_DEFAULT = 1.1
 HEAD_TILT_FALLBACK_MIN = -0.5
 HEAD_TILT_FALLBACK_MAX = 1.2
 
+PR2_ARM_UP_POSE = {
+    "l_shoulder_pan_joint": 1.2,
+    "l_shoulder_lift_joint": 1.25,
+    "l_upper_arm_roll_joint": 1.57,
+    "l_elbow_flex_joint": 0.0,
+    "l_forearm_roll_joint": 0.0,
+    "l_wrist_flex_joint": 0.0,
+    "l_wrist_roll_joint": 0.0,
+    "r_shoulder_pan_joint": -1.2,
+    "r_shoulder_lift_joint": 1.25,
+    "r_upper_arm_roll_joint": -1.57,
+    "r_elbow_flex_joint": 0.0,
+    "r_forearm_roll_joint": 0.0,
+    "r_wrist_flex_joint": 0.0,
+    "r_wrist_roll_joint": 0.0,
+}
+
 PR2_CAMERA_NAMES = [
-    "high_def_sensor",
-    "l_forearm_cam_sensor",
-    "r_forearm_cam_sensor",
-    "wide_stereo_l_stereo_camera_sensor",
-    "wide_stereo_r_stereo_camera_sensor",
+    "high_def_sensor"
+    #"l_forearm_cam_sensor",
+    #"r_forearm_cam_sensor",
+    #"wide_stereo_l_stereo_camera_sensor",
+    #"wide_stereo_r_stereo_camera_sensor",
 ]
 
 PR2_CASTER_NAMES = ["fl", "fr", "bl", "br"]
@@ -136,6 +153,16 @@ def detect_head_tilt_motor(robot):
         return None
 
 
+def detect_pr2_arm_motors(robot):
+    motors = {}
+    for name in PR2_ARM_UP_POSE:
+        try:
+            motors[name] = robot.getDevice(name)
+        except BaseException:
+            pass
+    return motors
+
+
 def get_motor_position_limits(motor, fallback_min, fallback_max):
     try:
         min_position = motor.getMinPosition()
@@ -195,6 +222,24 @@ def set_pr2_wheel_speed(caster_modules, speed):
             motor.setVelocity(speed)
 
 
+def set_pr2_arm_pose(arm_motors, pose):
+    configured = []
+    for name, target_position in pose.items():
+        motor = arm_motors.get(name)
+        if motor is None:
+            continue
+
+        min_position, max_position = get_motor_position_limits(
+            motor,
+            target_position,
+            target_position,
+        )
+        motor.setPosition(clamp(target_position, min_position, max_position))
+        configured.append(name)
+
+    return configured
+
+
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 print("timestep: ", timestep)
@@ -203,6 +248,7 @@ pr2_caster_modules = detect_pr2_caster_modules(robot)
 left_motors, right_motors = detect_drive_motors(robot)
 pr2_cameras = detect_pr2_cameras(robot, timestep)
 head_tilt_motor = detect_head_tilt_motor(robot)
+pr2_arm_motors = detect_pr2_arm_motors(robot)
 head_tilt_min, head_tilt_max = HEAD_TILT_FALLBACK_MIN, HEAD_TILT_FALLBACK_MAX
 target_head_tilt = HEAD_TILT_DEFAULT
 
@@ -214,6 +260,8 @@ if head_tilt_motor is not None:
     )
     target_head_tilt = clamp(HEAD_TILT_DEFAULT, head_tilt_min, head_tilt_max)
     head_tilt_motor.setPosition(target_head_tilt)
+
+configured_arm_motors = set_pr2_arm_pose(pr2_arm_motors, PR2_ARM_UP_POSE)
 
 if not left_motors or not right_motors:
     print("[ERROR] No left/right wheel motor groups found.")
@@ -250,6 +298,12 @@ if head_tilt_motor is not None:
     )
 else:
     print("[INFO] Head tilt motor 'head_tilt_joint' not found.")
+if configured_arm_motors:
+    print("[INFO] PR2 arms moved upward to clear the head camera view:")
+    for name in configured_arm_motors:
+        print(f"  - {name}: {PR2_ARM_UP_POSE[name]:.2f} rad")
+else:
+    print("[INFO] No PR2 arm motors found for the upward camera-clearance pose.")
 print("[INFO] Robot-left motors:")
 for m in left_motors:
     print(f"  - {m.getName()}")
@@ -294,6 +348,7 @@ while running and robot.step(timestep) != -1:
                 head_tilt_max,
             )
             head_tilt_motor.setPosition(target_head_tilt)
+            print(f"{target_head_tilt=}")
         elif key in (ord("L"), ord("l")) and head_tilt_motor is not None:
             target_head_tilt = clamp(
                 target_head_tilt - HEAD_TILT_STEP,
@@ -301,6 +356,7 @@ while running and robot.step(timestep) != -1:
                 head_tilt_max,
             )
             head_tilt_motor.setPosition(target_head_tilt)
+            print(f"{target_head_tilt=}")
         elif key == ord(" "):
             stop_requested = True
         elif key in (ord("Q"), ord("q"), 27):  # Q/q or ESC
