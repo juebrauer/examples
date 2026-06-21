@@ -25,6 +25,24 @@ HEAD_TILT_STEP = 0.1
 HEAD_TILT_DEFAULT = 1.1
 HEAD_TILT_FALLBACK_MIN = -0.5
 HEAD_TILT_FALLBACK_MAX = 1.2
+CAMERA_DISPLAY_SCALE = 0.25
+LINE_FOLLOW_SPEED = 1.0
+LINE_FOLLOW_SIDE_SPEED = 0.8
+LINE_FOLLOW_ROTATE_SPEED = 0.7
+LINE_FOLLOW_ROI_TOP = 0.45
+LINE_FOLLOW_ROI_BOTTOM = 0.95
+LINE_FOLLOW_WHITE_THRESHOLD = 215
+LINE_FOLLOW_MIN_MASK_AREA = 30
+LINE_FOLLOW_CENTER_DEADBAND = 0.15
+LINE_FOLLOW_SLOPE_DEADBAND = 0.20
+LINE_FOLLOW_ROTATE_STEP_DEGREES = 2.0
+ACTION_FORWARD = "a1: forward"
+ACTION_MOVE_LEFT = "a2: move left"
+ACTION_MOVE_RIGHT = "a3: move right"
+ACTION_ROTATE_LEFT = f"a4: rotate left {LINE_FOLLOW_ROTATE_STEP_DEGREES:g} deg"
+ACTION_ROTATE_RIGHT = f"a5: rotate right {LINE_FOLLOW_ROTATE_STEP_DEGREES:g} deg"
+ACTION_LINE_LOST = "STOP: line lost"
+ACTION_MANUAL = "MANUAL"
 
 PR2_ARM_UP_POSE = {
     "l_shoulder_pan_joint": 1.2,
@@ -53,6 +71,7 @@ PR2_CAMERA_NAMES = [
 
 PR2_CASTER_NAMES = ["fl", "fr", "bl", "br"]
 PR2_FORWARD_CASTER_ANGLES = {name: 0.0 for name in PR2_CASTER_NAMES}
+PR2_SIDE_CASTER_ANGLES = {name: 1.5707963268 for name in PR2_CASTER_NAMES}
 PR2_TURN_CASTER_ANGLES = {
     "fl": 2.3561944902,   # 135 degrees
     "fr": 0.7853981634,   # 45 degrees
@@ -175,11 +194,15 @@ def get_motor_position_limits(motor, fallback_min, fallback_max):
     return fallback_min, fallback_max
 
 
-def show_camera_images(cameras):
+def show_camera_images(cameras, line_follow_enabled):
     global camera_display_enabled
 
     if not camera_display_enabled:
-        return
+        return None, False, "STOP: no camera display"
+
+    line_error = None
+    line_visible = False
+    selected_action = ACTION_LINE_LOST
 
     try:
         for camera in cameras:
@@ -191,12 +214,146 @@ def show_camera_images(cameras):
             height = camera.getHeight()
             frame = np.frombuffer(image, dtype=np.uint8).reshape((height, width, 4))
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            cv2.imshow(camera.getName(), frame_bgr)
+            frame_bgr_small = cv2.resize(
+                frame_bgr,
+                (
+                    max(1, int(width * CAMERA_DISPLAY_SCALE)),
+                    max(1, int(height * CAMERA_DISPLAY_SCALE)),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+            detection = detect_white_line(frame_bgr_small)
+            if line_follow_enabled:
+                action = select_line_follow_action(detection)
+            else:
+                action = ACTION_MANUAL
+            draw_line_detection(frame_bgr_small, detection, action)
+            if detection["visible"] and line_error is None:
+                line_error = detection["error"]
+                line_visible = True
+                selected_action = action
+
+            cv2.imshow(camera.getName(), frame_bgr_small)
 
         cv2.waitKey(1)
+        return line_error, line_visible, selected_action
     except BaseException as exc:
         camera_display_enabled = False
         print(f"[WARNING] OpenCV camera display disabled: {exc}")
+        return None, False, "STOP: display error"
+
+
+def detect_white_line(frame_bgr):
+    height, width = frame_bgr.shape[:2]
+    roi_top = int(height * LINE_FOLLOW_ROI_TOP)
+    roi_bottom = int(height * LINE_FOLLOW_ROI_BOTTOM)
+    roi = frame_bgr[roi_top:roi_bottom, :]
+
+    if roi.size == 0:
+        return {"visible": False, "error": 0.0, "roi": (0, 0, width, height), "mask": None}
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    mask = np.where(gray >= LINE_FOLLOW_WHITE_THRESHOLD, 255, 0).astype(np.uint8)
+
+    moments = cv2.moments(mask)
+    if moments["m00"] < LINE_FOLLOW_MIN_MASK_AREA:
+        return {
+            "visible": False,
+            "error": 0.0,
+            "roi": (0, roi_top, width, roi_bottom),
+            "mask": mask,
+        }
+
+    center_x = int(moments["m10"] / moments["m00"])
+    center_y = roi_top + int(moments["m01"] / moments["m00"])
+    error = (center_x - (width / 2.0)) / (width / 2.0)
+    ys, xs = np.nonzero(mask)
+    slope = 0.0
+    regression_line = None
+    if len(xs) >= 2 and np.ptp(ys) > 0:
+        slope, intercept = np.polyfit(ys, xs, 1)
+        x_top = int(intercept)
+        x_bottom = int(slope * (roi.shape[0] - 1) + intercept)
+        regression_line = (
+            (clamp(x_top, 0, width - 1), roi_top),
+            (clamp(x_bottom, 0, width - 1), roi_bottom - 1),
+        )
+
+    return {
+        "visible": True,
+        "error": clamp(error, -1.0, 1.0),
+        "center": (center_x, center_y),
+        "roi": (0, roi_top, width, roi_bottom),
+        "mask": mask,
+        "slope": slope,
+        "regression_line": regression_line,
+    }
+
+
+def select_line_follow_action(detection):
+    if not detection["visible"]:
+        return ACTION_LINE_LOST
+
+    slope = detection.get("slope", 0.0)
+    if slope < -LINE_FOLLOW_SLOPE_DEADBAND:
+        return ACTION_ROTATE_LEFT
+    if slope > LINE_FOLLOW_SLOPE_DEADBAND:
+        return ACTION_ROTATE_RIGHT
+
+    error = detection["error"]
+    if error > LINE_FOLLOW_CENTER_DEADBAND:
+        return ACTION_MOVE_RIGHT
+    if error < -LINE_FOLLOW_CENTER_DEADBAND:
+        return ACTION_MOVE_LEFT
+
+    return ACTION_FORWARD
+
+
+def draw_line_detection(frame_bgr, detection, action):
+    left, top, right, bottom = detection["roi"]
+    mask = detection.get("mask")
+    if mask is not None:
+        roi = frame_bgr[top:bottom, left:right]
+        green_overlay = np.zeros_like(roi)
+        green_overlay[:, :] = (0, 255, 0)
+        mask_bool = mask > 0
+        roi[mask_bool] = cv2.addWeighted(roi, 0.35, green_overlay, 0.65, 0)[mask_bool]
+
+    color = (0, 255, 0) if detection["visible"] else (0, 0, 255)
+    cv2.rectangle(frame_bgr, (left, top), (right - 1, bottom - 1), color, 1)
+    cv2.line(
+        frame_bgr,
+        (frame_bgr.shape[1] // 2, top),
+        (frame_bgr.shape[1] // 2, bottom - 1),
+        (255, 0, 0),
+        1,
+    )
+    if detection["visible"]:
+        cv2.circle(frame_bgr, detection["center"], 4, (0, 0, 255), -1)
+        regression_line = detection.get("regression_line")
+        if regression_line is not None:
+            cv2.line(frame_bgr, regression_line[0], regression_line[1], (0, 255, 255), 2)
+
+    cv2.putText(
+        frame_bgr,
+        action,
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame_bgr,
+        action,
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def clamp(value, lo, hi):
@@ -220,6 +377,44 @@ def set_pr2_wheel_speed(caster_modules, speed):
     for module in caster_modules:
         for motor in module["wheel_motors"]:
             motor.setVelocity(speed)
+
+
+def execute_line_follow_action(action, caster_modules, left_motors, right_motors):
+    left_speed = 0.0
+    right_speed = 0.0
+
+    if caster_modules:
+        if action == ACTION_FORWARD:
+            set_pr2_caster_angles(caster_modules, PR2_FORWARD_CASTER_ANGLES)
+            set_pr2_wheel_speed(caster_modules, LINE_FOLLOW_SPEED)
+        elif action == ACTION_MOVE_LEFT:
+            set_pr2_caster_angles(caster_modules, PR2_SIDE_CASTER_ANGLES)
+            set_pr2_wheel_speed(caster_modules, LINE_FOLLOW_SIDE_SPEED)
+        elif action == ACTION_MOVE_RIGHT:
+            set_pr2_caster_angles(caster_modules, PR2_SIDE_CASTER_ANGLES)
+            set_pr2_wheel_speed(caster_modules, -LINE_FOLLOW_SIDE_SPEED)
+        elif action == ACTION_ROTATE_LEFT:
+            set_pr2_caster_angles(caster_modules, PR2_TURN_CASTER_ANGLES)
+            set_pr2_wheel_speed(caster_modules, LINE_FOLLOW_ROTATE_SPEED)
+        elif action == ACTION_ROTATE_RIGHT:
+            set_pr2_caster_angles(caster_modules, PR2_TURN_CASTER_ANGLES)
+            set_pr2_wheel_speed(caster_modules, -LINE_FOLLOW_ROTATE_SPEED)
+        else:
+            set_pr2_wheel_speed(caster_modules, 0.0)
+        return
+
+    if action == ACTION_FORWARD:
+        left_speed = LINE_FOLLOW_SPEED
+        right_speed = LINE_FOLLOW_SPEED
+    elif action == ACTION_ROTATE_LEFT:
+        left_speed = -LINE_FOLLOW_ROTATE_SPEED
+        right_speed = LINE_FOLLOW_ROTATE_SPEED
+    elif action == ACTION_ROTATE_RIGHT:
+        left_speed = LINE_FOLLOW_ROTATE_SPEED
+        right_speed = -LINE_FOLLOW_ROTATE_SPEED
+
+    set_side_speed(left_motors, left_speed)
+    set_side_speed(right_motors, right_speed)
 
 
 def set_pr2_arm_pose(arm_motors, pose):
@@ -286,7 +481,10 @@ keyboard = Keyboard()
 keyboard.enable(timestep)
 
 print("[INFO] PR2 manual drive ready.")
-print("[INFO] Controls: W/S/A/D or Arrow Keys, P=Head up, L=Head down, Space=Stop, Q=Quit")
+print(
+    "[INFO] Controls: F=Toggle line following, W/S/A/D or Arrow Keys=Manual drive, "
+    "P=Head up, L=Head down, Space=Stop, Q=Quit"
+)
 if pr2_caster_modules:
     print("[INFO] PR2 caster steering motors:")
     for module in pr2_caster_modules:
@@ -320,27 +518,37 @@ else:
     print("[INFO] No PR2 cameras found with the configured names.")
 
 running = True
+line_follow_enabled = True
 target_forward = 0.0
 target_turn = 0.0
 while running and robot.step(timestep) != -1:
-    show_camera_images(pr2_cameras)
+    line_error, line_visible, line_action = show_camera_images(pr2_cameras, line_follow_enabled)
 
     stop_requested = False
 
     key = keyboard.getKey()
     while key != -1:
         if key in (Keyboard.UP, ord("W"), ord("w")):
+            line_follow_enabled = False
             target_forward = FORWARD_SPEED
             target_turn = 0.0
         elif key in (Keyboard.DOWN, ord("S"), ord("s")):
+            line_follow_enabled = False
             target_forward = -FORWARD_SPEED
             target_turn = 0.0
         elif key in (Keyboard.LEFT, ord("A"), ord("a")):
+            line_follow_enabled = False
             target_forward = 0.0
             target_turn = TURN_SPEED
         elif key in (Keyboard.RIGHT, ord("D"), ord("d")):
+            line_follow_enabled = False
             target_forward = 0.0
             target_turn = -TURN_SPEED
+        elif key in (ord("F"), ord("f")):
+            line_follow_enabled = not line_follow_enabled
+            target_forward = 0.0
+            target_turn = 0.0
+            print(f"[INFO] Line following enabled: {line_follow_enabled}")
         elif key in (ord("P"), ord("p")) and head_tilt_motor is not None:
             target_head_tilt = clamp(
                 target_head_tilt + HEAD_TILT_STEP,
@@ -358,6 +566,7 @@ while running and robot.step(timestep) != -1:
             head_tilt_motor.setPosition(target_head_tilt)
             print(f"{target_head_tilt=}")
         elif key == ord(" "):
+            line_follow_enabled = False
             stop_requested = True
         elif key in (ord("Q"), ord("q"), 27):  # Q/q or ESC
             running = False
@@ -369,6 +578,14 @@ while running and robot.step(timestep) != -1:
         target_turn = 0.0
         left_speed = 0.0
         right_speed = 0.0
+    elif line_follow_enabled:
+        execute_line_follow_action(
+            line_action if line_visible else ACTION_LINE_LOST,
+            pr2_caster_modules,
+            left_motors,
+            right_motors,
+        )
+        continue
     elif pr2_caster_modules and target_turn != 0.0 and target_forward == 0.0:
         set_pr2_caster_angles(pr2_caster_modules, PR2_TURN_CASTER_ANGLES)
         set_pr2_wheel_speed(pr2_caster_modules, target_turn)
