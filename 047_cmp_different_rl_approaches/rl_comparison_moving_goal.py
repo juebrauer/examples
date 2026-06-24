@@ -1,22 +1,20 @@
 """RL comparison demo with PySide6.
 
-The user can switch between seven agent variants:
+This demo compares exactly three Deep RL approaches:
 - DQN
-- DDQN
-- Dueling DQN
-- PER (implemented as DDQN with prioritized replay)
-- REINFORCE (Monte-Carlo policy gradient)
-- REINFORCE fast (higher learning rate)
-- REINFORCE with baseline
+- REINFORCE
+- PPO
+
+Each approach lives in its own file/class:
+- dqn_agent.py -> DQNAgent
+- reinforce_agent.py -> ReinforceAgent
+- ppo_agent.py -> PPOAgent
 
 Task:
 The agent (black circle) has to follow a moving target (red circle).
-State space: only the relative offset (dx, dy) to the current target.
+State space: [dx_t-1, dy_t-1, dx_t, dy_t].
 Action space: UP, LEFT, RIGHT, DOWN.
-Reward: negative normalized distance to the target.
-
-The UI shows the simulation on the left, and controls plus a rolling reward
-plot on the right.
+Reward: absolute normalized distance in [0, 1].
 """
 
 from __future__ import annotations
@@ -24,25 +22,17 @@ from __future__ import annotations
 import random
 import sys
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, List, Sequence
+from typing import Deque, List
 
 import numpy as np
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.distributions import Categorical
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "This demo requires PyTorch. Install it in your environment, e.g. 'pip install torch'."
-    ) from exc
-
+from dqn_agent import DQNAgent
+from ppo_agent import PPOAgent
+from reinforce_agent import ReinforceAgent
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen, QBrush
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -60,95 +50,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
 Action = int
 State = np.ndarray
-
-
-@dataclass(frozen=True)
-class AlgorithmSpec:
-    name: str
-    use_double: bool
-    use_dueling: bool
-    use_per: bool
-    use_reinforce: bool
-    use_baseline: bool
-    reinforce_alpha: float
-    normalize_advantage: bool
-
-
-ALGORITHMS: Sequence[AlgorithmSpec] = (
-    AlgorithmSpec(
-        "DQN",
-        use_double=False,
-        use_dueling=False,
-        use_per=False,
-        use_reinforce=False,
-        use_baseline=False,
-        reinforce_alpha=3e-4,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "DDQN",
-        use_double=True,
-        use_dueling=False,
-        use_per=False,
-        use_reinforce=False,
-        use_baseline=False,
-        reinforce_alpha=3e-4,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "Dueling DQN",
-        use_double=True,
-        use_dueling=True,
-        use_per=False,
-        use_reinforce=False,
-        use_baseline=False,
-        reinforce_alpha=3e-4,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "PER",
-        use_double=True,
-        use_dueling=False,
-        use_per=True,
-        use_reinforce=False,
-        use_baseline=False,
-        reinforce_alpha=3e-4,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "REINFORCE",
-        use_double=False,
-        use_dueling=False,
-        use_per=False,
-        use_reinforce=True,
-        use_baseline=False,
-        reinforce_alpha=3e-4,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "REINFORCE fast",
-        use_double=False,
-        use_dueling=False,
-        use_per=False,
-        use_reinforce=True,
-        use_baseline=False,
-        reinforce_alpha=1e-3,
-        normalize_advantage=False,
-    ),
-    AlgorithmSpec(
-        "REINFORCE with baseline",
-        use_double=False,
-        use_dueling=False,
-        use_per=False,
-        use_reinforce=True,
-        use_baseline=True,
-        reinforce_alpha=1e-3,
-        normalize_advantage=True,
-    ),
-)
 
 
 class MovingTargetEnv:
@@ -165,8 +68,8 @@ class MovingTargetEnv:
         self.agent_radius = 10
         self.target_radius = 12
         self.capture_radius = 2 * self.target_radius
-        self.agent_speed = 8.0
-        self.target_speed = 3.5
+        self.agent_speed = 5.0
+        self.target_speed = 2.0
         self.max_steps_per_episode = 100
         self.max_distance = float(np.hypot(self.width, self.height))
 
@@ -176,6 +79,10 @@ class MovingTargetEnv:
         self.target_y = 0.0
         self.target_vx = 0.0
         self.target_vy = 0.0
+        self.prev_dx = 0.0
+        self.prev_dy = 0.0
+        self.curr_dx = 0.0
+        self.curr_dy = 0.0
         self.steps = 0
         self.episode_reward = 0.0
 
@@ -193,14 +100,23 @@ class MovingTargetEnv:
         self.target_vx = vx
         self.target_vy = vy
 
+        dx, dy = self._offset_to_target()
+        self.prev_dx = dx
+        self.prev_dy = dy
+        self.curr_dx = dx
+        self.curr_dy = dy
+
         self.steps = 0
         self.episode_reward = 0.0
         return self.state()
 
     def state(self) -> State:
+        return np.array([self.prev_dx, self.prev_dy, self.curr_dx, self.curr_dy], dtype=np.float32)
+
+    def _offset_to_target(self) -> tuple[float, float]:
         dx = (self.target_x - self.agent_x) / float(self.width)
         dy = (self.target_y - self.agent_y) / float(self.height)
-        return np.array([dx, dy], dtype=np.float32)
+        return float(dx), float(dy)
 
     def distance_to_target(self) -> float:
         return float(np.hypot(self.target_x - self.agent_x, self.target_y - self.agent_y))
@@ -223,15 +139,22 @@ class MovingTargetEnv:
 
         self._move_target()
 
+        next_dx, next_dy = self._offset_to_target()
+        self.prev_dx = self.curr_dx
+        self.prev_dy = self.curr_dy
+        self.curr_dx = next_dx
+        self.curr_dy = next_dy
+
         distance = self.distance_to_target()
-        reward = -distance / self.max_distance
+        reward = 1.0 - (distance / self.max_distance)
+
         self.episode_reward += reward
         self.steps += 1
 
         done = self.steps >= self.max_steps_per_episode
         info = {
-            "distance": self.distance_to_target(),
-            "in_zone": reward > 0.0,
+            "distance": distance,
+            "in_zone": self.in_reward_zone(),
             "steps": self.steps,
         }
         return self.state(), reward, done, info
@@ -258,363 +181,6 @@ class MovingTargetEnv:
         elif self.target_y > bottom:
             self.target_y = bottom
             self.target_vy = -abs(self.target_vy)
-
-
-@dataclass
-class Transition:
-    state: State
-    action: int
-    reward: float
-    next_state: State
-    done: bool
-
-
-@dataclass
-class SampleBatch:
-    states: np.ndarray
-    actions: np.ndarray
-    rewards: np.ndarray
-    next_states: np.ndarray
-    dones: np.ndarray
-    weights: np.ndarray
-    indices: np.ndarray | None = None
-
-
-class UniformReplayBuffer:
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.buffer: Deque[Transition] = deque(maxlen=capacity)
-
-    def add(self, transition: Transition) -> None:
-        self.buffer.append(transition)
-
-    def sample(self, batch_size: int) -> SampleBatch:
-        batch = random.sample(self.buffer, batch_size)
-        return SampleBatch(
-            states=np.stack([item.state for item in batch]),
-            actions=np.array([item.action for item in batch], dtype=np.int64),
-            rewards=np.array([item.reward for item in batch], dtype=np.float32),
-            next_states=np.stack([item.next_state for item in batch]),
-            dones=np.array([item.done for item in batch], dtype=np.float32),
-            weights=np.ones((batch_size, 1), dtype=np.float32),
-            indices=None,
-        )
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity: int, alpha: float = 0.6, priority_epsilon: float = 1e-5) -> None:
-        self.capacity = capacity
-        self.alpha = alpha
-        self.priority_epsilon = priority_epsilon
-        self.buffer: List[Transition] = []
-        self.priorities = np.zeros(capacity, dtype=np.float32)
-        self.position = 0
-
-    def add(self, transition: Transition) -> None:
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-        else:
-            self.buffer[self.position] = transition
-
-        max_priority = float(self.priorities.max()) if self.buffer else 1.0
-        if max_priority <= 0.0:
-            max_priority = 1.0
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size: int, beta: float) -> SampleBatch:
-        size = len(self.buffer)
-        scaled = self.priorities[:size] ** self.alpha
-        probs = scaled / scaled.sum()
-        indices = np.random.choice(size, batch_size, replace=size < batch_size, p=probs)
-        samples = [self.buffer[int(idx)] for idx in indices]
-
-        weights = (size * probs[indices]) ** (-beta)
-        weights = weights / weights.max()
-        return SampleBatch(
-            states=np.stack([item.state for item in samples]),
-            actions=np.array([item.action for item in samples], dtype=np.int64),
-            rewards=np.array([item.reward for item in samples], dtype=np.float32),
-            next_states=np.stack([item.next_state for item in samples]),
-            dones=np.array([item.done for item in samples], dtype=np.float32),
-            weights=weights.astype(np.float32).reshape(-1, 1),
-            indices=indices.astype(np.int64),
-        )
-
-    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
-        for idx, priority in zip(indices, priorities, strict=False):
-            self.priorities[int(idx)] = float(abs(priority) + self.priority_epsilon)
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-
-class MLPQNetwork(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class DuelingQNetwork(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-        )
-        self.value_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-        self.advantage_head = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.features(x)
-        values = self.value_head(features)
-        advantages = self.advantage_head(features)
-        return values + advantages - advantages.mean(dim=1, keepdim=True)
-
-
-class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class QLearningAgent:
-    def __init__(self, spec: AlgorithmSpec) -> None:
-        self.spec = spec
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.num_actions = 4
-        self.gamma = 0.98
-        self.batch_size = 64
-        self.learning_starts = 800
-        self.target_update_interval = 500
-        self.replay_size = 30_000
-        self.epsilon_start = 1.0
-        self.epsilon_end = 0.05
-        self.epsilon_decay_steps = 25_000
-        self.per_alpha = 0.6
-        self.per_beta_start = 0.4
-        self.per_beta_end = 1.0
-        self.per_beta_decay_steps = 40_000
-
-        network_cls = DuelingQNetwork if self.spec.use_dueling else MLPQNetwork
-        self.policy_net = network_cls(2, self.num_actions).to(self.device)
-        self.target_net = network_cls(2, self.num_actions).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
-        self.loss_fn = nn.SmoothL1Loss(reduction="none")
-
-        if self.spec.use_per:
-            self.replay: UniformReplayBuffer | PrioritizedReplayBuffer = PrioritizedReplayBuffer(
-                self.replay_size,
-                alpha=self.per_alpha,
-            )
-        else:
-            self.replay = UniformReplayBuffer(self.replay_size)
-
-        self.env_steps = 0
-        self.training_steps = 0
-        self.epsilon = self.epsilon_start
-
-    def register_env_step(self) -> None:
-        self.env_steps += 1
-        progress = min(1.0, self.env_steps / float(self.epsilon_decay_steps))
-        self.epsilon = self.epsilon_start + progress * (self.epsilon_end - self.epsilon_start)
-
-    def beta(self) -> float:
-        if not self.spec.use_per:
-            return 1.0
-        progress = min(1.0, self.training_steps / float(self.per_beta_decay_steps))
-        return self.per_beta_start + progress * (self.per_beta_end - self.per_beta_start)
-
-    def act(self, state: State, greedy: bool = False) -> int:
-        if (not greedy) and random.random() < self.epsilon:
-            return random.randrange(self.num_actions)
-
-        with torch.no_grad():
-            x = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            q_values = self.policy_net(x)
-            return int(torch.argmax(q_values, dim=1).item())
-
-    def store(self, state: State, action: int, reward: float, next_state: State, done: bool) -> None:
-        self.replay.add(
-            Transition(
-                state=state.copy(),
-                action=action,
-                reward=reward,
-                next_state=next_state.copy(),
-                done=done,
-            )
-        )
-
-    def learn(self) -> float | None:
-        if len(self.replay) < max(self.batch_size, self.learning_starts):
-            return None
-
-        if self.spec.use_per:
-            batch = self.replay.sample(self.batch_size, beta=self.beta())
-        else:
-            batch = self.replay.sample(self.batch_size)
-
-        states = torch.as_tensor(batch.states, dtype=torch.float32, device=self.device)
-        actions = torch.as_tensor(batch.actions, dtype=torch.int64, device=self.device).unsqueeze(1)
-        rewards = torch.as_tensor(batch.rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.as_tensor(batch.next_states, dtype=torch.float32, device=self.device)
-        dones = torch.as_tensor(batch.dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-        weights = torch.as_tensor(batch.weights, dtype=torch.float32, device=self.device)
-
-        q_values = self.policy_net(states).gather(1, actions)
-
-        with torch.no_grad():
-            if self.spec.use_double:
-                next_actions = self.policy_net(next_states).argmax(dim=1, keepdim=True)
-                next_q_values = self.target_net(next_states).gather(1, next_actions)
-            else:
-                next_q_values = self.target_net(next_states).max(dim=1, keepdim=True).values
-
-            targets = rewards + self.gamma * (1.0 - dones) * next_q_values
-
-        td_errors = targets - q_values
-        loss = (self.loss_fn(q_values, targets) * weights).mean()
-
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
-        self.optimizer.step()
-
-        self.training_steps += 1
-        if self.training_steps % self.target_update_interval == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-
-        if self.spec.use_per and batch.indices is not None:
-            priorities = td_errors.detach().abs().squeeze(1).cpu().numpy()
-            self.replay.update_priorities(batch.indices, priorities)
-
-        return float(loss.item())
-
-
-class ReinforceAgent:
-    def __init__(self, spec: AlgorithmSpec) -> None:
-        self.spec = spec
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.num_actions = 4
-        self.alpha = self.spec.reinforce_alpha
-        self.gamma = 0.98
-        self.epsilon = 0.0
-        self.policy_net = PolicyNetwork(2, self.num_actions).to(self.device)
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.alpha)
-        self.training_steps = 0
-        self.env_steps = 0
-
-        self.episode_log_probs: List[torch.Tensor] = []
-        self.episode_rewards: List[float] = []
-        self._pending_log_prob: torch.Tensor | None = None
-
-    def register_env_step(self) -> None:
-        self.env_steps += 1
-
-    def act(self, state: State, greedy: bool = False) -> int:
-        x = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits = self.policy_net(x)
-
-        if greedy:
-            action = int(torch.argmax(logits, dim=1).item())
-            self._pending_log_prob = torch.log_softmax(logits, dim=1).squeeze(0)[action]
-            return action
-
-        dist = Categorical(logits=logits)
-        action_tensor = dist.sample().squeeze(0)
-        self._pending_log_prob = dist.log_prob(action_tensor)
-        return int(action_tensor.item())
-
-    def store(self, state: State, action: int, reward: float, next_state: State, done: bool) -> None:
-        del state, action, next_state, done
-        if self._pending_log_prob is None:
-            return
-        self.episode_log_probs.append(self._pending_log_prob)
-        self.episode_rewards.append(float(reward))
-        self._pending_log_prob = None
-
-    def learn(self, episode_done: bool = False) -> float | None:
-        if not episode_done:
-            return None
-        if not self.episode_rewards:
-            return None
-
-        # Pseudocode-like REINFORCE:
-        # 1) For each t, compute R_t = sum_{t'=t}^T gamma^(t'-t) * r_{t'}
-        # 2) Accumulate objective J = sum_t R_t * log pi(a_t | s_t)
-        # 3) Perform one gradient-ascent update per episode.
-        returns: List[float] = []
-        horizon = len(self.episode_rewards)
-        for t in range(horizon):
-            r_t = 0.0
-            for tp in range(t, horizon):
-                r_t += (self.gamma ** (tp - t)) * self.episode_rewards[tp]
-            returns.append(r_t)
-
-        returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
-        log_probs_t = torch.stack(self.episode_log_probs)
-
-        baseline = torch.zeros((), dtype=torch.float32, device=self.device)
-        if self.spec.use_baseline:
-            baseline = returns_t.mean()
-
-        advantages = returns_t - baseline
-        if self.spec.normalize_advantage and advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
-
-        objective = torch.zeros((), dtype=torch.float32, device=self.device)
-        for t in range(horizon):
-            objective = objective + advantages[t] * log_probs_t[t]
-
-        # Optimizers minimize by default, so we minimize -J instead of maximizing J.
-        loss = -objective
-
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=5.0)
-        self.optimizer.step()
-
-        self.training_steps += 1
-        self.episode_log_probs.clear()
-        self.episode_rewards.clear()
-
-        return float(loss.item())
 
 
 class SimulationView(QWidget):
@@ -688,14 +254,6 @@ class SimulationView(QWidget):
             int(self.env.agent_radius * 2 * scale_y),
         )
 
-        painter.setPen(QColor(60, 60, 60))
-        painter.setFont(QFont("DejaVu Sans", 10))
-        info = (
-            f"Agent (black) follows moving target (red)\n"
-            f"State = [dx, dy] = [{self.state[0]:+.3f}, {self.state[1]:+.3f}]"
-        )
-        painter.drawText(world.adjusted(14, 14, -14, -14), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, info)
-
 
 class RewardPlot(FigureCanvas):
     def __init__(self) -> None:
@@ -703,65 +261,79 @@ class RewardPlot(FigureCanvas):
         super().__init__(self.fig)
         self.ax = self.fig.add_subplot(111)
         self.steps: List[int] = []
-        self.rolling_avg: List[float] = []
+        self.step_rewards: List[float] = []
         self.setMinimumHeight(220)
 
     def clear(self) -> None:
         self.steps.clear()
-        self.rolling_avg.clear()
+        self.step_rewards.clear()
         self.redraw()
 
-    def add_point(self, step: int, rolling_average: float) -> None:
+    def add_point(self, step: int, step_reward: float, redraw: bool = True) -> None:
         self.steps.append(step)
-        self.rolling_avg.append(rolling_average)
+        self.step_rewards.append(step_reward)
         if len(self.steps) > 5000:
             self.steps = self.steps[-5000:]
-            self.rolling_avg = self.rolling_avg[-5000:]
-        self.redraw()
+            self.step_rewards = self.step_rewards[-5000:]
+        if redraw:
+            self.redraw()
 
     def redraw(self) -> None:
         self.ax.clear()
-        self.ax.set_title("Rolling average reward over the last 1000 steps")
+        self.ax.set_title("Reward per training step + rolling average (100)")
         self.ax.set_xlabel("Training steps")
-        self.ax.set_ylabel("Average reward")
+        self.ax.set_ylabel("Reward")
         self.ax.grid(True, alpha=0.25)
 
         if self.steps:
-            self.ax.plot(self.steps, self.rolling_avg, color="#1565c0", linewidth=1.8)
+            self.ax.plot(self.steps, self.step_rewards, color="#1565c0", linewidth=1.2, label="Step reward")
+
+            rolling_rewards: List[float] = []
+            for i in range(len(self.step_rewards)):
+                start = max(0, i - 99)
+                rolling_rewards.append(float(np.mean(self.step_rewards[start : i + 1])))
+
+            self.ax.plot(self.steps, rolling_rewards, color="#ef6c00", linewidth=2.0, label="Avg last 100")
             self.ax.axhline(0.0, color="#94a3b8", linewidth=1.0, linestyle="--")
             self.ax.set_xlim(self.steps[0], self.steps[-1] + 1)
-            y_max = max(0.05, max(self.rolling_avg) * 1.2)
-            self.ax.set_ylim(0.0, max(0.2, y_max))
+            y_min = min(0.0, min(self.step_rewards) * 1.2)
+            y_max = max(0.2, max(self.step_rewards) * 1.2)
+            if y_max - y_min < 1e-6:
+                y_max = y_min + 0.1
+            self.ax.set_ylim(y_min, y_max)
+            self.ax.legend(loc="lower right")
 
         self.draw_idle()
 
 
 class MainWindow(QMainWindow):
+    ALGORITHM_NAMES = ("DQN", "REINFORCE", "PPO")
+
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle(
-            "RL comparison demo: DQN / DDQN / Dueling DQN / PER / REINFORCE / REINFORCE-fast / REINFORCE+Baseline"
-        )
+        self.setWindowTitle("RL comparison demo: DQN / REINFORCE / PPO")
         self.resize(1280, 760)
 
         self.env = MovingTargetEnv()
-        self.agent: QLearningAgent | ReinforceAgent = QLearningAgent(ALGORITHMS[0])
+        self.agent = self._create_agent("DQN")
         self.running = False
         self.training_steps = 0
         self.episode_index = 1
         self.episode_reward = 0.0
-        self.recent_rewards: Deque[float] = deque(maxlen=1000)
+        self.last_reward = 0.0
         self.last_loss: float | None = None
-        self.steps_per_tick = 8
+        self.steps_per_tick = 2
         self.render_enabled = True
+
+        self.distance_window: Deque[float] = deque(maxlen=5000)
 
         self.view = SimulationView(self.env)
         self.plot = RewardPlot()
 
         self.combo_algorithm = QComboBox()
-        for spec in ALGORITHMS:
-            self.combo_algorithm.addItem(spec.name, spec)
+        for algorithm_name in self.ALGORITHM_NAMES:
+            self.combo_algorithm.addItem(algorithm_name)
         self.combo_algorithm.currentIndexChanged.connect(self._algorithm_changed)
 
         self.btn_start_stop = QPushButton("Start")
@@ -778,11 +350,16 @@ class MainWindow(QMainWindow):
         self.lbl_steps = QLabel()
         self.lbl_episode = QLabel()
         self.lbl_episode_reward = QLabel()
+        self.lbl_state = QLabel()
         self.lbl_distance = QLabel()
+        self.lbl_avg_distance_5000 = QLabel()
         self.lbl_epsilon = QLabel()
         self.lbl_replay = QLabel()
         self.lbl_loss = QLabel()
-        self.lbl_rolling_reward = QLabel()
+        self.lbl_ppo_entropy = QLabel()
+        self.lbl_ppo_ratio = QLabel()
+        self.lbl_ppo_clip_frac = QLabel()
+        self.lbl_last_reward = QLabel()
         self.lbl_device = QLabel(str(self.agent.device))
 
         self._build_ui()
@@ -809,7 +386,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(left, stretch=3)
 
         side_container = QFrame()
-        side_container.setFrameShape(QFrame.Shape.StyledPanel)
         side_layout = QVBoxLayout(side_container)
 
         scroll = QScrollArea()
@@ -832,10 +408,12 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.chk_rendering)
 
         hint = QLabel(
-            "PER uses prioritized replay; the other variants use uniform replay.\n"
-            "REINFORCE updates once per episode. REINFORCE fast uses a higher learning rate.\n"
-            "REINFORCE with baseline uses trajectory-mean baseline and normalized advantages.\n"
-            "The agent only observes the relative offset to the moving target."
+            "Three standalone Deep RL variants are available:\n"
+            "- DQN: value-based Q-learning with replay + target network\n"
+            "- REINFORCE: Monte-Carlo policy gradient, one update per episode\n"
+            "- PPO: clipped actor-critic updates over mini-batches\n"
+            "Reward is fixed to: reward = 1 - d/max_d (range [0, 1]).\n"
+            "Comparison metric: mean distance to goal over the last 5000 steps."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #475569;")
@@ -849,11 +427,16 @@ class MainWindow(QMainWindow):
         stats_layout.addRow("Training steps", self.lbl_steps)
         stats_layout.addRow("Episode", self.lbl_episode)
         stats_layout.addRow("Episode reward", self.lbl_episode_reward)
-        stats_layout.addRow("Distance", self.lbl_distance)
+        stats_layout.addRow("State [dx_t-1, dy_t-1, dx_t, dy_t]", self.lbl_state)
+        stats_layout.addRow("Current distance", self.lbl_distance)
+        stats_layout.addRow("Avg distance (last 5000)", self.lbl_avg_distance_5000)
         stats_layout.addRow("Epsilon", self.lbl_epsilon)
         stats_layout.addRow("Replay size", self.lbl_replay)
         stats_layout.addRow("Last loss", self.lbl_loss)
-        stats_layout.addRow("Rolling reward", self.lbl_rolling_reward)
+        stats_layout.addRow("PPO entropy", self.lbl_ppo_entropy)
+        stats_layout.addRow("PPO ratio mean", self.lbl_ppo_ratio)
+        stats_layout.addRow("PPO clip fraction", self.lbl_ppo_clip_frac)
+        stats_layout.addRow("Last reward", self.lbl_last_reward)
         stats_layout.addRow("Device", self.lbl_device)
         side_layout.addWidget(stats_box)
 
@@ -864,10 +447,17 @@ class MainWindow(QMainWindow):
         action.triggered.connect(self.close)
         return action
 
-    def selected_spec(self) -> AlgorithmSpec:
-        spec = self.combo_algorithm.currentData()
-        assert isinstance(spec, AlgorithmSpec)
-        return spec
+    def _selected_algorithm(self) -> str:
+        return str(self.combo_algorithm.currentText())
+
+    def _create_agent(self, algorithm_name: str):
+        if algorithm_name == "DQN":
+            return DQNAgent()
+        if algorithm_name == "REINFORCE":
+            return ReinforceAgent()
+        if algorithm_name == "PPO":
+            return PPOAgent()
+        raise ValueError(f"Unsupported algorithm: {algorithm_name}")
 
     def _algorithm_changed(self, _index: int) -> None:
         if self.running:
@@ -876,17 +466,14 @@ class MainWindow(QMainWindow):
         self.reset_demo()
 
     def reset_demo(self) -> None:
-        spec = self.selected_spec()
         self.env = MovingTargetEnv()
-        if spec.use_reinforce:
-            self.agent = ReinforceAgent(spec)
-        else:
-            self.agent = QLearningAgent(spec)
+        self.agent = self._create_agent(self._selected_algorithm())
         self.training_steps = 0
         self.episode_index = 1
         self.episode_reward = 0.0
-        self.recent_rewards.clear()
+        self.last_reward = 0.0
         self.last_loss = None
+        self.distance_window.clear()
         self.plot.clear()
         self.view.env = self.env
         self.view.set_state(self.env.state())
@@ -901,7 +488,6 @@ class MainWindow(QMainWindow):
         self.view.setVisible(enabled)
 
         if enabled:
-            # Refresh both canvases once when rendering is turned on again.
             self.view.set_state(self.env.state())
             self.plot.redraw()
 
@@ -916,30 +502,41 @@ class MainWindow(QMainWindow):
 
         self._sync_ui()
 
+    def _avg_distance_last_5000(self) -> float | None:
+        if not self.distance_window:
+            return None
+        return float(np.mean(self.distance_window))
+
     def training_step(self) -> bool:
         state = self.env.state()
         action = self.agent.act(state)
         next_state, reward, done, info = self.env.step(action)
-        del info
 
         self.agent.store(state, action, reward, next_state, done)
         self.agent.register_env_step()
-        loss = self.agent.learn(episode_done=done) if isinstance(self.agent, ReinforceAgent) else self.agent.learn()
+        loss = self.agent.learn(episode_done=done)
         if loss is not None:
             self.last_loss = loss
 
         self.training_steps += 1
         self.episode_reward += reward
-        self.recent_rewards.append(reward)
+        self.last_reward = reward
 
-        rolling_avg = float(np.mean(self.recent_rewards)) if self.recent_rewards else 0.0
-        if self.render_enabled and self.training_steps % 2 == 0:
-            self.plot.add_point(self.training_steps, rolling_avg)
+        self.distance_window.append(float(info["distance"]))
+
+        self.plot.add_point(self.training_steps, reward, redraw=self.render_enabled)
 
         if self.render_enabled:
             self.view.set_state(next_state)
 
         if done:
+            avg_distance = self._avg_distance_last_5000()
+            avg_text = f"{avg_distance:.2f} px" if avg_distance is not None else "n/a"
+            print(
+                f"[{self._selected_algorithm()}] Episode {self.episode_index} finished | "
+                f"avg distance over last {len(self.distance_window)} steps: {avg_text}"
+            )
+
             self.episode_index += 1
             self.episode_reward = 0.0
             self.env.reset()
@@ -949,20 +546,49 @@ class MainWindow(QMainWindow):
         return done
 
     def _sync_ui(self) -> None:
-        self.lbl_algorithm.setText(self.selected_spec().name)
+        self.lbl_algorithm.setText(self._selected_algorithm())
         self.lbl_steps.setText(str(self.training_steps))
         self.lbl_episode.setText(str(self.episode_index))
         self.lbl_episode_reward.setText(f"{self.episode_reward:.2f}")
+        state = self.env.state()
+        self.lbl_state.setText(f"[{state[0]:+.3f}, {state[1]:+.3f}, {state[2]:+.3f}, {state[3]:+.3f}]")
         self.lbl_distance.setText(f"{self.env.distance_to_target():.1f} px")
-        if isinstance(self.agent, QLearningAgent):
+
+        avg_distance = self._avg_distance_last_5000()
+        if avg_distance is None:
+            self.lbl_avg_distance_5000.setText("n/a")
+        else:
+            self.lbl_avg_distance_5000.setText(f"{avg_distance:.2f} px")
+
+        if isinstance(self.agent, DQNAgent):
             self.lbl_epsilon.setText(f"{self.agent.epsilon:.3f}")
             self.lbl_replay.setText(str(len(self.agent.replay)))
         else:
             self.lbl_epsilon.setText("-")
             self.lbl_replay.setText("-")
+
+        if isinstance(self.agent, PPOAgent):
+            if self.agent.last_entropy is None:
+                self.lbl_ppo_entropy.setText("-")
+            else:
+                self.lbl_ppo_entropy.setText(f"{self.agent.last_entropy:.4f}")
+
+            if self.agent.last_ratio_mean is None:
+                self.lbl_ppo_ratio.setText("-")
+            else:
+                self.lbl_ppo_ratio.setText(f"{self.agent.last_ratio_mean:.4f}")
+
+            if self.agent.last_clip_fraction is None:
+                self.lbl_ppo_clip_frac.setText("-")
+            else:
+                self.lbl_ppo_clip_frac.setText(f"{self.agent.last_clip_fraction:.3f}")
+        else:
+            self.lbl_ppo_entropy.setText("-")
+            self.lbl_ppo_ratio.setText("-")
+            self.lbl_ppo_clip_frac.setText("-")
+
         self.lbl_loss.setText("-" if self.last_loss is None else f"{self.last_loss:.4f}")
-        rolling_avg = float(np.mean(self.recent_rewards)) if self.recent_rewards else 0.0
-        self.lbl_rolling_reward.setText(f"{rolling_avg:.3f} (window=1000 steps)")
+        self.lbl_last_reward.setText(f"{self.last_reward:.3f}")
         self.lbl_device.setText(str(self.agent.device))
 
 
