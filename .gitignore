@@ -62,3 +62,5 @@
 !048_particle_filter_demo_spaceships/Makefile
 !048_particle_filter_demo_spaceships/pics/earth_orbit.jpg
 
+052_dqn_img_as_input/models
+053_pong_agents/models
