@@ -63,4 +63,5 @@
 !048_particle_filter_demo_spaceships/pics/earth_orbit.jpg
 
 052_dqn_img_as_input/models
-053_pong_agents/models
+053_pong_agents/models_dqn_ppo_1mio_steps
+053_pong_agents/models_dqn_ppo_2.5mio_steps

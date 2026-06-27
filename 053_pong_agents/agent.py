@@ -13,7 +13,7 @@ class BaseAgent:
         self.name = name
         self.steps_done = 0
 
-    def get_action(self, state):
+    def get_action(self, state, greedy=False):
         raise NotImplementedError("Subclasses must implement get_action")
 
     def step_end(self, reward, next_state, done):
@@ -41,7 +41,7 @@ class RandomAgent(BaseAgent):
     def __init__(self, action_space, name="Random"):
         super().__init__(action_space, name)
 
-    def get_action(self, state):
+    def get_action(self, state, greedy=False):
         return self.action_space.sample()
 
 
@@ -111,11 +111,12 @@ class DQNAgent(BaseAgent):
         self.last_state = None
         self.last_action = None
 
-    def get_action(self, state):
+    def get_action(self, state, greedy=False):
         state_np = np.array(state, copy=False)
         self.last_state = state_np
         
-        if random.random() < self.epsilon:
+        epsilon_to_use = 0.0 if greedy else self.epsilon
+        if random.random() < epsilon_to_use:
             action = self.action_space.sample()
         else:
             with torch.no_grad():
@@ -250,18 +251,22 @@ class PPOAgent(BaseAgent):
         self.last_logprob = None
         self.last_value = None
         
-    def get_action(self, state):
+    def get_action(self, state, greedy=False):
         state_np = np.array(state, copy=False)
         self.last_state = state_np
         
         with torch.no_grad():
             state_t = torch.tensor(state_np, dtype=torch.float32, device=self.device).unsqueeze(0)
             logits, value = self.network(state_t)
-            probs = Categorical(logits=logits)
-            action = probs.sample()
+            if greedy:
+                action = logits.argmax(dim=1)
+                self.last_logprob = 0.0
+            else:
+                probs = Categorical(logits=logits)
+                action = probs.sample()
+                self.last_logprob = probs.log_prob(action).item()
             
         self.last_action = action.item()
-        self.last_logprob = probs.log_prob(action).item()
         self.last_value = value.item()
         
         return self.last_action

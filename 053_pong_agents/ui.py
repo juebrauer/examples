@@ -173,9 +173,13 @@ class MainWindow(QMainWindow):
         controls_layout = QVBoxLayout()
         controls_group.setLayout(controls_layout)
 
-        self.btn_start = QPushButton("Start")
-        self.btn_start.clicked.connect(self.toggle_start)
+        self.btn_start = QPushButton("Start training")
+        self.btn_start.clicked.connect(self.toggle_start_training)
         controls_layout.addWidget(self.btn_start)
+
+        self.btn_play_greedy = QPushButton("Play greedy")
+        self.btn_play_greedy.clicked.connect(self.toggle_play_greedy)
+        controls_layout.addWidget(self.btn_play_greedy)
 
         self.btn_step = QPushButton("Next Step")
         self.btn_step.clicked.connect(self.single_step)
@@ -266,8 +270,25 @@ class MainWindow(QMainWindow):
         filepath, _ = QFileDialog.getOpenFileName(self, "Load Model", "models/", "PyTorch Models (*.pth)")
         if filepath:
             try:
-                self.current_agent.load(filepath)
+                import torch
                 filename = os.path.basename(filepath)
+                
+                # Infer agent type by loading the state dict and inspecting keys
+                # We use weights_only=False because older PyTorch versions might complain, but True is safer if supported.
+                state_dict = torch.load(filepath, map_location="cpu")
+                keys = list(state_dict.keys())
+                
+                is_ppo = any("actor" in k or "critic" in k or "fc_shared" in k for k in keys)
+                is_dqn = any("fc_net" in k for k in keys) and not is_ppo
+                
+                if is_ppo or "PPO" in filename.upper():
+                    if "PPO Agent" in self.agent_factories:
+                        self.combo_agent.setCurrentText("PPO Agent")
+                elif is_dqn or "DQN" in filename.upper():
+                    if "DQN Agent" in self.agent_factories:
+                        self.combo_agent.setCurrentText("DQN Agent")
+                
+                self.current_agent.load(filepath)
                 self.lbl_loaded_model.setText(f"Loaded: {filename}")
                 self.lbl_loaded_model.setStyleSheet("color: green; font-weight: bold;")
                 self.reset_env()
@@ -278,7 +299,12 @@ class MainWindow(QMainWindow):
     def on_agent_changed(self, agent_name):
         was_running = self.worker._is_running
         if was_running:
-            self.toggle_start()
+            self.worker.pause_loop()
+            self.btn_start.setText("Start training")
+            self.btn_start.setEnabled(True)
+            self.btn_play_greedy.setText("Play greedy")
+            self.btn_play_greedy.setEnabled(True)
+            self.btn_step.setEnabled(True)
             
         # Memory cleanup before instantiating the new agent to prevent OOM
         if hasattr(self, 'current_agent'):
@@ -301,7 +327,10 @@ class MainWindow(QMainWindow):
 
     def update_epsilon_label(self):
         if hasattr(self.current_agent, 'epsilon'):
-            self.lbl_epsilon.setText(f"Epsilon: {self.current_agent.epsilon:.3f}")
+            if self.worker.greedy_mode:
+                self.lbl_epsilon.setText(f"Epsilon: 0.000 (Greedy)")
+            else:
+                self.lbl_epsilon.setText(f"Epsilon: {self.current_agent.epsilon:.3f}")
         else:
             self.lbl_epsilon.setText(f"Epsilon: N/A ({self.current_agent.name})")
 
@@ -330,6 +359,7 @@ class MainWindow(QMainWindow):
         
         # Lock UI
         self.btn_start.setEnabled(False)
+        self.btn_play_greedy.setEnabled(False)
         self.btn_step.setEnabled(False)
         self.btn_reset.setEnabled(False)
         self.combo_agent.setEnabled(False)
@@ -338,7 +368,9 @@ class MainWindow(QMainWindow):
         
         # Pause main worker
         if self.worker._is_running:
-            self.toggle_start()
+            self.worker.pause_loop()
+            self.btn_start.setText("Start training")
+            self.btn_play_greedy.setText("Play greedy")
             
         self.lbl_exp_progress.setText(f"Progress: Initializing...")
         
@@ -356,6 +388,7 @@ class MainWindow(QMainWindow):
         
         # Unlock UI
         self.btn_start.setEnabled(True)
+        self.btn_play_greedy.setEnabled(True)
         self.btn_step.setEnabled(True)
         self.btn_reset.setEnabled(True)
         self.combo_agent.setEnabled(True)
@@ -402,19 +435,40 @@ class MainWindow(QMainWindow):
 
     def reset_env(self):
         if self.worker._is_running:
-            self.toggle_start()
+            self.worker.pause_loop()
+            self.btn_start.setText("Start training")
+            self.btn_start.setEnabled(True)
+            self.btn_play_greedy.setText("Play greedy")
+            self.btn_play_greedy.setEnabled(True)
+            self.btn_step.setEnabled(True)
         self.last_ep = 0
         self.last_ep_reward = 0.0
         self.worker.reset_env()
 
-    def toggle_start(self):
+    def toggle_start_training(self):
         if self.worker._is_running:
             self.worker.pause_loop()
-            self.btn_start.setText("Start")
+            self.btn_start.setText("Start training")
+            self.btn_play_greedy.setEnabled(True)
             self.btn_step.setEnabled(True)
         else:
+            self.worker.set_greedy_mode(False)
             self.worker.start_loop()
-            self.btn_start.setText("Pause")
+            self.btn_start.setText("Pause training")
+            self.btn_play_greedy.setEnabled(False)
+            self.btn_step.setEnabled(False)
+
+    def toggle_play_greedy(self):
+        if self.worker._is_running:
+            self.worker.pause_loop()
+            self.btn_play_greedy.setText("Play greedy")
+            self.btn_start.setEnabled(True)
+            self.btn_step.setEnabled(True)
+        else:
+            self.worker.set_greedy_mode(True)
+            self.worker.start_loop()
+            self.btn_play_greedy.setText("Pause playing")
+            self.btn_start.setEnabled(False)
             self.btn_step.setEnabled(False)
 
     def single_step(self):

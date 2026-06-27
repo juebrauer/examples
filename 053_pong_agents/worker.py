@@ -17,6 +17,7 @@ class RLWorker(QThread):
         self.mutex = QMutex()
         self._is_running = False
         self._single_step = False
+        self.greedy_mode = False
         
         # User configurations
         self.delay_ms = 16  # default roughly 60 FPS
@@ -31,6 +32,10 @@ class RLWorker(QThread):
     def set_agent(self, agent):
         with QMutexLocker(self.mutex):
             self.agent = agent
+
+    def set_greedy_mode(self, greedy):
+        with QMutexLocker(self.mutex):
+            self.greedy_mode = greedy
 
     def set_delay(self, ms):
         with QMutexLocker(self.mutex):
@@ -84,6 +89,7 @@ class RLWorker(QThread):
             self.mutex.lock()
             is_running = self._is_running
             single_step = self._single_step
+            greedy_mode = self.greedy_mode
             self.mutex.unlock()
 
             if not is_running and not single_step:
@@ -94,15 +100,16 @@ class RLWorker(QThread):
                     self._single_step = False
 
             # --- RL Step ---
-            action = self.agent.get_action(self.current_state)
+            action = self.agent.get_action(self.current_state, greedy=greedy_mode)
             next_state, reward, terminated, truncated, _ = self.env.step(action)
             done = terminated or truncated
 
-            # Allow the agent to store the transition and train
-            if hasattr(self.agent, 'step_end'):
-                self.agent.step_end(reward, next_state, done)
-            
-            self.agent.train_step()
+            if not greedy_mode:
+                # Allow the agent to store the transition and train
+                if hasattr(self.agent, 'step_end'):
+                    self.agent.step_end(reward, next_state, done)
+                
+                self.agent.train_step()
             
             with QMutexLocker(self.mutex):
                 self.current_state = next_state
