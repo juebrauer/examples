@@ -63,6 +63,9 @@ def main():
         """
         This is just a linear approximation of h
         using the Jacobi matrix of h
+        x[0] <=> x1
+        x[1] <=> x2
+        x[2] <=> x3
         """
         Jh = np.array([[ 2*x[0],      0,     0],
                        [      0, 2*x[1],     0],

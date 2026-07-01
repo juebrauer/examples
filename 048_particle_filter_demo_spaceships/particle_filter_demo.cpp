@@ -212,10 +212,10 @@ Mat get_image_of_continuous_probability_distribution(particle_filter* pf)
    clock_t start_time = clock();
 
    // width of Gaussian Kernel
-   const float sigma = 1.0; // try 1,10,20
+   const float sigma = 10.0; // try 1,10,20
 
    // bandwidth of Kernel Density Estimator (KDE)
-   const float bandwidth = 1.0; // try 0.1, 1.0, 10.0
+   const float bandwidth = 10.0; // try 0.1, 1.0, 10.0
 
    const float normalization_fac = 1.0 / (sqrt(2 * M_PI) * sigma);   
 
