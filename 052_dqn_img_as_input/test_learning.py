@@ -5,13 +5,13 @@ import matplotlib.pyplot as plt
 from dqn_image_demo import SimpleGridEnv, DQNAgent
 
 def test():
-    env = SimpleGridEnv()
+    env = SimpleGridEnv(num_stacked_frames=3)
     agent = DQNAgent(
-        obs_shape=(48, 48, 3),
+        obs_shape=(48, 48, env.obs_channels),
         num_actions=4,
         lr=5e-4, # lower LR
         gamma=0.99, # higher gamma
-        epsilon_decay_steps=100000, # slower decay
+        epsilon_decay_steps=15000, # faster decay to 0.05
         target_update_frequency=1000
     )
     

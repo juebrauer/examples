@@ -45,6 +45,7 @@ from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -73,9 +74,13 @@ class SimpleGridEnv:
     Der Zustand (Observation) ist ein 48x48 RGB-Bild (float32, [0, 1]).
     Der Agent (grünes Quadrat) versucht das Ziel (roter Kreis) zu erreichen.
     """
-    def __init__(self, grid_size: int = 24, obs_size: int = 48):
+    def __init__(self, grid_size: int = 24, obs_size: int = 48, num_stacked_frames: int = 3, gamma: float = 0.99):
         self.grid_size = grid_size
         self.obs_size = obs_size
+        self.num_stacked_frames = num_stacked_frames
+        self.obs_channels = 3 * num_stacked_frames
+        self.frame_buffer = deque(maxlen=num_stacked_frames)
+        self.gamma = gamma
         self.cell_size = obs_size / grid_size  # Pixel pro Grid-Zelle (hier: 48 / 24 = 2)
         
         # Aktionen: 0: Oben, 1: Unten, 2: Links, 3: Rechts
@@ -113,7 +118,11 @@ class SimpleGridEnv:
             if self.goal_pos != self.agent_pos:
                 break
                 
-        return self.render_observation()
+        single_frame = self.render_single_frame()
+        self.frame_buffer.clear()
+        for _ in range(self.num_stacked_frames):
+            self.frame_buffer.append(single_frame)
+        return self.get_stacked_observation()
         
     def get_l1_distance(self, p1: Tuple[int, int], p2: Tuple[int, int]) -> int:
         """Berechnet den Manhattan-Abstand zwischen zwei Punkten."""
@@ -136,7 +145,14 @@ class SimpleGridEnv:
         new_dist = self.get_l1_distance(self.agent_pos, self.goal_pos)
         reached_goal = (self.agent_pos == self.goal_pos)
         
-        # --- Reward Shaping für schnelles Lernen im Hörsaal ---
+        # --- Potential-Based Reward Shaping (Ng, Harada, Russell, 1999) ---
+        # F(s, s') = gamma * Phi(s') - Phi(s)
+        # wobei Phi(s) = - c * L1_distance(s, goal). Hier c = 0.5.
+        # Im Zielzustand ist Phi(terminal) = 0.
+        phi_old = -0.5 * old_dist
+        phi_new = 0.0 if reached_goal else (-0.5 * new_dist)
+        shaping_reward = self.gamma * phi_new - phi_old
+        
         # 1. Zeitschmerz (animiert den Agenten, schnell zu sein)
         reward = -0.05
         
@@ -144,10 +160,8 @@ class SimpleGridEnv:
         if hit_wall:
             reward -= 0.1
             
-        # 3. Annäherung belohnen / Entfernung bestrafen
-        # (Dies gibt dem Agenten dichte, graduelle Rückmeldung)
-        dist_change = old_dist - new_dist
-        reward += dist_change * 0.5
+        # 3. Potential-Based Reward Shaping (garantiert Politik-Invarianz ohne Oszillation/Hacking!)
+        reward += shaping_reward
         
         # 4. Zielerreichung belohnen
         if reached_goal:
@@ -161,12 +175,13 @@ class SimpleGridEnv:
             "hit_wall": hit_wall
         }
         
-        return self.render_observation(), reward, done, info
+        single_frame = self.render_single_frame()
+        self.frame_buffer.append(single_frame)
+        return self.get_stacked_observation(), reward, done, info
 
-    def render_observation(self) -> np.ndarray:
+    def render_single_frame(self) -> np.ndarray:
         """
-        Rendert die Umgebung als 48x48 RGB-Bild im Wertebereich [0, 1].
-        Dies ist das exakte Bild, das das neuronale Netz als Eingabe erhält.
+        Rendert die Umgebung als einzelnes 48x48x3 RGB-Bild im Wertebereich [0, 1].
         """
         # Weißer Hintergrund
         img = np.ones((self.obs_size, self.obs_size, 3), dtype=np.float32)
@@ -183,6 +198,18 @@ class SimpleGridEnv:
         
         return img
 
+    def get_stacked_observation(self) -> np.ndarray:
+        """
+        Gibt den Stack der letzten N Frames als Array zurück (H, W, 3*N).
+        """
+        return np.concatenate(list(self.frame_buffer), axis=-1)
+
+    def render_observation(self) -> np.ndarray:
+        """
+        Gibt die aktuelle Observation (Stack) zurück.
+        """
+        return self.get_stacked_observation()
+
 
 # ==============================================================================
 # 2. Das DQN Modell (CNN mit PyTorch)
@@ -191,52 +218,115 @@ class SimpleGridEnv:
 class DQN(nn.Module):
     """
     Einfaches, verständliches Convolutional Neural Network (CNN).
-    Eingabe: (Batch_Size, Channels=3, Height=48, Width=48)
+    Eingabe: (Batch_Size, Channels=9, Height=48, Width=48) - 3 gestackte RGB Frames
     Ausgabe: (Batch_Size, Aktionen=4)
     """
-    def __init__(self, in_channels: int = 3, num_actions: int = 4):
+    def __init__(self, in_channels: int = 9, num_actions: int = 4):
         super().__init__()
         
         # 1. Convolutional Block: Extrahiert einfache geometrische Muster
-        # Input: 3 x 48 x 48
-        # Conv: 3x3 Filter, Padding 1 -> Output: 16 Kanäle, 48 x 48
-        # Max-Pooling: 2x2 -> Halbiert die Dimension -> Output: 16 Kanäle, 24 x 24
-        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # Input: in_channels x 48 x 48 (Standard: 9 x 48 x 48 für 3 gestackte Frames)
+        # Conv: 3x3 Filter, Stride 2, Padding 1 -> Output: 16 Kanäle, 24 x 24 (1 Pixel im Feature Map = 1 Grid Zelle!)
+        # Kein Max-Pooling, um räumliche Positionsinformationen exakt zu erhalten!
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1)
         
         # 2. Convolutional Block: Kombiniert Muster zu komplexeren Objekten
         # Input: 16 Kanäle, 24 x 24
-        # Conv: 3x3 Filter, Padding 1 -> Output: 32 Kanäle, 24 x 24
-        # Max-Pooling: 2x2 -> Halbiert die Dimension -> Output: 32 Kanäle, 12 x 12
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # Conv: 3x3 Filter, Stride 1, Padding 1 -> Output: 32 Kanäle, 24 x 24
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         
-        # Nach dem Pooling haben wir ein Tensor-Volumen von 32 x 12 x 12.
-        # Um dies in ein fully connected Layer zu leiten, müssen wir es glätten (Flatten).
-        # Die flache Feature-Größe ist: 32 Kanäle * 12 Pixel * 12 Pixel = 4608 Features.
-        self.flat_features = 32 * 12 * 12
+        # Da wir kein Max-Pooling mehr verwenden, bleibt die räumliche Auflösung bei 24 x 24.
+        # Die flache Feature-Größe ist: 32 Kanäle * 24 Pixel * 24 Pixel = 18432 Features.
+        self.flat_features = 32 * 24 * 24
         
         # Fully Connected (Dichte) Schichten zur Entscheidungsfindung
-        # FC1: Reduziert 4608 Features auf 256 repräsentative Neuronen (Erhöht für 24x24 Grid)
+        # FC1: Reduziert 18432 Features auf 256 repräsentative Neuronen
         self.fc1 = nn.Linear(self.flat_features, 256)
         # FC2: Mappt die 256 Neuronen auf die 4 Q-Werte (einer pro Richtung)
         self.fc2 = nn.Linear(256, num_actions)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Eingabe-Aktivierung: Conv1 -> ReLU -> Pool1
+        # Eingabe-Aktivierung: Conv1 -> ReLU (ohne Max-Pooling)
         x = torch.relu(self.conv1(x))
-        x = self.pool1(x)
         
-        # Zweite Aktivierung: Conv2 -> ReLU -> Pool2
+        # Zweite Aktivierung: Conv2 -> ReLU (ohne Max-Pooling)
         x = torch.relu(self.conv2(x))
-        x = self.pool2(x)
         
-        # Flatten: (Batch_Size, 32, 12, 12) -> (Batch_Size, 4608)
+        # Flatten: (Batch_Size, 32, 24, 24) -> (Batch_Size, 18432)
         x = x.reshape(-1, self.flat_features)
         
         # Fully Connected Schichten mit ReLU Aktivierung im Hidden-Layer
         x = torch.relu(self.fc1(x))
         q_values = self.fc2(x)
+        
+        return q_values
+
+
+class ViT(nn.Module):
+    """
+    Vision Transformer (ViT) für Deep Q-Learning auf Bild-Daten.
+    Teilt das 48x48 Eingabebild in Patches auf, wendet Self-Attention via Transformer an
+    und sagt die Q-Werte für alle 4 Aktionen voraus.
+    """
+    def __init__(
+        self,
+        in_channels: int = 9,
+        num_actions: int = 4,
+        img_size: int = 48,
+        patch_size: int = 6,
+        embed_dim: int = 128,
+        num_heads: int = 4,
+        depth: int = 2
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) * (img_size // patch_size)  # (48/6)*(48/6) = 64
+        self.embed_dim = embed_dim
+        
+        # 1. Patch Embedding via Conv2d (Stride = Patch Size)
+        self.patch_embed = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        # 2. CLS-Token & Positional Embedding
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        
+        # 3. Transformer Encoder Block
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        # 4. Q-Value Head (auf dem CLS-Token)
+        self.head = nn.Linear(embed_dim, num_actions)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        
+        # Patches extrahieren: (B, C, H, W) -> (B, embed_dim, 8, 8) -> (B, 64, embed_dim)
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        
+        # CLS-Token vorne anhängen: (B, 1, embed_dim) -> (B, 65, embed_dim)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        # Positional Embeddings addieren
+        x = x + self.pos_embed
+        
+        # Self-Attention im Transformer Encoder
+        x = self.transformer(x)
+        
+        # Nur das CLS-Token (Index 0) für die Q-Wert-Vorhersage nutzen
+        x = self.norm(x[:, 0])
+        q_values = self.head(x)
         
         return q_values
 
@@ -251,21 +341,24 @@ class DQNAgent:
     """
     def __init__(
         self,
-        obs_shape: Tuple[int, int, int] = (48, 48, 3),
+        obs_shape: Tuple[int, int, int] = (48, 48, 9),
         num_actions: int = 4,
-        lr: float = 5e-4,  # Leicht reduziert für stabilere Updates
+        lr: float = 5e-4,  # Konstante Lernrate
         gamma: float = 0.99, # Erhöht, damit der Agent weitsichtiger wird
         epsilon_start: float = 1.0,
         epsilon_min: float = 0.05,
-        epsilon_decay_steps: int = 150000,  # Deutlich erhöht für die größere 24x24 Welt!
+        epsilon_decay_steps: int = 100000,  # Langsamer absinken lassen für gründlichere Exploration
         batch_size: int = 64,
         buffer_capacity: int = 10000,
         target_update_frequency: int = 1000, # Etwas seltener updaten für stabilere Q-Targets
+        model_type: str = "vit"  # "vit" für Vision Transformer, "cnn" für klassisches CNN
     ):
         self.num_actions = num_actions
         self.gamma = gamma
         self.batch_size = batch_size
         self.target_update_frequency = target_update_frequency
+        self.model_type = model_type.lower()
+        self.lr = lr
         
         # Epsilon-Greedy Parameter
         self.epsilon = epsilon_start
@@ -279,8 +372,9 @@ class DQNAgent:
         self.memory = deque(maxlen=buffer_capacity)
         
         # Policy-Netzwerk (wird trainiert) und Target-Netzwerk (berechnet stabile Zielwerte)
-        self.policy_net = DQN(in_channels=obs_shape[2], num_actions=num_actions).to(self.device)
-        self.target_net = DQN(in_channels=obs_shape[2], num_actions=num_actions).to(self.device)
+        NetClass = ViT if self.model_type == "vit" else DQN
+        self.policy_net = NetClass(in_channels=obs_shape[2], num_actions=num_actions).to(self.device)
+        self.target_net = NetClass(in_channels=obs_shape[2], num_actions=num_actions).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
@@ -431,7 +525,12 @@ class CnnInputView(QWidget):
             return
             
         # Konvertiere NumPy-Bild [0,1] float32 in QImage
-        arr = np.clip(self.obs * 255.0, 0, 255).astype(np.uint8)
+        # Alle Frames aus dem Stack nebeneinander legen (exakte Modell-Eingabe: alle 3 Frames nebeneinander)
+        num_frames = self.obs.shape[2] // 3
+        frames = [self.obs[:, :, i*3:(i+1)*3] for i in range(num_frames)]
+        arr = np.hstack(frames)
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        arr = np.ascontiguousarray(arr)
         h, w, c = arr.shape
         qimg = QImage(arr.data, w, h, c * w, QImage.Format_RGB888)
         
@@ -648,10 +747,12 @@ class MainWindow(QMainWindow):
         self.resize(1150, 720)
         
         # RL Komponenten initialisieren
-        self.env = SimpleGridEnv()
+        self.current_model_type = "vit"
+        self.env = SimpleGridEnv(num_stacked_frames=3)
         self.agent = DQNAgent(
-            obs_shape=(self.env.obs_size, self.env.obs_size, 3),
-            num_actions=4
+            obs_shape=(self.env.obs_size, self.env.obs_size, self.env.obs_channels),
+            num_actions=4,
+            model_type=self.current_model_type
         )
         
         # State & Trainingsvariablen
@@ -741,12 +842,29 @@ class MainWindow(QMainWindow):
         self.lbl_loss = QLabel("N/A")
         stats_grid.addWidget(self.lbl_loss, 5, 1)
         
-        stats_grid.addWidget(QLabel("Berechnungs-Device:"), 6, 0)
+        stats_grid.addWidget(QLabel("Aktuelle Architektur:"), 6, 0)
+        self.lbl_arch = QLabel(f"{self.agent.model_type.upper()}")
+        self.lbl_arch.setStyleSheet("font-weight: bold; color: #8e44ad;")
+        stats_grid.addWidget(self.lbl_arch, 6, 1)
+        
+        stats_grid.addWidget(QLabel("Berechnungs-Device:"), 7, 0)
         lbl_device = QLabel(f"{self.agent.device}".upper())
         lbl_device.setStyleSheet("font-weight: bold; color: #27ae60;" if "cuda" in str(self.agent.device) else "font-weight: bold; color: #7f8c8d;")
-        stats_grid.addWidget(lbl_device, 6, 1)
+        stats_grid.addWidget(lbl_device, 7, 1)
         
         right_panel.addWidget(stats_box)
+        
+        # 1.5. Architektur-Auswahl (CNN vs. ViT)
+        arch_box = QGroupBox("Architektur-Auswahl (Neuronales Netz)")
+        arch_layout = QVBoxLayout(arch_box)
+        arch_layout.setSpacing(8)
+        
+        self.combo_arch = QComboBox()
+        self.combo_arch.addItem("Vision Transformer (ViT) - Attention auf Patches", "vit")
+        self.combo_arch.addItem("Convolutional Neural Network (CNN) - Faltungen", "cnn")
+        self.combo_arch.currentIndexChanged.connect(self.on_arch_changed)
+        arch_layout.addWidget(self.combo_arch)
+        right_panel.addWidget(arch_box)
         
         # 2. Anzeige- & Trainingsmodus (Neue didaktische Modusauswahl)
         mode_box = QGroupBox("Anzeige- & Trainingsmodus")
@@ -885,6 +1003,11 @@ class MainWindow(QMainWindow):
             self.refresh_visuals()
             self.update_stats_labels()
 
+    def on_arch_changed(self):
+        """Wechselt die Modell-Architektur zwischen ViT und CNN und setzt das Experiment zurück."""
+        self.current_model_type = self.combo_arch.currentData()
+        self.reset_agent_and_env()
+
     def reset_agent_and_env(self):
         """Setzt das gesamte Experiment zurück."""
         self.running = False
@@ -893,10 +1016,12 @@ class MainWindow(QMainWindow):
         self.btn_step.setEnabled(True)
         
         # Environment und Agent neu instanziieren
-        self.env = SimpleGridEnv()
+        model_type = getattr(self, "current_model_type", "vit")
+        self.env = SimpleGridEnv(num_stacked_frames=3)
         self.agent = DQNAgent(
-            obs_shape=(self.env.obs_size, self.env.obs_size, 3),
-            num_actions=4
+            obs_shape=(self.env.obs_size, self.env.obs_size, self.env.obs_channels),
+            num_actions=4,
+            model_type=model_type
         )
         
         self.state = self.env.reset()
@@ -1009,6 +1134,9 @@ class MainWindow(QMainWindow):
         self.lbl_epsilon.setText(f"{self.agent.epsilon:.3f}")
         self.lbl_buffer.setText(f"{len(self.agent.memory)} / {self.agent.memory.maxlen}")
         
+        if hasattr(self, "lbl_arch"):
+            self.lbl_arch.setText(f"{self.agent.model_type.upper()}")
+            
         if self.last_loss is not None:
             self.lbl_loss.setText(f"{self.last_loss:.5f}")
         else:
