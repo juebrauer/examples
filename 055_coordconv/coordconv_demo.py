@@ -42,17 +42,30 @@ class TrainingConfig:
 class PlainCNN(nn.Module):
     def __init__(self, image_size: int):
         super().__init__()
+        pooled_size = image_size
+        for _ in range(4):
+            pooled_size //= 2
+
         self.features = nn.Sequential(
             nn.Conv2d(CHANNELS_RGB, 16, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
             nn.Conv2d(16, 16, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
             nn.Conv2d(16, 8, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(8, 4, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
         )
         self.regressor = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(8 * image_size * image_size, 128),
+            nn.Linear(4 * pooled_size * pooled_size, 128),
             nn.ReLU(),
             nn.Linear(128, 2),
             nn.Sigmoid(),
