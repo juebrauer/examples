@@ -247,14 +247,10 @@ class NavigationCNN(nn.Module):
         )
 
     def extract_feature_vector(self, x: torch.Tensor) -> torch.Tensor:
-        f1 = self.relu(self.conv1(x))
-        f2 = self.relu(self.conv2(f1))
-        f3 = self.relu(self.conv3(f2))
-
-        f1_vec = torch.flatten(f1, start_dim=1)
-        f2_vec = torch.flatten(f2, start_dim=1)
-        f3_vec = torch.flatten(f3, start_dim=1)
-        return torch.cat([f1_vec, f2_vec, f3_vec], dim=1)
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        return torch.flatten(x, start_dim=1)
 
     def get_feature_vector_length(self, input_size: int) -> int:
         with torch.no_grad():
