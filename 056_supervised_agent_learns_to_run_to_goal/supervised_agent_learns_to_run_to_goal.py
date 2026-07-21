@@ -7,8 +7,6 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -28,6 +26,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from agent_rl import RLInteractiveAgent
+from agent_supervised import SupervisedNavigationAgent
+
 
 WORLD_SIZE = 50
 MAX_STEPS_PER_EPISODE = 250
@@ -38,6 +39,14 @@ AGENT_MARKER_SIZE = 3
 GOAL_MARKER_SIZE = 3
 LOCAL_SAMPLE_PROBABILITY = 0.6
 LOCAL_RADIUS = 6
+
+# RL hyperparameters.  These are intentionally collected here so the
+# experiment can be changed without touching the agent implementation.
+RL_ACTOR_LR = 3e-4
+RL_CRITIC_LR = 1e-3
+RL_HISTORY_DECAY = 0.90
+RL_ENTROPY_COEFFICIENT = 0.01
+RL_ADVANTAGE_CLIP = 2.0
 
 ACTION_UP = 0
 ACTION_DOWN = 1
@@ -231,39 +240,6 @@ class GridWorld:
         return StepResult(done=done, reached_goal=reached_goal)
 
 
-class NavigationCNN(nn.Module):
-    def __init__(self, input_size: int = WORLD_SIZE):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2, padding=2)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.relu = nn.ReLU()
-
-        in_features = self.get_feature_vector_length(input_size)
-        self.classifier = nn.Sequential(
-            nn.Linear(in_features, 128),
-            nn.ReLU(),
-            nn.Linear(128, 4),
-        )
-
-    def extract_feature_vector(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        return torch.flatten(x, start_dim=1)
-
-    def get_feature_vector_length(self, input_size: int) -> int:
-        with torch.no_grad():
-            model_device = next(self.parameters()).device
-            dummy = torch.zeros(1, 3, input_size, input_size, device=model_device)
-            out = self.extract_feature_vector(dummy)
-        return int(out.shape[1])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.extract_feature_vector(x)
-        return self.classifier(x)
-
-
 class TrainingWorker(QObject):
     progress = Signal(object)
     finished = Signal(object)
@@ -273,8 +249,8 @@ class TrainingWorker(QObject):
         mode: str,
         total_train_epochs: int,
         total_test_episodes: int,
-        model: nn.Module,
-        optimizer: optim.Optimizer,
+        supervised_agent: SupervisedNavigationAgent,
+        rl_agent: RLInteractiveAgent,
         device: torch.device,
         world_size: int,
         max_steps: int,
@@ -283,13 +259,15 @@ class TrainingWorker(QObject):
         cycle_blocker_enabled: bool,
         local_sampling_enabled: bool,
         soft_targets_enabled: bool,
+        rl_history_length: int,
+        fast_mode_enabled: bool,
     ):
         super().__init__()
         self.mode = mode
         self.total_train_epochs = total_train_epochs
         self.total_test_episodes = total_test_episodes
-        self.model = model
-        self.optimizer = optimizer
+        self.supervised_agent = supervised_agent
+        self.rl_agent = rl_agent
         self.device = device
         self.world_size = world_size
         self.max_steps = max_steps
@@ -298,6 +276,8 @@ class TrainingWorker(QObject):
         self.cycle_blocker_enabled = cycle_blocker_enabled
         self.local_sampling_enabled = local_sampling_enabled
         self.soft_targets_enabled = soft_targets_enabled
+        self.rl_history_length = max(1, rl_history_length)
+        self.fast_mode_enabled = fast_mode_enabled
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -312,99 +292,63 @@ class TrainingWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        if self.mode == "training":
-            self._run_training()
-        else:
-            self._run_testing()
+        if self.mode == "training_supervised":
+            self._run_training_supervised()
+            return
+        if self.mode == "testing_supervised":
+            self._run_testing_supervised()
+            return
+        if self.mode == "training_rl":
+            self._run_training_rl()
+            return
+        self._run_testing_rl()
 
-    def _run_training(self) -> None:
-        self.model.train()
+    def _compute_reward(self, prev_dist: float, dist: float, reached_goal: bool) -> float:
+        reward = -0.02
+        if dist < prev_dist - 1e-9:
+            reward += 0.15
+        elif dist > prev_dist + 1e-9:
+            reward -= 0.15
+        if reached_goal:
+            reward += 1.0
+        return reward
 
-        states = np.zeros(
-            (TRAIN_SAMPLES, 3, self.world_size, self.world_size),
-            dtype=np.float32,
+    def _run_training_supervised(self) -> None:
+        epochs_done = self.supervised_agent.train(
+            total_epochs=self.total_train_epochs,
+            should_stop=lambda: self._stop_requested,
+            progress_callback=lambda payload: self.progress.emit(payload),
+            local_sampling_enabled=self.local_sampling_enabled,
+            soft_targets_enabled=self.soft_targets_enabled,
+            sample_training_positions_fn=sample_training_positions,
+            build_state_image_fn=build_state_image,
+            expert_action_from_positions_fn=expert_action_from_positions,
+            expert_action_distribution_fn=expert_action_distribution,
         )
-        if self.soft_targets_enabled:
-            targets = np.zeros((TRAIN_SAMPLES, 4), dtype=np.float32)
-        else:
-            targets = np.zeros((TRAIN_SAMPLES,), dtype=np.int64)
-
-        for i in range(TRAIN_SAMPLES):
-            agent_x, agent_y, goal_x, goal_y = sample_training_positions(
-                self.world_size,
-                use_local_sampling=self.local_sampling_enabled,
-            )
-
-            states[i] = build_state_image(
-                size=self.world_size,
-                agent_x=agent_x,
-                agent_y=agent_y,
-                goal_x=goal_x,
-                goal_y=goal_y,
-            )
-            if self.soft_targets_enabled:
-                targets[i] = expert_action_distribution(agent_x, agent_y, goal_x, goal_y)
-            else:
-                targets[i] = expert_action_from_positions(agent_x, agent_y, goal_x, goal_y)
-
-        states_tensor = torch.from_numpy(states)
-        targets_tensor = torch.from_numpy(targets)
-
-        epoch = 1
-        while epoch <= self.total_train_epochs and not self._stop_requested:
-            perm = torch.randperm(TRAIN_SAMPLES)
-            total_loss = 0.0
-            total_seen = 0
-
-            for start in range(0, TRAIN_SAMPLES, TRAIN_BATCH_SIZE):
-                if self._stop_requested:
-                    break
-
-                end = min(start + TRAIN_BATCH_SIZE, TRAIN_SAMPLES)
-                idx = perm[start:end]
-
-                batch_x = states_tensor[idx].to(self.device)
-                batch_y = targets_tensor[idx].to(self.device)
-
-                logits = self.model(batch_x)
-                if self.soft_targets_enabled:
-                    log_probs = torch.log_softmax(logits, dim=1)
-                    loss = -(batch_y * log_probs).sum(dim=1).mean()
-                else:
-                    loss = torch.nn.functional.cross_entropy(logits, batch_y)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                batch_size = int(batch_y.shape[0])
-                total_loss += float(loss.item()) * batch_size
-                total_seen += batch_size
-
-            epoch_loss = total_loss / max(total_seen, 1)
-            self.progress.emit(
-                {
-                    "mode": "training",
-                    "epoch": epoch,
-                    "epochs_total": self.total_train_epochs,
-                    "epoch_loss": epoch_loss,
-                }
-            )
-
-            epoch += 1
 
         self.finished.emit(
             {
-                "mode": "training",
+                "mode": "training_supervised",
                 "stopped": self._stop_requested,
-                "epochs_done": min(epoch - 1, self.total_train_epochs),
+                "epochs_done": epochs_done,
                 "epochs_target": self.total_train_epochs,
             }
         )
 
-    def _run_testing(self) -> None:
+    def _select_action_from_scores(
+        self,
+        scores: torch.Tensor,
+        deterministic: bool,
+    ) -> int:
+        if deterministic:
+            return int(torch.argmax(scores).item())
+
+        probs = torch.softmax(scores, dim=0)
+        return int(torch.multinomial(probs, num_samples=1).item())
+
+    def _run_testing_supervised(self) -> None:
         env = GridWorld(size=self.world_size, max_steps=self.max_steps)
-        self.model.eval()
+        self.supervised_agent.model.eval()
 
         current_episode = 1
         global_step = 0
@@ -426,10 +370,7 @@ class TrainingWorker(QObject):
 
                 while True:
                     state = env.get_state_image()
-                    state_tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
-
-                    logits = self.model(state_tensor)
-                    scores = logits[0].clone()
+                    scores = self.supervised_agent.predict_scores_from_state_image(state).clone()
                     current_position = (env.agent_x, env.agent_y)
 
                     if self.cycle_blocker_enabled:
@@ -441,11 +382,10 @@ class TrainingWorker(QObject):
                             forbidden_action = opposite_action[last_action]
                             scores[forbidden_action] = float("-inf")
 
-                    if self.deterministic_action_selection:
-                        action = int(torch.argmax(scores).item())
-                    else:
-                        probs = torch.softmax(scores, dim=0)
-                        action = int(torch.multinomial(probs, num_samples=1).item())
+                    action = self._select_action_from_scores(
+                        scores,
+                        deterministic=self.deterministic_action_selection,
+                    )
 
                     result = env.step(action)
                     position_history.append(current_position)
@@ -464,7 +404,7 @@ class TrainingWorker(QObject):
 
                     self.progress.emit(
                         {
-                            "mode": "testing",
+                            "mode": "testing_supervised",
                             "episode": current_episode,
                             "step": env.step_count,
                             "global_step": global_step,
@@ -502,7 +442,244 @@ class TrainingWorker(QObject):
 
         self.finished.emit(
             {
-                "mode": "testing",
+                "mode": "testing_supervised",
+                "stopped": self._stop_requested,
+                "episodes_done": episodes_done,
+                "episodes_target": self.total_test_episodes,
+                "successes": successes,
+                "success_rate": success_rate,
+                "avg_steps": avg_steps,
+            }
+        )
+
+    def _run_training_rl(self) -> None:
+        env = GridWorld(size=self.world_size, max_steps=self.max_steps)
+        current_episode = 1
+        global_step = 0
+        successes = 0
+        steps_sum = 0
+
+        while current_episode <= self.total_train_epochs and not self._stop_requested:
+            env.reset()
+            self.rl_agent.begin_episode(self.rl_history_length)
+            prev_dist = env.get_distance()
+
+            episode_actor_loss_sum = 0.0
+            episode_critic_loss_sum = 0.0
+            episode_reward_sum = 0.0
+            episode_abs_advantage_sum = 0.0
+            episode_entropy_sum = 0.0
+            episode_step_count = 0
+
+            while True:
+                if self._stop_requested:
+                    break
+
+                state = env.get_state_image()
+                action, _ = self.rl_agent.act(state, deterministic=False)
+                result = env.step(action)
+                state_after_action = env.get_state_image()
+
+                global_step += 1
+                episode_step_count += 1
+                dist = env.get_distance()
+
+                if dist < prev_dist - 1e-9:
+                    dist_trend = 1
+                elif dist > prev_dist + 1e-9:
+                    dist_trend = -1
+                else:
+                    dist_trend = 0
+
+                reward = self._compute_reward(prev_dist, dist, result.reached_goal)
+                prev_dist = dist
+
+                learning_metrics = self.rl_agent.observe_and_learn(state, action, reward)
+                actor_loss = float(learning_metrics["actor_loss"])
+                critic_loss = float(learning_metrics["critic_loss"])
+
+                episode_actor_loss_sum += actor_loss
+                episode_critic_loss_sum += critic_loss
+                episode_reward_sum += reward
+                episode_abs_advantage_sum += abs(float(learning_metrics["advantage"]))
+                episode_entropy_sum += float(learning_metrics["entropy"])
+
+                if not self.fast_mode_enabled:
+                    self.progress.emit(
+                        {
+                            "mode": "training_rl",
+                            "episode": current_episode,
+                            "step": env.step_count,
+                            "global_step": global_step,
+                            "distance": dist,
+                            "distance_trend": dist_trend,
+                            "action": action,
+                            "loss": actor_loss + critic_loss,
+                            "agent_x": env.agent_x,
+                            "agent_y": env.agent_y,
+                            "goal_x": env.goal_x,
+                            "goal_y": env.goal_y,
+                            "state_image": state_after_action,
+                            "episode_done": result.done,
+                        }
+                    )
+
+                if result.done:
+                    if result.reached_goal:
+                        successes += 1
+                    steps_sum += env.step_count
+                    break
+
+            if episode_step_count > 0:
+                avg_actor_loss = episode_actor_loss_sum / episode_step_count
+                avg_critic_loss = episode_critic_loss_sum / episode_step_count
+                avg_abs_advantage = episode_abs_advantage_sum / episode_step_count
+                avg_entropy = episode_entropy_sum / episode_step_count
+            else:
+                avg_actor_loss = 0.0
+                avg_critic_loss = 0.0
+                avg_abs_advantage = 0.0
+                avg_entropy = 0.0
+
+            self.progress.emit(
+                {
+                    "mode": "training_rl_episode",
+                    "episode": current_episode,
+                    "episodes_total": self.total_train_epochs,
+                    "avg_actor_loss": avg_actor_loss,
+                    "avg_critic_loss": avg_critic_loss,
+                    "avg_abs_advantage": avg_abs_advantage,
+                    "avg_entropy": avg_entropy,
+                    "reward_sum": episode_reward_sum,
+                }
+            )
+
+            current_episode += 1
+
+        episodes_done = min(current_episode - 1, self.total_train_epochs)
+        success_rate = 0.0
+        avg_steps = 0.0
+        if episodes_done > 0:
+            success_rate = 100.0 * successes / episodes_done
+            avg_steps = steps_sum / episodes_done
+
+        self.finished.emit(
+            {
+                "mode": "training_rl",
+                "stopped": self._stop_requested,
+                "episodes_done": episodes_done,
+                "episodes_target": self.total_train_epochs,
+                "successes": successes,
+                "success_rate": success_rate,
+                "avg_steps": avg_steps,
+            }
+        )
+
+    def _run_testing_rl(self) -> None:
+        env = GridWorld(size=self.world_size, max_steps=self.max_steps)
+        current_episode = 1
+        global_step = 0
+        successes = 0
+        steps_sum = 0
+
+        while current_episode <= self.total_test_episodes and not self._stop_requested:
+            env.reset()
+            self.rl_agent.begin_episode(self.rl_history_length)
+            prev_dist = env.get_distance()
+
+            position_history: deque[tuple[int, int]] = deque(maxlen=2)
+            last_action = None
+            opposite_action = {
+                ACTION_UP: ACTION_DOWN,
+                ACTION_DOWN: ACTION_UP,
+                ACTION_LEFT: ACTION_RIGHT,
+                ACTION_RIGHT: ACTION_LEFT,
+            }
+
+            while True:
+                if self._stop_requested:
+                    break
+
+                state = env.get_state_image()
+                action, probs = self.rl_agent.act(
+                    state,
+                    deterministic=self.deterministic_action_selection,
+                )
+                current_position = (env.agent_x, env.agent_y)
+
+                if self.cycle_blocker_enabled:
+                    if (
+                        len(position_history) == 2
+                        and current_position == position_history[0]
+                        and last_action is not None
+                    ):
+                        forbidden_action = opposite_action[last_action]
+                        probs = probs.copy()
+                        probs[forbidden_action] = 0.0
+                        probs_sum = float(probs.sum())
+                        if probs_sum > 1e-12:
+                            probs = probs / probs_sum
+
+                            if self.deterministic_action_selection:
+                                action = int(np.argmax(probs))
+                            else:
+                                action = int(np.random.choice(4, p=probs))
+
+                result = env.step(action)
+                position_history.append(current_position)
+                last_action = action
+                state_after_action = env.get_state_image()
+
+                global_step += 1
+                dist = env.get_distance()
+                if dist < prev_dist - 1e-9:
+                    dist_trend = 1
+                elif dist > prev_dist + 1e-9:
+                    dist_trend = -1
+                else:
+                    dist_trend = 0
+                prev_dist = dist
+
+                self.progress.emit(
+                    {
+                        "mode": "testing_rl",
+                        "episode": current_episode,
+                        "step": env.step_count,
+                        "global_step": global_step,
+                        "distance": dist,
+                        "distance_trend": dist_trend,
+                        "action": action,
+                        "loss": None,
+                        "agent_x": env.agent_x,
+                        "agent_y": env.agent_y,
+                        "goal_x": env.goal_x,
+                        "goal_y": env.goal_y,
+                        "state_image": state_after_action,
+                        "episode_done": result.done,
+                    }
+                )
+
+                if self.test_step_delay_ms > 0:
+                    self._sleep_with_stop(self.test_step_delay_ms)
+
+                if result.done:
+                    if result.reached_goal:
+                        successes += 1
+                    steps_sum += env.step_count
+                    break
+
+            current_episode += 1
+
+        episodes_done = min(current_episode - 1, self.total_test_episodes)
+        success_rate = 0.0
+        avg_steps = 0.0
+        if episodes_done > 0:
+            success_rate = 100.0 * successes / episodes_done
+            avg_steps = steps_sum / episodes_done
+
+        self.finished.emit(
+            {
+                "mode": "testing_rl",
                 "stopped": self._stop_requested,
                 "episodes_done": episodes_done,
                 "episodes_target": self.total_test_episodes,
@@ -600,13 +777,25 @@ class DistancePlotCanvas(FigureCanvas):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PySide6 + PyTorch: Supervised Navigation CNN Demo")
+        self.setWindowTitle("PySide6 + PyTorch: Supervised + RL Navigation Demo")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = NavigationCNN(input_size=WORLD_SIZE).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+        self.supervised_agent = SupervisedNavigationAgent(
+            world_size=WORLD_SIZE,
+            device=self.device,
+            lr=1e-3,
+        )
+        self.rl_agent = RLInteractiveAgent(
+            world_size=WORLD_SIZE,
+            device=self.device,
+            actor_lr=RL_ACTOR_LR,
+            critic_lr=RL_CRITIC_LR,
+            history_decay=RL_HISTORY_DECAY,
+            entropy_coefficient=RL_ENTROPY_COEFFICIENT,
+            advantage_clip=RL_ADVANTAGE_CLIP,
+        )
 
-        vector_len = self.model.get_feature_vector_length(WORLD_SIZE)
+        vector_len = self.supervised_agent.get_feature_vector_length()
         self.pre_flatten_shape_text = f"1D Laenge: {vector_len}"
 
         self.mode = None
@@ -618,6 +807,9 @@ class MainWindow(QMainWindow):
         self.cycle_blocker_enabled = False
         self.local_sampling_enabled = True
         self.soft_targets_enabled = False
+        # Ten recent decisions make the delayed-credit effect visible; choose
+        # N=1 in the UI for the simplest immediate-reward baseline.
+        self.rl_history_length = 10
 
         self.total_train_epochs = 0
         self.total_test_episodes = TEST_EPISODES
@@ -647,7 +839,13 @@ class MainWindow(QMainWindow):
         self.episodes_spinbox = QSpinBox()
         self.episodes_spinbox.setRange(1, 10000)
         self.episodes_spinbox.setValue(50)
-        form.addRow("Trainingsepochen:", self.episodes_spinbox)
+        form.addRow("Trainingsepochen / RL-Episoden:", self.episodes_spinbox)
+
+        self.rl_history_spinbox = QSpinBox()
+        self.rl_history_spinbox.setRange(1, 100)
+        self.rl_history_spinbox.setValue(self.rl_history_length)
+        self.rl_history_spinbox.valueChanged.connect(self.on_rl_history_length_changed)
+        form.addRow("RL History N:", self.rl_history_spinbox)
 
         self.fast_mode_checkbox = QCheckBox("Visualisierung aus (Fast Mode)")
         self.fast_mode_checkbox.setChecked(False)
@@ -676,13 +874,21 @@ class MainWindow(QMainWindow):
         self.soft_targets_checkbox.stateChanged.connect(self.on_soft_targets_changed)
         form.addRow(self.soft_targets_checkbox)
 
-        self.start_training_btn = QPushButton("Start Training")
+        self.start_training_btn = QPushButton("Train Supervised Agent")
         self.start_training_btn.clicked.connect(self.on_training_button_clicked)
         form.addRow(self.start_training_btn)
 
-        self.start_testing_btn = QPushButton("Start Testing (100 Episoden)")
-        self.start_testing_btn.clicked.connect(self.start_testing)
+        self.start_testing_btn = QPushButton("Test Supervised Agent (100 Episoden)")
+        self.start_testing_btn.clicked.connect(self.start_testing_supervised)
         form.addRow(self.start_testing_btn)
+
+        self.start_rl_training_btn = QPushButton("Train RL Agent")
+        self.start_rl_training_btn.clicked.connect(self.on_rl_training_button_clicked)
+        form.addRow(self.start_rl_training_btn)
+
+        self.start_rl_testing_btn = QPushButton("Test RL Agent (100 Episoden)")
+        self.start_rl_testing_btn.clicked.connect(self.start_testing_rl)
+        form.addRow(self.start_rl_testing_btn)
 
         self.mode_label = QLabel("Mode: idle")
         form.addRow("Status:", self.mode_label)
@@ -760,11 +966,12 @@ class MainWindow(QMainWindow):
             self.loss_label.setText(f"{loss_value:.5f}")
 
     def update_controls_state(self) -> None:
-        in_training = self.mode == "training"
-        in_testing = self.mode == "testing"
+        in_training = self.mode in {"training_supervised", "training_rl"}
+        in_testing = self.mode in {"testing_supervised", "testing_rl"}
         is_running = in_training or in_testing
 
         self.episodes_spinbox.setEnabled(not is_running)
+        self.rl_history_spinbox.setEnabled(not is_running)
 
         # Fast mode can be changed while running.
         self.fast_mode_checkbox.setEnabled(True)
@@ -773,17 +980,33 @@ class MainWindow(QMainWindow):
         self.local_sampling_checkbox.setEnabled(True)
         self.soft_targets_checkbox.setEnabled(True)
 
-        self.start_training_btn.setEnabled(not in_testing)
-        self.start_training_btn.setText("Stop Training" if in_training else "Start Training")
+        self.start_training_btn.setEnabled(self.mode in {None, "training_supervised"})
+        self.start_training_btn.setText(
+            "Stop Supervised Training"
+            if self.mode == "training_supervised"
+            else "Train Supervised Agent"
+        )
+
+        self.start_rl_training_btn.setEnabled(self.mode in {None, "training_rl"})
+        self.start_rl_training_btn.setText(
+            "Stop RL Training"
+            if self.mode == "training_rl"
+            else "Train RL Agent"
+        )
 
         # Testing can only be started when idle.
         self.start_testing_btn.setEnabled(not is_running)
+        self.start_rl_testing_btn.setEnabled(not is_running)
 
     def fast_mode(self) -> bool:
         return self.fast_mode_state
 
     def on_fast_mode_changed(self) -> None:
         self.fast_mode_state = self.fast_mode_checkbox.isChecked()
+        self.test_step_delay_ms = 0 if self.fast_mode_state else 30
+        if self.worker is not None:
+            self.worker.test_step_delay_ms = self.test_step_delay_ms
+            self.worker.fast_mode_enabled = self.fast_mode_state
 
     def on_deterministic_actions_changed(self) -> None:
         self.deterministic_action_selection = self.deterministic_actions_checkbox.isChecked()
@@ -797,28 +1020,39 @@ class MainWindow(QMainWindow):
     def on_soft_targets_changed(self) -> None:
         self.soft_targets_enabled = self.soft_targets_checkbox.isChecked()
 
+    def on_rl_history_length_changed(self) -> None:
+        self.rl_history_length = self.rl_history_spinbox.value()
+
     def on_training_button_clicked(self) -> None:
-        if self.mode == "training":
-            self.stop_training()
+        if self.mode == "training_supervised":
+            self.stop_current_training()
             return
 
         if self.mode is None:
-            self.start_training()
+            self.start_training_supervised()
 
-    def stop_training(self) -> None:
-        if self.mode != "training":
+    def on_rl_training_button_clicked(self) -> None:
+        if self.mode == "training_rl":
+            self.stop_current_training()
+            return
+
+        if self.mode is None:
+            self.start_training_rl()
+
+    def stop_current_training(self) -> None:
+        if self.mode not in {"training_supervised", "training_rl"}:
             return
 
         if self.worker is not None:
             self.worker.request_stop()
 
-    def start_training(self) -> None:
-        self.mode = "training"
+    def start_training_supervised(self) -> None:
+        self.mode = "training_supervised"
         self.total_train_epochs = self.episodes_spinbox.value()
         self.current_episode = 1
         self.global_step = 0
         self.result_label.setText("-")
-        self.mode_label.setText("Mode: training (dataset)")
+        self.mode_label.setText("Mode: training supervised")
         self.plot_canvas.reset()
         self.train_loss_text.clear()
 
@@ -826,20 +1060,49 @@ class MainWindow(QMainWindow):
         self.reset_world_visual_random()
         self.refresh_info_labels(last_action="-", dist_trend=None)
         self.step_label.setText("0")
-        self.start_worker(mode="training")
+        self.start_worker(mode="training_supervised")
 
-    def start_testing(self) -> None:
-        self.mode = "testing"
+    def start_testing_supervised(self) -> None:
+        self.mode = "testing_supervised"
         self.current_episode = 1
         self.global_step = 0
-        self.mode_label.setText("Mode: testing")
+        self.mode_label.setText("Mode: testing supervised")
         self.plot_canvas.reset()
 
         self.update_controls_state()
         self.reset_world_visual_random()
         self.refresh_info_labels(last_action="-", dist_trend=None)
         self.step_label.setText("0")
-        self.start_worker(mode="testing")
+        self.start_worker(mode="testing_supervised")
+
+    def start_training_rl(self) -> None:
+        self.mode = "training_rl"
+        self.total_train_epochs = self.episodes_spinbox.value()
+        self.current_episode = 1
+        self.global_step = 0
+        self.result_label.setText("-")
+        self.mode_label.setText("Mode: training rl")
+        self.plot_canvas.reset()
+        self.train_loss_text.clear()
+
+        self.update_controls_state()
+        self.reset_world_visual_random()
+        self.refresh_info_labels(last_action="-", dist_trend=None)
+        self.step_label.setText("0")
+        self.start_worker(mode="training_rl")
+
+    def start_testing_rl(self) -> None:
+        self.mode = "testing_rl"
+        self.current_episode = 1
+        self.global_step = 0
+        self.mode_label.setText("Mode: testing rl")
+        self.plot_canvas.reset()
+
+        self.update_controls_state()
+        self.reset_world_visual_random()
+        self.refresh_info_labels(last_action="-", dist_trend=None)
+        self.step_label.setText("0")
+        self.start_worker(mode="testing_rl")
 
     def finish_run(self) -> None:
         if self.worker_thread is not None:
@@ -857,8 +1120,8 @@ class MainWindow(QMainWindow):
             mode=mode,
             total_train_epochs=self.total_train_epochs,
             total_test_episodes=TEST_EPISODES,
-            model=self.model,
-            optimizer=self.optimizer,
+            supervised_agent=self.supervised_agent,
+            rl_agent=self.rl_agent,
             device=self.device,
             world_size=WORLD_SIZE,
             max_steps=MAX_STEPS_PER_EPISODE,
@@ -867,6 +1130,8 @@ class MainWindow(QMainWindow):
             cycle_blocker_enabled=self.cycle_blocker_enabled,
             local_sampling_enabled=self.local_sampling_enabled,
             soft_targets_enabled=self.soft_targets_enabled,
+            rl_history_length=self.rl_history_length,
+            fast_mode_enabled=self.fast_mode_state,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -878,7 +1143,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def on_worker_progress(self, payload: dict) -> None:
         mode = payload.get("mode")
-        if mode == "training":
+        if mode == "training_supervised":
             epoch = int(payload["epoch"])
             epochs_total = int(payload["epochs_total"])
             epoch_loss = float(payload["epoch_loss"])
@@ -888,6 +1153,24 @@ class MainWindow(QMainWindow):
             self.loss_label.setText(f"{epoch_loss:.5f}")
             self.train_loss_text.append(
                 f"Epoch {epoch}/{epochs_total}: {epoch_loss:.6f}"
+            )
+            return
+
+        if mode == "training_rl_episode":
+            episode = int(payload["episode"])
+            episodes_total = int(payload["episodes_total"])
+            avg_actor_loss = float(payload["avg_actor_loss"])
+            avg_critic_loss = float(payload["avg_critic_loss"])
+            avg_abs_advantage = float(payload["avg_abs_advantage"])
+            avg_entropy = float(payload["avg_entropy"])
+            reward_sum = float(payload["reward_sum"])
+            self.train_loss_text.append(
+                (
+                    f"RL Episode {episode}/{episodes_total}: "
+                    f"actor={avg_actor_loss:.6f}, critic={avg_critic_loss:.6f}, "
+                    f"|adv|={avg_abs_advantage:.4f}, entropy={avg_entropy:.4f}, "
+                    f"reward={reward_sum:.3f}"
+                )
             )
             return
 
@@ -915,27 +1198,51 @@ class MainWindow(QMainWindow):
         mode = payload.get("mode")
         stopped = bool(payload.get("stopped", False))
 
-        if mode == "training":
+        if mode == "training_supervised":
             epochs_done = int(payload.get("epochs_done", 0))
             epochs_target = int(payload.get("epochs_target", 0))
             if stopped:
                 self.result_label.setText(
-                    f"Training manuell gestoppt bei Epoche {epochs_done}."
+                    f"Supervised-Training manuell gestoppt bei Epoche {epochs_done}."
                 )
             else:
                 QMessageBox.information(
                     self,
                     "Training abgeschlossen",
-                    f"Training mit {epochs_target} Epochen abgeschlossen.",
+                    f"Supervised-Training mit {epochs_target} Epochen abgeschlossen.",
                 )
-        elif mode == "testing":
+        elif mode == "training_rl":
+            episodes_done = int(payload.get("episodes_done", 0))
+            episodes_target = int(payload.get("episodes_target", 0))
+            successes = int(payload.get("successes", 0))
+            success_rate = float(payload.get("success_rate", 0.0))
+            avg_steps = float(payload.get("avg_steps", 0.0))
+
+            self.result_label.setText(
+                f"RL Training (Erfolge): {successes}/{episodes_done} ({success_rate:.1f}%), avg Steps: {avg_steps:.1f}"
+            )
+
+            if not stopped:
+                QMessageBox.information(
+                    self,
+                    "RL-Training abgeschlossen",
+                    (
+                        f"RL-Training mit {episodes_target} Episoden abgeschlossen.\n"
+                        f"Erfolge: {successes}/{episodes_done} ({success_rate:.1f}%)\n"
+                        f"Durchschnittliche Schritte: {avg_steps:.1f}"
+                    ),
+                )
+
+        elif mode in {"testing_supervised", "testing_rl"}:
             successes = int(payload.get("successes", 0))
             episodes_done = int(payload.get("episodes_done", 0))
             success_rate = float(payload.get("success_rate", 0.0))
             avg_steps = float(payload.get("avg_steps", 0.0))
 
+            label_prefix = "Supervised" if mode == "testing_supervised" else "RL"
+
             self.result_label.setText(
-                f"Erfolg: {successes}/{episodes_done} "
+                f"{label_prefix} Erfolg: {successes}/{episodes_done} "
                 f"({success_rate:.1f}%), avg Steps: {avg_steps:.1f}"
             )
 
@@ -944,7 +1251,7 @@ class MainWindow(QMainWindow):
                     self,
                     "Testing abgeschlossen",
                     (
-                        f"Erfolgsrate: {successes}/{episodes_done} "
+                        f"{label_prefix} Erfolgsrate: {successes}/{episodes_done} "
                         f"({success_rate:.1f}%)\n"
                         f"Durchschnittliche Schritte: {avg_steps:.1f}"
                     ),
