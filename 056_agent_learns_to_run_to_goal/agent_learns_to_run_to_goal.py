@@ -1,12 +1,36 @@
 import math
+import os
 import random
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
-import torch
+
+# A file manager, IDE, or plain ``python ...`` may start this file with the
+# Conda base interpreter, which does not contain PyTorch in this installation.
+# Restart once with the project's teaching environment instead of immediately
+# disappearing with "ModuleNotFoundError: torch".
+try:
+    import torch
+except ModuleNotFoundError as import_error:
+    teaching_python = (
+        Path.home() / "miniconda3" / "envs" / "env_teaching" / "bin" / "python"
+    )
+    current_python = Path(sys.executable).resolve()
+    if (
+        import_error.name == "torch"
+        and teaching_python.is_file()
+        and current_python != teaching_python.resolve()
+    ):
+        os.execv(
+            str(teaching_python),
+            [str(teaching_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+    raise
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -40,13 +64,12 @@ GOAL_MARKER_SIZE = 3
 LOCAL_SAMPLE_PROBABILITY = 0.6
 LOCAL_RADIUS = 6
 
-# RL hyperparameters.  These are intentionally collected here so the
-# experiment can be changed without touching the agent implementation.
-RL_ACTOR_LR = 3e-4
-RL_CRITIC_LR = 1e-3
-RL_HISTORY_DECAY = 0.90
-RL_ENTROPY_COEFFICIENT = 0.01
-RL_ADVANTAGE_CLIP = 2.0
+# RL-by-supervised-learning hyperparameters.
+RL_LEARNING_RATE = 1e-3
+RL_WARMUP_SAMPLES = 1000
+RL_BATCH_SIZE = 32
+RL_REPLAY_CAPACITY = 10_000
+RL_EXPLORATION_EPSILON = 0.10
 
 ACTION_UP = 0
 ACTION_DOWN = 1
@@ -259,7 +282,6 @@ class TrainingWorker(QObject):
         cycle_blocker_enabled: bool,
         local_sampling_enabled: bool,
         soft_targets_enabled: bool,
-        rl_history_length: int,
         fast_mode_enabled: bool,
     ):
         super().__init__()
@@ -276,7 +298,6 @@ class TrainingWorker(QObject):
         self.cycle_blocker_enabled = cycle_blocker_enabled
         self.local_sampling_enabled = local_sampling_enabled
         self.soft_targets_enabled = soft_targets_enabled
-        self.rl_history_length = max(1, rl_history_length)
         self.fast_mode_enabled = fast_mode_enabled
         self._stop_requested = False
 
@@ -461,15 +482,12 @@ class TrainingWorker(QObject):
 
         while current_episode <= self.total_train_epochs and not self._stop_requested:
             env.reset()
-            self.rl_agent.begin_episode(self.rl_history_length)
+            self.rl_agent.begin_episode()
             prev_dist = env.get_distance()
 
-            episode_actor_loss_sum = 0.0
-            episode_critic_loss_sum = 0.0
+            episode_loss_sum = 0.0
             episode_reward_sum = 0.0
-            episode_abs_advantage_sum = 0.0
-            episode_entropy_sum = 0.0
-            episode_step_count = 0
+            episode_training_steps = 0
 
             while True:
                 if self._stop_requested:
@@ -481,7 +499,6 @@ class TrainingWorker(QObject):
                 state_after_action = env.get_state_image()
 
                 global_step += 1
-                episode_step_count += 1
                 dist = env.get_distance()
 
                 if dist < prev_dist - 1e-9:
@@ -495,14 +512,11 @@ class TrainingWorker(QObject):
                 prev_dist = dist
 
                 learning_metrics = self.rl_agent.observe_and_learn(state, action, reward)
-                actor_loss = float(learning_metrics["actor_loss"])
-                critic_loss = float(learning_metrics["critic_loss"])
-
-                episode_actor_loss_sum += actor_loss
-                episode_critic_loss_sum += critic_loss
+                loss = float(learning_metrics["loss"])
+                if learning_metrics["trained"]:
+                    episode_loss_sum += loss
+                    episode_training_steps += 1
                 episode_reward_sum += reward
-                episode_abs_advantage_sum += abs(float(learning_metrics["advantage"]))
-                episode_entropy_sum += float(learning_metrics["entropy"])
 
                 if not self.fast_mode_enabled:
                     self.progress.emit(
@@ -514,7 +528,7 @@ class TrainingWorker(QObject):
                             "distance": dist,
                             "distance_trend": dist_trend,
                             "action": action,
-                            "loss": actor_loss + critic_loss,
+                            "loss": loss if learning_metrics["trained"] else None,
                             "agent_x": env.agent_x,
                             "agent_y": env.agent_y,
                             "goal_x": env.goal_x,
@@ -523,6 +537,11 @@ class TrainingWorker(QObject):
                             "episode_done": result.done,
                         }
                     )
+                    # In visualization mode, pace the producer so the Qt event
+                    # queue cannot fill with hundreds of stale step updates.
+                    # Fast mode deliberately skips both signal and delay.
+                    if self.test_step_delay_ms > 0:
+                        self._sleep_with_stop(self.test_step_delay_ms)
 
                 if result.done:
                     if result.reached_goal:
@@ -530,26 +549,17 @@ class TrainingWorker(QObject):
                     steps_sum += env.step_count
                     break
 
-            if episode_step_count > 0:
-                avg_actor_loss = episode_actor_loss_sum / episode_step_count
-                avg_critic_loss = episode_critic_loss_sum / episode_step_count
-                avg_abs_advantage = episode_abs_advantage_sum / episode_step_count
-                avg_entropy = episode_entropy_sum / episode_step_count
-            else:
-                avg_actor_loss = 0.0
-                avg_critic_loss = 0.0
-                avg_abs_advantage = 0.0
-                avg_entropy = 0.0
+            avg_loss = episode_loss_sum / max(episode_training_steps, 1)
 
             self.progress.emit(
                 {
                     "mode": "training_rl_episode",
                     "episode": current_episode,
                     "episodes_total": self.total_train_epochs,
-                    "avg_actor_loss": avg_actor_loss,
-                    "avg_critic_loss": avg_critic_loss,
-                    "avg_abs_advantage": avg_abs_advantage,
-                    "avg_entropy": avg_entropy,
+                    "avg_loss": avg_loss,
+                    "training_steps": self.rl_agent.training_steps,
+                    "replay_size": len(self.rl_agent.replay_buffer),
+                    "warmup_samples": self.rl_agent.warmup_samples,
                     "reward_sum": episode_reward_sum,
                 }
             )
@@ -584,7 +594,7 @@ class TrainingWorker(QObject):
 
         while current_episode <= self.total_test_episodes and not self._stop_requested:
             env.reset()
-            self.rl_agent.begin_episode(self.rl_history_length)
+            self.rl_agent.begin_episode()
             prev_dist = env.get_distance()
 
             position_history: deque[tuple[int, int]] = deque(maxlen=2)
@@ -701,7 +711,9 @@ class WorldWidget(QWidget):
         if state_image.shape != (3, self.world_size, self.world_size):
             return
         self.state_image = np.asarray(state_image, dtype=np.float32)
-        self.repaint()
+        # update() coalesces multiple pending paint requests. repaint() would
+        # block immediately and makes the whole UI sluggish during training.
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -718,23 +730,32 @@ class WorldWidget(QWidget):
 
         pixel_size = max(2, int(math.ceil(cell)))
 
-        # Render exactly what the model sees: RGB values from state_image channels.
-        for gy in range(self.world_size):
-            for gx in range(self.world_size):
-                r = int(np.clip(self.state_image[0, gy, gx], 0.0, 1.0) * 255.0)
-                g = int(np.clip(self.state_image[1, gy, gx], 0.0, 1.0) * 255.0)
-                b = int(np.clip(self.state_image[2, gy, gx], 0.0, 1.0) * 255.0)
-                if r == 0 and g == 0 and b == 0:
-                    continue
-
-                px = int(ox + gx * cell)
-                py = int(oy + gy * cell)
-                painter.fillRect(px, py, pixel_size, pixel_size, QColor(r, g, b))
+        # Render exactly what the model sees, but iterate only over colored
+        # pixels.  A state normally has about 18 such pixels, not 2,500.
+        rgb_image = np.moveaxis(
+            np.clip(self.state_image, 0.0, 1.0),
+            0,
+            2,
+        )
+        colored_pixels = np.argwhere(np.any(rgb_image > 0.0, axis=2))
+        for gy, gx in colored_pixels:
+            r, g, b = (rgb_image[gy, gx] * 255.0).astype(np.uint8)
+            px = int(ox + gx * cell)
+            py = int(oy + gy * cell)
+            painter.fillRect(
+                px,
+                py,
+                pixel_size,
+                pixel_size,
+                QColor(int(r), int(g), int(b)),
+            )
 
 
 class DistancePlotCanvas(FigureCanvas):
+    MAX_VISIBLE_POINTS = 500
+
     def __init__(self, parent=None):
-        self.figure = Figure(figsize=(5, 3), tight_layout=True)
+        self.figure = Figure(figsize=(5, 3))
         self.ax = self.figure.add_subplot(111)
         super().__init__(self.figure)
         self.setParent(parent)
@@ -742,36 +763,42 @@ class DistancePlotCanvas(FigureCanvas):
         self.steps = []
         self.trends = []
 
-        self.ax.set_title("Distanztrend pro Step")
+        self.line = None
+        self._configure_axes()
+
+    def _configure_axes(self) -> None:
+        self.ax.set_title("Distanztrend pro Step (letzte 500)")
         self.ax.set_xlabel("Globaler Step")
         self.ax.set_ylabel("Trend (-1/0/1)")
+        self.ax.set_ylim(-1.2, 1.2)
+        self.ax.set_yticks([-1, 0, 1])
         self.ax.grid(True, alpha=0.3)
+        (self.line,) = self.ax.plot([], [], color="tab:blue", linewidth=1.2)
 
     def reset(self) -> None:
         self.steps.clear()
         self.trends.clear()
         self.ax.clear()
-        self.ax.set_title("Distanztrend pro Step")
-        self.ax.set_xlabel("Globaler Step")
-        self.ax.set_ylabel("Trend (-1/0/1)")
-        self.ax.set_ylim(-1.2, 1.2)
-        self.ax.set_yticks([-1, 0, 1])
-        self.ax.grid(True, alpha=0.3)
+        self._configure_axes()
         self.draw_idle()
 
-    def add_point(self, step: int, trend: int) -> None:
+    def add_point(self, step: int, trend: int, redraw: bool = True) -> None:
         self.steps.append(step)
         self.trends.append(trend)
-        self.ax.clear()
-        self.ax.plot(self.steps, self.trends, color="tab:blue", linewidth=1.2)
-        self.ax.set_title("Distanztrend pro Step")
-        self.ax.set_xlabel("Globaler Step")
-        self.ax.set_ylabel("Trend (-1/0/1)")
-        self.ax.set_ylim(-1.2, 1.2)
-        self.ax.set_yticks([-1, 0, 1])
-        self.ax.grid(True, alpha=0.3)
 
-        self.draw()
+        visible_steps = self.steps[-self.MAX_VISIBLE_POINTS :]
+        visible_trends = self.trends[-self.MAX_VISIBLE_POINTS :]
+        self.line.set_data(visible_steps, visible_trends)
+
+        if visible_steps:
+            x_min = visible_steps[0]
+            x_max = max(visible_steps[-1], x_min + 1)
+            self.ax.set_xlim(x_min, x_max)
+
+        if redraw:
+            # draw_idle() schedules and coalesces rendering in Qt's event loop
+            # instead of synchronously blocking on every simulation step.
+            self.draw_idle()
 
 
 class MainWindow(QMainWindow):
@@ -788,11 +815,11 @@ class MainWindow(QMainWindow):
         self.rl_agent = RLInteractiveAgent(
             world_size=WORLD_SIZE,
             device=self.device,
-            actor_lr=RL_ACTOR_LR,
-            critic_lr=RL_CRITIC_LR,
-            history_decay=RL_HISTORY_DECAY,
-            entropy_coefficient=RL_ENTROPY_COEFFICIENT,
-            advantage_clip=RL_ADVANTAGE_CLIP,
+            lr=RL_LEARNING_RATE,
+            warmup_samples=RL_WARMUP_SAMPLES,
+            batch_size=RL_BATCH_SIZE,
+            replay_capacity=RL_REPLAY_CAPACITY,
+            exploration_epsilon=RL_EXPLORATION_EPSILON,
         )
 
         vector_len = self.supervised_agent.get_feature_vector_length()
@@ -807,10 +834,6 @@ class MainWindow(QMainWindow):
         self.cycle_blocker_enabled = False
         self.local_sampling_enabled = True
         self.soft_targets_enabled = False
-        # Ten recent decisions make the delayed-credit effect visible; choose
-        # N=1 in the UI for the simplest immediate-reward baseline.
-        self.rl_history_length = 10
-
         self.total_train_epochs = 0
         self.total_test_episodes = TEST_EPISODES
         self.current_episode = 0
@@ -840,12 +863,6 @@ class MainWindow(QMainWindow):
         self.episodes_spinbox.setRange(1, 10000)
         self.episodes_spinbox.setValue(50)
         form.addRow("Trainingsepochen / RL-Episoden:", self.episodes_spinbox)
-
-        self.rl_history_spinbox = QSpinBox()
-        self.rl_history_spinbox.setRange(1, 100)
-        self.rl_history_spinbox.setValue(self.rl_history_length)
-        self.rl_history_spinbox.valueChanged.connect(self.on_rl_history_length_changed)
-        form.addRow("RL History N:", self.rl_history_spinbox)
 
         self.fast_mode_checkbox = QCheckBox("Visualisierung aus (Fast Mode)")
         self.fast_mode_checkbox.setChecked(False)
@@ -971,8 +988,6 @@ class MainWindow(QMainWindow):
         is_running = in_training or in_testing
 
         self.episodes_spinbox.setEnabled(not is_running)
-        self.rl_history_spinbox.setEnabled(not is_running)
-
         # Fast mode can be changed while running.
         self.fast_mode_checkbox.setEnabled(True)
         self.deterministic_actions_checkbox.setEnabled(True)
@@ -1019,9 +1034,6 @@ class MainWindow(QMainWindow):
 
     def on_soft_targets_changed(self) -> None:
         self.soft_targets_enabled = self.soft_targets_checkbox.isChecked()
-
-    def on_rl_history_length_changed(self) -> None:
-        self.rl_history_length = self.rl_history_spinbox.value()
 
     def on_training_button_clicked(self) -> None:
         if self.mode == "training_supervised":
@@ -1130,7 +1142,6 @@ class MainWindow(QMainWindow):
             cycle_blocker_enabled=self.cycle_blocker_enabled,
             local_sampling_enabled=self.local_sampling_enabled,
             soft_targets_enabled=self.soft_targets_enabled,
-            rl_history_length=self.rl_history_length,
             fast_mode_enabled=self.fast_mode_state,
         )
         self.worker.moveToThread(self.worker_thread)
@@ -1159,16 +1170,16 @@ class MainWindow(QMainWindow):
         if mode == "training_rl_episode":
             episode = int(payload["episode"])
             episodes_total = int(payload["episodes_total"])
-            avg_actor_loss = float(payload["avg_actor_loss"])
-            avg_critic_loss = float(payload["avg_critic_loss"])
-            avg_abs_advantage = float(payload["avg_abs_advantage"])
-            avg_entropy = float(payload["avg_entropy"])
+            avg_loss = float(payload["avg_loss"])
+            training_steps = int(payload["training_steps"])
+            replay_size = int(payload["replay_size"])
+            warmup_samples = int(payload["warmup_samples"])
             reward_sum = float(payload["reward_sum"])
             self.train_loss_text.append(
                 (
                     f"RL Episode {episode}/{episodes_total}: "
-                    f"actor={avg_actor_loss:.6f}, critic={avg_critic_loss:.6f}, "
-                    f"|adv|={avg_abs_advantage:.4f}, entropy={avg_entropy:.4f}, "
+                    f"loss={avg_loss:.6f}, replay={replay_size}/{warmup_samples}, "
+                    f"updates={training_steps}, "
                     f"reward={reward_sum:.3f}"
                 )
             )
@@ -1186,7 +1197,13 @@ class MainWindow(QMainWindow):
             self.world_widget.set_state_image(state_image)
 
         self.step_label.setText(str(step_in_episode))
-        self.plot_canvas.add_point(self.global_step, dist_trend)
+        episode_done = bool(payload.get("episode_done", False))
+        redraw_plot = self.global_step % 5 == 0 or episode_done
+        self.plot_canvas.add_point(
+            self.global_step,
+            dist_trend,
+            redraw=redraw_plot,
+        )
         self.refresh_info_labels(
             last_action=ACTION_NAMES[action],
             loss_value=loss_value,
