@@ -38,6 +38,7 @@ from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from agent_rl import RLInteractiveAgent
+from agent_rl_td import TDTargetNavigationAgent
 from agent_supervised import SupervisedNavigationAgent
 
 
@@ -70,6 +72,23 @@ RL_WARMUP_SAMPLES = 1000
 RL_BATCH_SIZE = 32
 RL_REPLAY_CAPACITY = 10_000
 RL_EXPLORATION_EPSILON = 0.10
+
+TD_LEARNING_RATE = 1e-3
+TD_GAMMA = 0.99
+TD_WARMUP_SAMPLES = 1000
+TD_BATCH_SIZE = 32
+TD_REPLAY_CAPACITY = 10_000
+TD_EXPLORATION_EPSILON = 0.10
+TD_TARGET_UPDATE_INTERVAL = 250
+
+AGENT_SUPERVISED = "supervised"
+AGENT_RL_1STEP = "rl_1step"
+AGENT_RL_TD = "rl_td"
+AGENT_DISPLAY_NAMES = {
+    AGENT_SUPERVISED: "Supervised Agent",
+    AGENT_RL_1STEP: "RL Agent mit 1 Step Reinforcement",
+    AGENT_RL_TD: "RL Agent mit TD-Targets",
+}
 
 ACTION_UP = 0
 ACTION_DOWN = 1
@@ -272,8 +291,10 @@ class TrainingWorker(QObject):
         mode: str,
         total_train_epochs: int,
         total_test_episodes: int,
+        agent_kind: str,
         supervised_agent: SupervisedNavigationAgent,
         rl_agent: RLInteractiveAgent,
+        td_agent: TDTargetNavigationAgent,
         device: torch.device,
         world_size: int,
         max_steps: int,
@@ -288,8 +309,10 @@ class TrainingWorker(QObject):
         self.mode = mode
         self.total_train_epochs = total_train_epochs
         self.total_test_episodes = total_test_episodes
+        self.agent_kind = agent_kind
         self.supervised_agent = supervised_agent
         self.rl_agent = rl_agent
+        self.td_agent = td_agent
         self.device = device
         self.world_size = world_size
         self.max_steps = max_steps
@@ -334,6 +357,11 @@ class TrainingWorker(QObject):
             reward += 1.0
         return reward
 
+    def _active_rl_agent(self) -> RLInteractiveAgent | TDTargetNavigationAgent:
+        if self.agent_kind == AGENT_RL_TD:
+            return self.td_agent
+        return self.rl_agent
+
     def _run_training_supervised(self) -> None:
         epochs_done = self.supervised_agent.train(
             total_epochs=self.total_train_epochs,
@@ -350,6 +378,7 @@ class TrainingWorker(QObject):
         self.finished.emit(
             {
                 "mode": "training_supervised",
+                "agent_kind": self.agent_kind,
                 "stopped": self._stop_requested,
                 "epochs_done": epochs_done,
                 "epochs_target": self.total_train_epochs,
@@ -464,6 +493,7 @@ class TrainingWorker(QObject):
         self.finished.emit(
             {
                 "mode": "testing_supervised",
+                "agent_kind": self.agent_kind,
                 "stopped": self._stop_requested,
                 "episodes_done": episodes_done,
                 "episodes_target": self.total_test_episodes,
@@ -475,6 +505,7 @@ class TrainingWorker(QObject):
 
     def _run_training_rl(self) -> None:
         env = GridWorld(size=self.world_size, max_steps=self.max_steps)
+        active_agent = self._active_rl_agent()
         current_episode = 1
         global_step = 0
         successes = 0
@@ -482,7 +513,7 @@ class TrainingWorker(QObject):
 
         while current_episode <= self.total_train_epochs and not self._stop_requested:
             env.reset()
-            self.rl_agent.begin_episode()
+            active_agent.begin_episode()
             prev_dist = env.get_distance()
 
             episode_loss_sum = 0.0
@@ -494,7 +525,7 @@ class TrainingWorker(QObject):
                     break
 
                 state = env.get_state_image()
-                action, _ = self.rl_agent.act(state, deterministic=False)
+                action, _ = active_agent.act(state, deterministic=False)
                 result = env.step(action)
                 state_after_action = env.get_state_image()
 
@@ -508,10 +539,27 @@ class TrainingWorker(QObject):
                 else:
                     dist_trend = 0
 
-                reward = self._compute_reward(prev_dist, dist, result.reached_goal)
+                if self.agent_kind == AGENT_RL_TD:
+                    # Truly sparse reward: only reaching the goal is rewarded.
+                    reward = 1.0 if result.reached_goal else 0.0
+                else:
+                    reward = self._compute_reward(prev_dist, dist, result.reached_goal)
                 prev_dist = dist
 
-                learning_metrics = self.rl_agent.observe_and_learn(state, action, reward)
+                if self.agent_kind == AGENT_RL_TD:
+                    learning_metrics = active_agent.observe_and_learn(
+                        state,
+                        action,
+                        reward,
+                        state_after_action,
+                        result.done,
+                    )
+                else:
+                    learning_metrics = active_agent.observe_and_learn(
+                        state,
+                        action,
+                        reward,
+                    )
                 loss = float(learning_metrics["loss"])
                 if learning_metrics["trained"]:
                     episode_loss_sum += loss
@@ -522,6 +570,7 @@ class TrainingWorker(QObject):
                     self.progress.emit(
                         {
                             "mode": "training_rl",
+                            "agent_kind": self.agent_kind,
                             "episode": current_episode,
                             "step": env.step_count,
                             "global_step": global_step,
@@ -554,12 +603,14 @@ class TrainingWorker(QObject):
             self.progress.emit(
                 {
                     "mode": "training_rl_episode",
+                    "agent_kind": self.agent_kind,
                     "episode": current_episode,
                     "episodes_total": self.total_train_epochs,
                     "avg_loss": avg_loss,
-                    "training_steps": self.rl_agent.training_steps,
-                    "replay_size": len(self.rl_agent.replay_buffer),
-                    "warmup_samples": self.rl_agent.warmup_samples,
+                    "training_steps": active_agent.training_steps,
+                    "replay_size": len(active_agent.replay_buffer),
+                    "warmup_samples": active_agent.warmup_samples,
+                    "target_updates": getattr(active_agent, "target_updates", 0),
                     "reward_sum": episode_reward_sum,
                 }
             )
@@ -576,6 +627,7 @@ class TrainingWorker(QObject):
         self.finished.emit(
             {
                 "mode": "training_rl",
+                "agent_kind": self.agent_kind,
                 "stopped": self._stop_requested,
                 "episodes_done": episodes_done,
                 "episodes_target": self.total_train_epochs,
@@ -587,6 +639,7 @@ class TrainingWorker(QObject):
 
     def _run_testing_rl(self) -> None:
         env = GridWorld(size=self.world_size, max_steps=self.max_steps)
+        active_agent = self._active_rl_agent()
         current_episode = 1
         global_step = 0
         successes = 0
@@ -594,7 +647,7 @@ class TrainingWorker(QObject):
 
         while current_episode <= self.total_test_episodes and not self._stop_requested:
             env.reset()
-            self.rl_agent.begin_episode()
+            active_agent.begin_episode()
             prev_dist = env.get_distance()
 
             position_history: deque[tuple[int, int]] = deque(maxlen=2)
@@ -611,7 +664,7 @@ class TrainingWorker(QObject):
                     break
 
                 state = env.get_state_image()
-                action, probs = self.rl_agent.act(
+                action, probs = active_agent.act(
                     state,
                     deterministic=self.deterministic_action_selection,
                 )
@@ -653,6 +706,7 @@ class TrainingWorker(QObject):
                 self.progress.emit(
                     {
                         "mode": "testing_rl",
+                        "agent_kind": self.agent_kind,
                         "episode": current_episode,
                         "step": env.step_count,
                         "global_step": global_step,
@@ -690,6 +744,7 @@ class TrainingWorker(QObject):
         self.finished.emit(
             {
                 "mode": "testing_rl",
+                "agent_kind": self.agent_kind,
                 "stopped": self._stop_requested,
                 "episodes_done": episodes_done,
                 "episodes_target": self.total_test_episodes,
@@ -821,11 +876,23 @@ class MainWindow(QMainWindow):
             replay_capacity=RL_REPLAY_CAPACITY,
             exploration_epsilon=RL_EXPLORATION_EPSILON,
         )
+        self.td_agent = TDTargetNavigationAgent(
+            world_size=WORLD_SIZE,
+            device=self.device,
+            lr=TD_LEARNING_RATE,
+            gamma=TD_GAMMA,
+            warmup_samples=TD_WARMUP_SAMPLES,
+            batch_size=TD_BATCH_SIZE,
+            replay_capacity=TD_REPLAY_CAPACITY,
+            exploration_epsilon=TD_EXPLORATION_EPSILON,
+            target_update_interval=TD_TARGET_UPDATE_INTERVAL,
+        )
 
         vector_len = self.supervised_agent.get_feature_vector_length()
         self.pre_flatten_shape_text = f"1D Laenge: {vector_len}"
 
         self.mode = None
+        self.active_agent_kind = AGENT_SUPERVISED
         self.worker_thread = None
         self.worker = None
 
@@ -859,10 +926,15 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
 
+        self.agent_combobox = QComboBox()
+        for agent_kind, display_name in AGENT_DISPLAY_NAMES.items():
+            self.agent_combobox.addItem(display_name, agent_kind)
+        form.addRow("Agent:", self.agent_combobox)
+
         self.episodes_spinbox = QSpinBox()
         self.episodes_spinbox.setRange(1, 10000)
         self.episodes_spinbox.setValue(50)
-        form.addRow("Trainingsepochen / RL-Episoden:", self.episodes_spinbox)
+        form.addRow("Anzahl Epochen / Episoden:", self.episodes_spinbox)
 
         self.fast_mode_checkbox = QCheckBox("Visualisierung aus (Fast Mode)")
         self.fast_mode_checkbox.setChecked(False)
@@ -891,21 +963,13 @@ class MainWindow(QMainWindow):
         self.soft_targets_checkbox.stateChanged.connect(self.on_soft_targets_changed)
         form.addRow(self.soft_targets_checkbox)
 
-        self.start_training_btn = QPushButton("Train Supervised Agent")
+        self.start_training_btn = QPushButton("Training")
         self.start_training_btn.clicked.connect(self.on_training_button_clicked)
         form.addRow(self.start_training_btn)
 
-        self.start_testing_btn = QPushButton("Test Supervised Agent (100 Episoden)")
-        self.start_testing_btn.clicked.connect(self.start_testing_supervised)
+        self.start_testing_btn = QPushButton("Testing")
+        self.start_testing_btn.clicked.connect(self.on_testing_button_clicked)
         form.addRow(self.start_testing_btn)
-
-        self.start_rl_training_btn = QPushButton("Train RL Agent")
-        self.start_rl_training_btn.clicked.connect(self.on_rl_training_button_clicked)
-        form.addRow(self.start_rl_training_btn)
-
-        self.start_rl_testing_btn = QPushButton("Test RL Agent (100 Episoden)")
-        self.start_rl_testing_btn.clicked.connect(self.start_testing_rl)
-        form.addRow(self.start_rl_testing_btn)
 
         self.mode_label = QLabel("Mode: idle")
         form.addRow("Status:", self.mode_label)
@@ -931,7 +995,7 @@ class MainWindow(QMainWindow):
         self.train_loss_text = QTextEdit()
         self.train_loss_text.setReadOnly(True)
         self.train_loss_text.setMinimumHeight(140)
-        form.addRow("Loss pro Epoche:", self.train_loss_text)
+        form.addRow("Trainingsverlauf:", self.train_loss_text)
 
         self.result_label = QLabel("-")
         self.result_label.setWordWrap(True)
@@ -987,6 +1051,7 @@ class MainWindow(QMainWindow):
         in_testing = self.mode in {"testing_supervised", "testing_rl"}
         is_running = in_training or in_testing
 
+        self.agent_combobox.setEnabled(not is_running)
         self.episodes_spinbox.setEnabled(not is_running)
         # Fast mode can be changed while running.
         self.fast_mode_checkbox.setEnabled(True)
@@ -995,23 +1060,15 @@ class MainWindow(QMainWindow):
         self.local_sampling_checkbox.setEnabled(True)
         self.soft_targets_checkbox.setEnabled(True)
 
-        self.start_training_btn.setEnabled(self.mode in {None, "training_supervised"})
+        self.start_training_btn.setEnabled(not in_testing)
         self.start_training_btn.setText(
-            "Stop Supervised Training"
-            if self.mode == "training_supervised"
-            else "Train Supervised Agent"
+            "Training stoppen" if in_training else "Training"
         )
 
-        self.start_rl_training_btn.setEnabled(self.mode in {None, "training_rl"})
-        self.start_rl_training_btn.setText(
-            "Stop RL Training"
-            if self.mode == "training_rl"
-            else "Train RL Agent"
+        self.start_testing_btn.setEnabled(not in_training)
+        self.start_testing_btn.setText(
+            "Testing stoppen" if in_testing else "Testing"
         )
-
-        # Testing can only be started when idle.
-        self.start_testing_btn.setEnabled(not is_running)
-        self.start_rl_testing_btn.setEnabled(not is_running)
 
     def fast_mode(self) -> bool:
         return self.fast_mode_state
@@ -1036,35 +1093,44 @@ class MainWindow(QMainWindow):
         self.soft_targets_enabled = self.soft_targets_checkbox.isChecked()
 
     def on_training_button_clicked(self) -> None:
-        if self.mode == "training_supervised":
-            self.stop_current_training()
+        if self.mode in {"training_supervised", "training_rl"}:
+            self.stop_current_run()
             return
 
         if self.mode is None:
-            self.start_training_supervised()
+            self.start_training()
 
-    def on_rl_training_button_clicked(self) -> None:
-        if self.mode == "training_rl":
-            self.stop_current_training()
+    def on_testing_button_clicked(self) -> None:
+        if self.mode in {"testing_supervised", "testing_rl"}:
+            self.stop_current_run()
             return
 
         if self.mode is None:
-            self.start_training_rl()
+            self.start_testing()
 
-    def stop_current_training(self) -> None:
-        if self.mode not in {"training_supervised", "training_rl"}:
+    def stop_current_run(self) -> None:
+        if self.mode is None:
             return
 
         if self.worker is not None:
             self.worker.request_stop()
 
-    def start_training_supervised(self) -> None:
-        self.mode = "training_supervised"
+    def selected_agent_kind(self) -> str:
+        return str(self.agent_combobox.currentData())
+
+    def start_training(self) -> None:
+        self.active_agent_kind = self.selected_agent_kind()
+        if self.active_agent_kind == AGENT_SUPERVISED:
+            self.mode = "training_supervised"
+        else:
+            self.mode = "training_rl"
+
         self.total_train_epochs = self.episodes_spinbox.value()
         self.current_episode = 1
         self.global_step = 0
         self.result_label.setText("-")
-        self.mode_label.setText("Mode: training supervised")
+        agent_name = AGENT_DISPLAY_NAMES[self.active_agent_kind]
+        self.mode_label.setText(f"Mode: Training – {agent_name}")
         self.plot_canvas.reset()
         self.train_loss_text.clear()
 
@@ -1072,49 +1138,28 @@ class MainWindow(QMainWindow):
         self.reset_world_visual_random()
         self.refresh_info_labels(last_action="-", dist_trend=None)
         self.step_label.setText("0")
-        self.start_worker(mode="training_supervised")
+        self.start_worker(mode=self.mode)
 
-    def start_testing_supervised(self) -> None:
-        self.mode = "testing_supervised"
-        self.current_episode = 1
-        self.global_step = 0
-        self.mode_label.setText("Mode: testing supervised")
-        self.plot_canvas.reset()
+    def start_testing(self) -> None:
+        self.active_agent_kind = self.selected_agent_kind()
+        if self.active_agent_kind == AGENT_SUPERVISED:
+            self.mode = "testing_supervised"
+        else:
+            self.mode = "testing_rl"
 
-        self.update_controls_state()
-        self.reset_world_visual_random()
-        self.refresh_info_labels(last_action="-", dist_trend=None)
-        self.step_label.setText("0")
-        self.start_worker(mode="testing_supervised")
-
-    def start_training_rl(self) -> None:
-        self.mode = "training_rl"
-        self.total_train_epochs = self.episodes_spinbox.value()
+        self.total_test_episodes = self.episodes_spinbox.value()
         self.current_episode = 1
         self.global_step = 0
         self.result_label.setText("-")
-        self.mode_label.setText("Mode: training rl")
-        self.plot_canvas.reset()
-        self.train_loss_text.clear()
-
-        self.update_controls_state()
-        self.reset_world_visual_random()
-        self.refresh_info_labels(last_action="-", dist_trend=None)
-        self.step_label.setText("0")
-        self.start_worker(mode="training_rl")
-
-    def start_testing_rl(self) -> None:
-        self.mode = "testing_rl"
-        self.current_episode = 1
-        self.global_step = 0
-        self.mode_label.setText("Mode: testing rl")
+        agent_name = AGENT_DISPLAY_NAMES[self.active_agent_kind]
+        self.mode_label.setText(f"Mode: Testing – {agent_name}")
         self.plot_canvas.reset()
 
         self.update_controls_state()
         self.reset_world_visual_random()
         self.refresh_info_labels(last_action="-", dist_trend=None)
         self.step_label.setText("0")
-        self.start_worker(mode="testing_rl")
+        self.start_worker(mode=self.mode)
 
     def finish_run(self) -> None:
         if self.worker_thread is not None:
@@ -1131,9 +1176,11 @@ class MainWindow(QMainWindow):
         self.worker = TrainingWorker(
             mode=mode,
             total_train_epochs=self.total_train_epochs,
-            total_test_episodes=TEST_EPISODES,
+            total_test_episodes=self.total_test_episodes,
+            agent_kind=self.active_agent_kind,
             supervised_agent=self.supervised_agent,
             rl_agent=self.rl_agent,
+            td_agent=self.td_agent,
             device=self.device,
             world_size=WORLD_SIZE,
             max_steps=MAX_STEPS_PER_EPISODE,
@@ -1168,18 +1215,26 @@ class MainWindow(QMainWindow):
             return
 
         if mode == "training_rl_episode":
+            agent_kind = str(payload.get("agent_kind", AGENT_RL_1STEP))
+            agent_name = AGENT_DISPLAY_NAMES[agent_kind]
             episode = int(payload["episode"])
             episodes_total = int(payload["episodes_total"])
             avg_loss = float(payload["avg_loss"])
             training_steps = int(payload["training_steps"])
             replay_size = int(payload["replay_size"])
             warmup_samples = int(payload["warmup_samples"])
+            target_updates = int(payload.get("target_updates", 0))
             reward_sum = float(payload["reward_sum"])
+            td_text = (
+                f", target-syncs={target_updates}"
+                if agent_kind == AGENT_RL_TD
+                else ""
+            )
             self.train_loss_text.append(
                 (
-                    f"RL Episode {episode}/{episodes_total}: "
+                    f"{agent_name}, Episode {episode}/{episodes_total}: "
                     f"loss={avg_loss:.6f}, replay={replay_size}/{warmup_samples}, "
-                    f"updates={training_steps}, "
+                    f"updates={training_steps}{td_text}, "
                     f"reward={reward_sum:.3f}"
                 )
             )
@@ -1229,6 +1284,8 @@ class MainWindow(QMainWindow):
                     f"Supervised-Training mit {epochs_target} Epochen abgeschlossen.",
                 )
         elif mode == "training_rl":
+            agent_kind = str(payload.get("agent_kind", AGENT_RL_1STEP))
+            agent_name = AGENT_DISPLAY_NAMES[agent_kind]
             episodes_done = int(payload.get("episodes_done", 0))
             episodes_target = int(payload.get("episodes_target", 0))
             successes = int(payload.get("successes", 0))
@@ -1236,7 +1293,8 @@ class MainWindow(QMainWindow):
             avg_steps = float(payload.get("avg_steps", 0.0))
 
             self.result_label.setText(
-                f"RL Training (Erfolge): {successes}/{episodes_done} ({success_rate:.1f}%), avg Steps: {avg_steps:.1f}"
+                f"{agent_name}: {successes}/{episodes_done} Erfolge "
+                f"({success_rate:.1f}%), avg Steps: {avg_steps:.1f}"
             )
 
             if not stopped:
@@ -1245,21 +1303,22 @@ class MainWindow(QMainWindow):
                     "RL-Training abgeschlossen",
                     (
                         f"RL-Training mit {episodes_target} Episoden abgeschlossen.\n"
+                        f"Agent: {agent_name}\n"
                         f"Erfolge: {successes}/{episodes_done} ({success_rate:.1f}%)\n"
                         f"Durchschnittliche Schritte: {avg_steps:.1f}"
                     ),
                 )
 
         elif mode in {"testing_supervised", "testing_rl"}:
+            agent_kind = str(payload.get("agent_kind", self.active_agent_kind))
+            agent_name = AGENT_DISPLAY_NAMES[agent_kind]
             successes = int(payload.get("successes", 0))
             episodes_done = int(payload.get("episodes_done", 0))
             success_rate = float(payload.get("success_rate", 0.0))
             avg_steps = float(payload.get("avg_steps", 0.0))
 
-            label_prefix = "Supervised" if mode == "testing_supervised" else "RL"
-
             self.result_label.setText(
-                f"{label_prefix} Erfolg: {successes}/{episodes_done} "
+                f"{agent_name}: {successes}/{episodes_done} "
                 f"({success_rate:.1f}%), avg Steps: {avg_steps:.1f}"
             )
 
@@ -1268,7 +1327,8 @@ class MainWindow(QMainWindow):
                     self,
                     "Testing abgeschlossen",
                     (
-                        f"{label_prefix} Erfolgsrate: {successes}/{episodes_done} "
+                        f"{agent_name}\n"
+                        f"Erfolgsrate: {successes}/{episodes_done} "
                         f"({success_rate:.1f}%)\n"
                         f"Durchschnittliche Schritte: {avg_steps:.1f}"
                     ),
