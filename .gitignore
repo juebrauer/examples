@@ -65,3 +65,9 @@
 052_dqn_img_as_input/models
 053_pong_agents/models_dqn_ppo_1mio_steps
 053_pong_agents/models_dqn_ppo_2.5mio_steps
+
+057_python_concepts/project
+057_python_concepts/messwerte
+
+058_python_clean_code/
+!058_python_clean_code/python_clean_code.ipynb
