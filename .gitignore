@@ -68,3 +68,5 @@
 
 057_python_concepts/project
 057_python_concepts/messwerte
+
+061_parquet_dask_pyspark/data
