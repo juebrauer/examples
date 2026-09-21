@@ -19,6 +19,9 @@
 !*.yaml
 !*.pt
 
+# Ignore Jupyter notebook checkpoint folders
+*.ipynb_checkpoints
+
 # Ignore specific folders
 005_vlm_finetuning_with_unsloth/unsloth_compiled_cache
 
