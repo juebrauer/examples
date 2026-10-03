@@ -4,7 +4,7 @@ from pyspark.sql import functions as F
 
 spark = (
     SparkSession.builder
-    .appName("MiniClusterTest")
+    .appName("MiniClusterTest-HighWorkLoad")
     .getOrCreate()
 )
 
