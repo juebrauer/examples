@@ -13,7 +13,7 @@ void tan_block_generator1(int n_rows, int n_cols)
              printf("%6d ", zufallszahl);
         }
         printf("\n");
-        break;
+        
     }
 }
 
