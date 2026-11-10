@@ -174,15 +174,27 @@ class DemoWindow(QMainWindow):
         results_layout.addWidget(training_box)
         curve_box = QGroupBox("4. Learning curve")
         curve_layout = QVBoxLayout(curve_box)
-        self.figure = Figure(figsize=(4, 4), layout="constrained")
+        self.figure = Figure(figsize=(4, 2.5), layout="constrained")
         self.loss_axes, self.error_axes = self.figure.subplots(2, 1, sharex=True)
         self.curve_canvas = FigureCanvasQTAgg(self.figure)
-        self.curve_canvas.setMinimumSize(330, 340)
+        self.curve_canvas.setMinimumSize(330, 230)
         curve_layout.addWidget(self.curve_canvas)
         curve_hint = QLabel("Evaluated after each epoch, with dropout disabled.\nChanging data or resetting the model clears the curve.")
         curve_hint.setWordWrap(True)
         curve_layout.addWidget(curve_hint)
         results_layout.addWidget(curve_box, 1)
+        outputs_box = QGroupBox("5. Logits ↔ labels (all examples)")
+        outputs_layout = QVBoxLayout(outputs_box)
+        outputs_hint = QLabel("Raw outputs in class order; dropout disabled.\nLabels are class indices: Class 1 = 0, Class 2 = 1, …")
+        outputs_hint.setWordWrap(True)
+        outputs_layout.addWidget(outputs_hint)
+        self.outputs = QPlainTextEdit()
+        self.outputs.setReadOnly(True)
+        self.outputs.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.outputs.setStyleSheet("font-family: monospace;")
+        self.outputs.setMinimumHeight(150)
+        outputs_layout.addWidget(self.outputs)
+        results_layout.addWidget(outputs_box)
         results_layout.addWidget(self.status)
         splitter = QSplitter()
         splitter.addWidget(self.canvas)
@@ -395,6 +407,30 @@ class DemoWindow(QMainWindow):
             loss, accuracy = evaluate(self.model, *self.tensors())
             text += f"\nTraining loss: {loss:.4f} | Accuracy: {accuracy:.1%}"
         self.metrics.setText(text)
+        self.update_outputs()
+
+    @torch.no_grad()
+    def update_outputs(self):
+        """Show every example's current logits alongside its integer target."""
+        if not self.canvas.points:
+            self.outputs.setPlainText("Draw points to see logits ↔ labels here.")
+            return
+        logits = None
+        if self.model is not None:
+            self.model.eval()
+            features, _ = self.tensors()
+            logits = self.model(features).tolist()
+        classes = ", ".join(f"C{i + 1}" for i in range(self.num_classes.value()))
+        lines = [f"Example | logits [{classes}] ↔ label (desired class)"]
+        for index, label in enumerate(self.canvas.labels):
+            scores = ("[" + ", ".join(f"{value:+.4f}" for value in logits[index]) + "]"
+                      if logits is not None else "[model pending Train / Reset]")
+            lines.append(f"{index + 1:>4} | {scores} ↔ {label} (Class {label + 1})")
+        vertical = self.outputs.verticalScrollBar().value()
+        horizontal = self.outputs.horizontalScrollBar().value()
+        self.outputs.setPlainText("\n".join(lines))
+        self.outputs.verticalScrollBar().setValue(vertical)
+        self.outputs.horizontalScrollBar().setValue(horizontal)
 
     def clear_points(self):
         self.canvas.points.clear()

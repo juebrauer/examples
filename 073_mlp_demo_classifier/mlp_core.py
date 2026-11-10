@@ -55,7 +55,11 @@ def make_optimizer(model, name: str, learning_rate: float):
 
 
 def train_one_epoch(model, optimizer, features, labels):
-    """One full-batch epoch: all drawn points contribute to one update."""
+    """One full-batch epoch: all drawn points contribute to one update.
+
+    labels is a torch.long tensor of shape [number of points] containing
+    class indices from 0 to num_classes - 1, not one-hot vectors.
+    """
     model.train()                     # Enable dropout during training.
     optimizer.zero_grad()             # Clear gradients from the previous step.
     logits = model(features)          # Forward pass: [number of points, classes].
