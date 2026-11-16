@@ -105,7 +105,10 @@ int main()
     } */
 
     switch (auswahl) {
-        case 1 : N = 5; break;
+        case 1 :
+         printf("Der Benutzer hat einen Mini-TAN-Block ausgewählt!\n");
+         N = 5;
+         break;
         case 2 : N = 10; break;
         case 3 : N = 20; break;
         case 4 : N = 100; break;
