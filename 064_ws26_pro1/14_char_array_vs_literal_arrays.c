@@ -14,7 +14,7 @@ int main() {
    str1[0] = 'h';
    print_my_string(str1);
 
-   str2[0] = 'h';
+   //str2[0] = 'h';
    print_my_string(str2);
 
    printf("Programmende!\n");
