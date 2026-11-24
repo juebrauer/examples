@@ -83,4 +83,11 @@ def evaluate(model, features, labels):
     logits = model(features)
     loss = nn.functional.cross_entropy(logits, labels).item()
     accuracy = (logits.argmax(dim=1) == labels).float().mean().item()
+    print("logits:", logits)
+    print("logits.argmax(dim=1)", logits.argmax(dim=1))
+    print("logits.argmax(dim=1) == labels", logits.argmax(dim=1) == labels)
+    print("(logits.argmax(dim=1) == labels).float().mean().item()",
+           (logits.argmax(dim=1) == labels).float().mean().item()
+         )
+
     return loss, accuracy
