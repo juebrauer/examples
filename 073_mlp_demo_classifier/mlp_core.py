@@ -54,7 +54,17 @@ def make_optimizer(model, name: str, learning_rate: float):
     return optimizers[name](model.parameters(), lr=learning_rate)
 
 
-def train_one_epoch(model, optimizer, features, labels):
+def classification_loss(logits, labels, loss_name="CrossEntropyLoss"):
+    """CE uses logits + class indices; MSE uses probabilities + one-hot targets."""
+    if loss_name == "CrossEntropyLoss":
+        return nn.functional.cross_entropy(logits, labels)
+    if loss_name == "MSELoss":
+        targets = nn.functional.one_hot(labels, num_classes=logits.shape[1]).to(logits.dtype)
+        return nn.functional.mse_loss(logits.softmax(dim=1), targets)
+    raise ValueError(f"Unknown loss: {loss_name}")
+
+
+def train_one_epoch(model, optimizer, features, labels, loss_name="CrossEntropyLoss"):
     """One full-batch epoch: all drawn points contribute to one update.
 
     labels is a torch.long tensor of shape [number of points] containing
@@ -63,7 +73,7 @@ def train_one_epoch(model, optimizer, features, labels):
     model.train()                     # Enable dropout during training.
     optimizer.zero_grad()             # Clear gradients from the previous step.
     logits = model(features)          # Forward pass: [number of points, classes].
-    loss = nn.functional.cross_entropy(logits, labels)
+    loss = classification_loss(logits, labels, loss_name)
     if not torch.isfinite(loss):
         raise ValueError("Loss is not finite. Reduce the learning rate and reset the model.")
     loss.backward()                   # Compute gradients using backpropagation.
@@ -78,16 +88,9 @@ def predict_classes(model, features):
 
 
 @torch.no_grad()
-def evaluate(model, features, labels):
+def evaluate(model, features, labels, loss_name="CrossEntropyLoss"):
     model.eval()
     logits = model(features)
-    loss = nn.functional.cross_entropy(logits, labels).item()
+    loss = classification_loss(logits, labels, loss_name).item()
     accuracy = (logits.argmax(dim=1) == labels).float().mean().item()
-    print("logits:", logits)
-    print("logits.argmax(dim=1)", logits.argmax(dim=1))
-    print("logits.argmax(dim=1) == labels", logits.argmax(dim=1) == labels)
-    print("(logits.argmax(dim=1) == labels).float().mean().item()",
-           (logits.argmax(dim=1) == labels).float().mean().item()
-         )
-
     return loss, accuracy

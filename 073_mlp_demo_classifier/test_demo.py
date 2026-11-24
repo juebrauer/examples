@@ -1,17 +1,49 @@
 """Behavior checks for the teaching demo; can run with Qt's offscreen backend."""
 import unittest
 
+import numpy as np
 import torch
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
-from mlp_core import build_mlp, evaluate, make_optimizer, predict_classes, train_one_epoch
+from datasets import DATASETS, load_dataset
+from mlp_core import (build_mlp, classification_loss, evaluate, make_optimizer,
+                      predict_classes, train_one_epoch)
 from mlp_demo import DemoWindow
 
 
 class CoreTests(unittest.TestCase):
+    def test_fixed_datasets_are_independent_of_other_randomness(self):
+        self.assertEqual(len(DATASETS), 10)
+        for name in DATASETS:
+            x, y, classes = load_dataset(name)
+            np.random.seed(100)
+            np.random.random(100)
+            torch.rand(100)
+            again_x, again_y, again_classes = load_dataset(name)
+            np.testing.assert_array_equal(x, again_x)
+            np.testing.assert_array_equal(y, again_y)
+            self.assertEqual(classes, again_classes)
+            self.assertEqual(x.shape, (300, 2))
+            self.assertTrue(np.isfinite(x).all())
+            self.assertTrue((np.abs(x) <= 1).all())
+            self.assertEqual(set(y), set(range(classes)))
+
+    def test_mse_uses_probabilities_and_one_hot_targets(self):
+        logits = torch.tensor([[2., -1., 0.], [-2., 1., 3.]], requires_grad=True)
+        labels = torch.tensor([0, 2])
+        target = torch.tensor([[1., 0., 0.], [0., 0., 1.]])
+        expected = ((logits.softmax(1) - target) ** 2).mean()
+        loss = classification_loss(logits, labels, "MSELoss")
+        torch.testing.assert_close(loss, expected)
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertGreater(logits.grad.abs().sum().item(), 0)
+        with self.assertRaises(ValueError):
+            classification_loss(logits, labels, "unknown")
+
     def test_parser_and_fixed_output(self):
         for n in range(2, 6):
             model = build_mlp("linear 10\nrelu\ndropout 0.1\nlinear 5\nlogistic", n)
@@ -21,15 +53,20 @@ class CoreTests(unittest.TestCase):
                 build_mlp(invalid, 3)
 
     def test_learns_and_predicts_without_dropout_noise(self):
+        for loss in ("CrossEntropyLoss", "MSELoss"):
+            with self.subTest(loss=loss):
+                self.check_learning(loss)
+
+    def check_learning(self, loss):
         torch.manual_seed(7)
         model = build_mlp("linear 12\nrelu\ndropout 0.1", 2)
         x = torch.tensor([[-1., -1.], [-0.8, -0.9], [1., 1.], [0.8, 0.9]])
         y = torch.tensor([0, 0, 1, 1])
         optimizer = make_optimizer(model, "Adam", 0.03)
-        before, _ = evaluate(model, x, y)
+        before, _ = evaluate(model, x, y, loss)
         for _ in range(80):
-            train_one_epoch(model, optimizer, x, y)
-        after, accuracy = evaluate(model, x, y)
+            train_one_epoch(model, optimizer, x, y, loss)
+        after, accuracy = evaluate(model, x, y, loss)
         self.assertLess(after, before)
         self.assertEqual(accuracy, 1.0)
         self.assertTrue(torch.equal(predict_classes(model, x), predict_classes(model, x)))
@@ -42,6 +79,7 @@ class UiTests(unittest.TestCase):
 
     def test_draw_train_continue_and_reset(self):
         window = DemoWindow()
+        window.clear_points()
         window.show()
         self.app.processEvents()
         rect = window.canvas.plot_rect()
@@ -122,6 +160,59 @@ class UiTests(unittest.TestCase):
         self.assertEqual(len(window.architecture.toPlainText()), len(before_text) + 1)
         self.assertFalse(window.timer.isActive())
         window.close()
+
+    def test_presets_loss_switch_and_reproducible_training(self):
+        window = DemoWindow()
+        try:
+            self.assertEqual(len(window.canvas.points), 300)
+            self.assertEqual(window.dataset_choice.count(), 11)
+            for name in DATASETS:
+                window.dataset_choice.setCurrentText(name)
+                self.assertEqual(window.num_classes.value(), load_dataset(name)[2])
+                self.assertEqual(window.model[-1].out_features, window.num_classes.value())
+                self.assertFalse(window.num_classes.isEnabled())
+            initial = {k: v.clone() for k, v in window.model.state_dict().items()}
+            original_points = list(window.canvas.points)
+
+            def train_three():
+                window.epochs.setValue(3)
+                window.start_training()
+                self.assertFalse(window.loss_choice.isEnabled())
+                self.assertFalse(window.model_seed.isEnabled())
+                for _ in range(3):
+                    window.training_step()
+                self.assertFalse(window.num_classes.isEnabled())
+                return list(window.history), {k: v.clone() for k, v in window.model.state_dict().items()}
+
+            ce_history, _ = train_three()
+            for loss in ("MSELoss", "CrossEntropyLoss", "MSELoss"):
+                window.loss_choice.setCurrentText(loss)
+                self.assertEqual(window.epochs_trained, 0)
+                self.assertEqual(window.history, [])
+                self.assertEqual(len(window.optimizer.state), 0)
+                for k, v in window.model.state_dict().items():
+                    self.assertTrue(torch.equal(initial[k], v))
+                history, weights = train_three()
+                measured, _ = evaluate(window.model, *window.tensors(), loss)
+                self.assertEqual(history[-1][1], measured)
+                if loss == "CrossEntropyLoss":
+                    self.assertEqual(history, ce_history)
+                window.reset_button.click()
+                repeat_history, repeat_weights = train_three()
+                self.assertEqual(history, repeat_history)
+                for k in weights:
+                    self.assertTrue(torch.equal(weights[k], repeat_weights[k]))
+
+            window.model_seed.setValue(43)
+            self.assertTrue(any(not torch.equal(v, initial[k])
+                                for k, v in window.model.state_dict().items()))
+            window.canvas.points[0] = [0., 0.]
+            window.reload_button.click()
+            self.assertEqual(window.canvas.points, original_points)
+            self.assertEqual(window.epochs_trained, 0)
+            window.grab().save('/tmp/mlp_demo_presets.png')
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":

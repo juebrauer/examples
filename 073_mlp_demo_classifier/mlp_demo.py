@@ -16,6 +16,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from mlp_core import build_mlp, evaluate, make_optimizer, predict_classes, train_one_epoch
+from datasets import DATASETS, load_dataset
 
 COLORS = ["#2563eb", "#e34850", "#159567", "#a855d8", "#e59418"]
 DEFAULT_ARCHITECTURE = "linear 100\nrelu\ndropout 0.1\nlinear 50\nlogistic"
@@ -46,6 +47,7 @@ class FeatureCanvas(QWidget):
         x = 2 * (event.position().x() - rect.left()) / rect.width() - 1
         y = 1 - 2 * (event.position().y() - rect.top()) / rect.height()
         count = 1 if event.button() == Qt.MouseButton.LeftButton else 10
+        self.window.dataset_choice.setCurrentIndex(0)
         points = np.array([[x, y]]) if count == 1 else self.rng.normal([x, y], 0.065, (10, 2))
         self.points.extend(np.clip(points, -1, 1).tolist())
         self.labels.extend([self.window.selected_class.currentIndex()] * count)
@@ -100,6 +102,10 @@ class DemoWindow(QMainWindow):
         self.num_classes.setRange(2, 5)
         self.num_classes.setValue(3)
         self.selected_class = QComboBox()
+        self.dataset_choice = QComboBox()
+        self.dataset_choice.addItems(["Manual / custom data", *DATASETS])
+        self.reload_button = QPushButton("Reload dataset")
+        self.reload_button.setToolTip("Restore the fixed dataset and reset model + optimizer using the model seed.")
         self.architecture = QPlainTextEdit(DEFAULT_ARCHITECTURE)
         self.architecture.setMaximumHeight(230)
         self.architecture.setToolTip("Return: insert a new line. Space: insert a space.")
@@ -112,6 +118,14 @@ class DemoWindow(QMainWindow):
         self.learning_rate.setSingleStep(0.001)
         self.optimizer_choice = QComboBox()
         self.optimizer_choice.addItems(["Adam", "SGD", "RMSprop", "AdamW"])
+        self.loss_choice = QComboBox()
+        self.loss_choice.addItems(["CrossEntropyLoss", "MSELoss"])
+        self.loss_hint = QLabel()
+        self.loss_hint.setWordWrap(True)
+        self.model_seed = QSpinBox()
+        self.model_seed.setRange(0, 2147483647)
+        self.model_seed.setValue(42)
+        self.model_seed.setToolTip("Same seed + architecture + class count = same initial weights. Also resets dropout randomness.")
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 100000)
         self.epochs.setValue(1)
@@ -136,8 +150,10 @@ class DemoWindow(QMainWindow):
         sidebar.setMinimumWidth(340)
         sidebar.setMaximumWidth(440)
         layout = QVBoxLayout(sidebar)
-        data_box = QGroupBox("1. Draw your data")
+        data_box = QGroupBox("1. Choose or draw data")
         data_form = QFormLayout(data_box)
+        data_form.addRow("Dataset", self.dataset_choice)
+        data_form.addRow(self.reload_button)
         data_form.addRow("Number of classes", self.num_classes)
         data_form.addRow("Active class", self.selected_class)
         hint = QLabel("Left click: add one point\nRight click: add 10 nearby points")
@@ -154,12 +170,16 @@ class DemoWindow(QMainWindow):
         syntax.setWordWrap(True)
         model_layout.addWidget(syntax)
         model_layout.addWidget(self.model_info)
+        model_layout.addWidget(QLabel("Model seed (Reset repeats the same initialization):"))
+        model_layout.addWidget(self.model_seed)
         model_layout.addWidget(self.reset_button)
         layout.addWidget(model_box)
         training_box = QGroupBox("3. Train and inspect")
         training_form = QFormLayout(training_box)
         training_form.addRow("Learning rate", self.learning_rate)
         training_form.addRow("Optimizer", self.optimizer_choice)
+        training_form.addRow("Loss function", self.loss_choice)
+        training_form.addRow(self.loss_hint)
         training_form.addRow("Epochs per click", self.epochs)
         buttons = QHBoxLayout()
         buttons.addWidget(self.train_button)
@@ -179,7 +199,7 @@ class DemoWindow(QMainWindow):
         self.curve_canvas = FigureCanvasQTAgg(self.figure)
         self.curve_canvas.setMinimumSize(330, 230)
         curve_layout.addWidget(self.curve_canvas)
-        curve_hint = QLabel("Evaluated after each epoch, with dropout disabled.\nChanging data or resetting the model clears the curve.")
+        curve_hint = QLabel("Evaluated after each epoch, with dropout disabled.\nLoss changes restart from the model seed and clear the curve.\nCE and MSE have different scales; compare classification error too.")
         curve_hint.setWordWrap(True)
         curve_layout.addWidget(curve_hint)
         results_layout.addWidget(curve_box, 1)
@@ -214,6 +234,10 @@ class DemoWindow(QMainWindow):
         splitter.setSizes([760, 370, 420])
         self.setCentralWidget(splitter)
         self.num_classes.valueChanged.connect(self.classes_changed)
+        self.dataset_choice.currentIndexChanged.connect(self.change_dataset)
+        self.reload_button.clicked.connect(self.change_dataset)
+        self.loss_choice.currentTextChanged.connect(self.change_loss)
+        self.model_seed.valueChanged.connect(self.reset_model)
         self.architecture.textChanged.connect(self.invalidate_model)
         self.learning_rate.valueChanged.connect(self.change_learning_rate)
         self.optimizer_choice.currentTextChanged.connect(self.change_optimizer)
@@ -229,7 +253,8 @@ class DemoWindow(QMainWindow):
         yy, xx = torch.meshgrid(axis.flip(0), axis, indexing="ij")
         self.grid = torch.stack((xx.flatten(), yy.flatten()), dim=1)
         self.classes_changed()
-        self.reset_model()
+        self.update_loss_hint()
+        self.dataset_choice.setCurrentText("Three Gaussian blobs")
         QApplication.instance().installEventFilter(self)
 
     def eventFilter(self, watched, event):
@@ -247,7 +272,7 @@ class DemoWindow(QMainWindow):
                 return True
             if (event.type() == QEvent.Type.KeyPress
                     and not event.isAutoRepeat() and self.train_button.isEnabled()):
-                for spin in (self.num_classes, self.learning_rate, self.epochs):
+                for spin in (self.num_classes, self.learning_rate, self.epochs, self.model_seed):
                     spin.interpretText()
                 self.train_button.click()
             return True
@@ -258,7 +283,7 @@ class DemoWindow(QMainWindow):
         self.draw_learning_curve()
 
     def record_learning_metrics(self):
-        loss, accuracy = evaluate(self.model, self.features, self.targets)
+        loss, accuracy = evaluate(self.model, self.features, self.targets, self.loss_choice.currentText())
         self.history.append((self.epochs_trained, loss, 100 * (1 - accuracy)))
 
     def draw_learning_curve(self):
@@ -268,9 +293,9 @@ class DemoWindow(QMainWindow):
             epochs, losses, errors = zip(*self.history)
             self.loss_axes.plot(epochs, losses, color=COLORS[0], marker=".", markersize=3)
             self.error_axes.plot(epochs, errors, color=COLORS[1], marker=".", markersize=3)
-        self.loss_axes.set_ylabel("Cross-entropy loss")
+        self.loss_axes.set_ylabel(self.loss_choice.currentText())
         self.loss_axes.set_title("Training data")
-        self.error_axes.set_ylabel("Classification error (%)")
+        self.error_axes.set_ylabel("Error (%)")
         self.error_axes.set_xlabel("Completed epochs")
         self.error_axes.set_ylim(-2, 102)
         for axes in (self.loss_axes, self.error_axes):
@@ -305,6 +330,8 @@ class DemoWindow(QMainWindow):
         self.canvas.update()
 
     def reset_model(self):
+        # CPU full-batch training: reset both initialization and dropout sequence.
+        torch.manual_seed(self.model_seed.value())
         try:
             model = build_mlp(self.architecture.toPlainText(), self.num_classes.value())
         except ValueError as error:
@@ -318,8 +345,33 @@ class DemoWindow(QMainWindow):
         self.model_info.setText(f"2 inputs → {self.num_classes.value()} logits | {count:,} parameters")
         self.refresh_regions()
         self.update_metrics()
-        self.status.setText("New random weights. Draw data or train the model.")
+        self.status.setText(f"Model + optimizer reset with seed {self.model_seed.value()}. Ready to train.")
         return True
+
+    def change_dataset(self):
+        manual = self.dataset_choice.currentIndex() == 0
+        self.reload_button.setEnabled(not manual)
+        self.num_classes.setEnabled(manual)
+        if manual:
+            return
+        points, labels, classes = load_dataset(self.dataset_choice.currentText())
+        # Clear old labels before lowering the class count.
+        self.canvas.points.clear()
+        self.canvas.labels.clear()
+        self.num_classes.setValue(classes)
+        self.canvas.points = points.tolist()
+        self.canvas.labels = labels.tolist()
+        self.reset_model()
+
+    def update_loss_hint(self):
+        self.loss_hint.setText(
+            "CE: raw logits + class indices."
+            if self.loss_choice.currentText() == "CrossEntropyLoss" else
+            "MSE: softmax(logits) + one-hot targets; mean over points and classes.")
+
+    def change_loss(self):
+        self.update_loss_hint()
+        self.reset_model()
 
     def change_learning_rate(self):
         if self.optimizer:
@@ -339,7 +391,7 @@ class DemoWindow(QMainWindow):
         if self.timer.isActive():
             return
         if len(set(self.canvas.labels)) < 2:
-            QMessageBox.information(self, "Add training data", "Draw points for at least two classes.")
+            QMessageBox.information(self, "Add training data", "Choose a dataset or draw points for at least two classes.")
             return
         if self.model is None and not self.reset_model():
             return
@@ -355,14 +407,20 @@ class DemoWindow(QMainWindow):
     def set_training_controls(self, training):
         for widget in (self.num_classes, self.selected_class, self.architecture,
                        self.learning_rate, self.optimizer_choice, self.epochs,
+                       self.dataset_choice, self.reload_button, self.loss_choice, self.model_seed,
                        self.reset_button, self.clear_button, self.undo_button, self.train_button):
             widget.setEnabled(not training)
+        if not training:
+            manual = self.dataset_choice.currentIndex() == 0
+            self.num_classes.setEnabled(manual)
+            self.reload_button.setEnabled(not manual)
         self.stop_button.setEnabled(training)
 
     def training_step(self):
         # One epoch per Qt event: the UI can repaint and handle Stop between epochs.
         try:
-            train_one_epoch(self.model, self.optimizer, self.features, self.targets)
+            train_one_epoch(self.model, self.optimizer, self.features, self.targets,
+                            self.loss_choice.currentText())
             self.epochs_trained += 1
             self.record_learning_metrics()
             self.remaining -= 1
@@ -404,8 +462,8 @@ class DemoWindow(QMainWindow):
         text = "Points: " + " | ".join(f"C{i+1}: {n}" for i, n in enumerate(counts))
         text += f"\nCompleted epochs: {self.epochs_trained}"
         if self.model is not None and self.canvas.points:
-            loss, accuracy = evaluate(self.model, *self.tensors())
-            text += f"\nTraining loss: {loss:.4f} | Accuracy: {accuracy:.1%}"
+            loss, accuracy = evaluate(self.model, *self.tensors(), self.loss_choice.currentText())
+            text += f"\n{self.loss_choice.currentText()}: {loss:.4f} | Accuracy: {accuracy:.1%}"
         self.metrics.setText(text)
         self.update_outputs()
 
@@ -433,6 +491,7 @@ class DemoWindow(QMainWindow):
         self.outputs.horizontalScrollBar().setValue(horizontal)
 
     def clear_points(self):
+        self.dataset_choice.setCurrentIndex(0)
         self.canvas.points.clear()
         self.canvas.labels.clear()
         self.clear_learning_curve()
@@ -442,6 +501,7 @@ class DemoWindow(QMainWindow):
 
     def undo_point(self):
         if self.canvas.points:
+            self.dataset_choice.setCurrentIndex(0)
             self.canvas.points.pop()
             self.canvas.labels.pop()
             self.clear_learning_curve()
